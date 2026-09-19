@@ -1,6 +1,6 @@
 {
   "name": "@octanejs/tanstack-router-ssr-query",
-  "version": "0.0.44",
+  "version": "0.0.45",
   "description": "Octane port of @tanstack/react-router-ssr-query — TanStack Router ⇄ Query SSR integration.",
   "type": "module",
   "main": "src/index.tsrx",
@@ -16,7 +16,8 @@
     "typecheck": "tsrx-tsc --noEmit -p tsconfig.octane.json"
   },
   "dependencies": {
-    "@tanstack/router-ssr-query-core": "1.169.1"
+    "@tanstack/router-ssr-query-core": "1.169.1",
+    "@tanstack/query-core": "catalog:default"
   },
   "peerDependencies": {
     "@octanejs/tanstack-query": "workspace:*",

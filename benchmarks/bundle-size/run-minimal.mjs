@@ -35,6 +35,16 @@ const existingScenarios = [
 	['binding-vanilla', 'ts'],
 	['binding-hooks', 'tsrx'],
 ];
+const signalFreeClientScenarios = new Set([
+	'cli-spa-starter',
+	'root-static-specialized',
+	'root-static',
+	'hooks-state',
+	'context',
+	'hydrate-root',
+	'deferred-hydration',
+	'suspense-transition',
+]);
 const bindingScenarios = [
 	{
 		id: 'binding-base-ui',
@@ -86,6 +96,12 @@ const scenarios = [
 		name: id,
 		extension,
 		bundler: 'vite',
+	})),
+	...['vite', 'esbuild'].map((bundler) => ({
+		id: 'behavior-root',
+		name: `behavior-root-${bundler}`,
+		extension: 'ts',
+		bundler,
 	})),
 	...bindingScenarios.flatMap((scenario) =>
 		['vite', 'esbuild'].map((bundler) => ({
@@ -187,6 +203,21 @@ assert.deepEqual(
 	'minimal-import budgets must cover every scenario exactly once',
 );
 
+const requestedScenarios = process.argv.slice(2);
+for (const requested of requestedScenarios) {
+	assert.equal(
+		scenarios.some(({ id, name }) => requested === id || requested === name),
+		true,
+		`Unknown minimal-import scenario: ${requested}`,
+	);
+}
+const selectedScenarios = requestedScenarios.length
+	? scenarios.filter(
+			({ id, name }) => requestedScenarios.includes(id) || requestedScenarios.includes(name),
+		)
+	: scenarios;
+assert.notEqual(selectedScenarios.length, 0, 'At least one minimal-import scenario must run');
+
 const payload = { suite: 'bundle-reachability', iterations: 1, targets: [] };
 
 function cliStarterPlugin(entry) {
@@ -207,14 +238,13 @@ export function run(container) {
 	const page = container.querySelector('main.page');
 	const title = page?.querySelector('h1');
 	const quickStart = container.querySelector('a[href="https://octanejs.dev/docs/quick-start"]');
-	const scopedStyle = document.head.querySelector('style[data-octane]');
 	return {
 		page: page !== null,
 		title: title?.textContent,
 		quickStart: quickStart?.querySelector('.link-title')?.textContent,
 		quickStartHref: quickStart?.getAttribute('href'),
 		links: container.querySelectorAll('a').length,
-		styled: scopedStyle?.textContent?.includes('.page') ?? false,
+		styled: page !== null && getComputedStyle(page).display === 'flex',
 	};
 }
 `;
@@ -318,24 +348,42 @@ async function buildScenario(scenario, entry) {
 	const modules = Object.entries(chunk.modules)
 		.filter(([, module]) => !scenario.package || module.renderedLength > 0)
 		.map(([id]) => id);
+	const emittedModules = Object.entries(chunk.modules)
+		.filter(([, module]) => module.renderedLength > 0)
+		.map(([id]) => id);
 	const runtimeModule = modules.find((id) => id.endsWith('/packages/octane/src/runtime.ts'));
 	return {
 		code: chunk.code,
 		modules,
+		emittedModules,
 		runtimeExports: runtimeModule ? chunk.modules[runtimeModule].renderedExports : [],
 	};
 }
 
 try {
-	for (const scenario of scenarios) {
+	for (const scenario of selectedScenarios) {
 		const { id, name } = scenario;
 		const serverScenario = id.startsWith('server-');
 		const entry = path.join(fixtures, `${id}.${scenario.extension}`);
-		const { code, modules, runtimeExports } = await buildScenario(scenario, entry);
+		const {
+			code,
+			modules,
+			emittedModules = modules,
+			runtimeExports,
+		} = await buildScenario(scenario, entry);
 		for (const [label, pattern] of forbidden) {
 			if (serverScenario && label === 'server runtime') continue;
 			const leaked = modules.find((id) => pattern.test(id));
 			assert.equal(leaked, undefined, `${name}: ${label} reached the production bundle: ${leaked}`);
+		}
+		if (signalFreeClientScenarios.has(id)) {
+			assert.deepEqual(
+				emittedModules.filter((module) =>
+					/\/packages\/octane\/src\/signals\/transition-(?:candidate|action)\.[jt]s$/.test(module),
+				),
+				[],
+				`${name}: signal-free client retained the concrete native transition implementation`,
+			);
 		}
 		const hasRuntime = modules.some((module) => module.endsWith('/packages/octane/src/runtime.ts'));
 		const hasServerRuntime = modules.some((module) =>
@@ -352,10 +400,22 @@ try {
 					`${name}: unrelated DOM namespace tables reached isolated server helpers`,
 				);
 			}
-		} else if (id === 'capture-only' || id === 'binding-vanilla' || id === 'binding-floating-ui') {
+		} else if (
+			id === 'capture-only' ||
+			id === 'behavior-root' ||
+			id === 'binding-vanilla' ||
+			id === 'binding-floating-ui'
+		) {
 			assert.equal(hasRuntime, false, `${name}: unrelated client runtime reached isolated entry`);
 		} else if (id !== 'binding-motion' && id !== 'binding-aria') {
 			assert.equal(hasRuntime, true, `${name}: executable feature omitted the client runtime`);
+		}
+		if (id === 'behavior-root') {
+			assert.deepEqual(
+				modules.filter((id) => /\/packages\/octane\/src\/compiler\//.test(id)),
+				[],
+				`${name}: compiler reached the behavior-only production bundle`,
+			);
 		}
 		if (id === 'root-static-specialized' || id === 'cli-spa-starter') {
 			assert.equal(
@@ -411,6 +471,13 @@ try {
 				true,
 				`${name}: invalid committed ${metric} byte budget`,
 			);
+			if (id === 'behavior-root') {
+				assert.equal(
+					measured[metric] <= budget[metric],
+					true,
+					`${name}: production ${metric} bytes ${measured[metric]} exceed committed budget ${budget[metric]}`,
+				);
+			}
 		}
 		payload.targets.push({
 			name,

@@ -69,6 +69,8 @@ import {
 import {
 	compileUniversal,
 	createLexicalAnalysis,
+	forEachRuntimeAstChild,
+	isIdentifierReference,
 	UNIVERSAL_COMPILER_RUNTIME_IMPORTS,
 	UNIVERSAL_THREAD_RUNTIME_IMPORTS,
 } from './compile-universal.js';
@@ -532,7 +534,12 @@ function attrBindingUpdateHelper(bind, inlineBindingGuards = false) {
 }
 
 function canCarryDirectSignalHandle(node) {
-	if (!node || node.metadata?.octane_string_child || node.metadata?.octane_primitive_text_child) {
+	if (
+		!node ||
+		node.metadata?.octane_string_child ||
+		node.metadata?.octane_primitive_text_child ||
+		node.metadata?.octane_primitive_value
+	) {
 		return false;
 	}
 	if (
@@ -626,7 +633,7 @@ function componentInvocationSite(ctx, node) {
 function markDirectSignalBinding(binding, ctx, origin, kind) {
 	if (!canCarryDirectSignalHandle(binding.expr)) return binding;
 	ctx.signalBindingsUsed = true;
-	if (binding.kind !== 'text' && binding.kind !== 'textOnlyChild') ctx.signalBindingsEager = true;
+	if (isDirectSignalHandleExpression(binding.expr)) ctx.signalBindingsEager = true;
 	return {
 		...binding,
 		signalDirect: true,
@@ -16606,37 +16613,167 @@ function depPathKey(node) {
 // Dep extraction for a memoized creation: one-level member paths for free
 // identifiers used as `obj.prop` or `obj['prop']` (→ `props.id`, so a fresh
 // props OBJECT with unchanged fields doesn't refetch), bare identifiers
-// otherwise. Scope-aware: identifiers bound inside nested functions don't
-// become deps.
-function collectDepPaths(expr) {
+// otherwise. Only outer runtime references become deps; locally declared
+// bindings and erased syntax do not.
+function collectDepPaths(expr, coarsenDepRoots = null) {
 	const deps = [];
 	const seen = new Set();
+	const lexical = createLexicalAnalysis(expr);
+	let guards = null;
+	let nextGuard = 0;
+	const isFree = (node, parent, key) =>
+		isIdentifierReference(node, parent, key, lexical) &&
+		!lexical.isBound(lexical.nodeScopes.get(node) ?? lexical.rootScope, node.name);
 	const push = (node, key) => {
+		if (coarsenDepRoots !== null) {
+			const member = depPathMember(node);
+			if (member?.object.type === 'Identifier' && coarsenDepRoots.has(member.object.name)) {
+				node = b.id(member.object.name);
+				key = depPathKey(node);
+			}
+		}
+		if (guards !== null) key += `:guard:${guards.id}`;
 		if (seen.has(key)) return;
 		seen.add(key);
+		if (guards !== null) {
+			for (let guard = guards; guard !== null; guard = guard.parent) {
+				node = b.conditional(guard.test, node, b.void0);
+			}
+		}
 		deps.push(node);
 	};
-	walk(expr, new Set());
+	walk(expr, null, null);
 	return deps;
 
-	function walk(n, bound) {
-		if (!n || typeof n !== 'object') return;
-		if (Array.isArray(n)) {
-			for (const x of n) walk(x, bound);
+	// Only repeat guards whose evaluation is a free typeof probe, not a call,
+	// accessor, or callback-local reference. Keeping the entire predicate also
+	// leaves member reads disabled for other types, not just absent globals.
+	function isTypeofGuard(node) {
+		node = unwrapTsExpr(node);
+		if (node?.type === 'UnaryExpression') {
+			if (node.operator === '!') return isTypeofGuard(node.argument);
+			const argument = unwrapTsExpr(node.argument);
+			return (
+				node.operator === 'typeof' &&
+				argument?.type === 'Identifier' &&
+				isFree(argument, node, 'argument')
+			);
+		}
+		if (node?.type === 'LogicalExpression' && (node.operator === '&&' || node.operator === '||')) {
+			return isTypeofGuard(node.left) && isTypeofGuard(node.right);
+		}
+		if (
+			node?.type === 'BinaryExpression' &&
+			(node.operator === '===' ||
+				node.operator === '!==' ||
+				node.operator === '==' ||
+				node.operator === '!=')
+		) {
+			const left = unwrapTsExpr(node.left);
+			const right = unwrapTsExpr(node.right);
+			return (
+				(left?.type === 'Literal' && typeof left.value === 'string' && isTypeofGuard(right)) ||
+				(right?.type === 'Literal' && typeof right.value === 'string' && isTypeofGuard(left))
+			);
+		}
+		return false;
+	}
+
+	function necessaryTypeofGuard(node, truthy) {
+		node = unwrapTsExpr(node);
+		if (isTypeofGuard(node)) return truthy ? node : b.unary('!', node);
+		if (node?.type === 'UnaryExpression' && node.operator === '!') {
+			return necessaryTypeofGuard(node.argument, !truthy);
+		}
+		// A true conjunction requires both operands; a false disjunction
+		// requires neither. Unknown operands contribute no proof and are never
+		// replayed: getters and calls remain in the authored predicate.
+		if (node?.type === 'LogicalExpression' && node.operator === (truthy ? '&&' : '||')) {
+			const left = necessaryTypeofGuard(node.left, truthy);
+			const right = necessaryTypeofGuard(node.right, truthy);
+			return left === null ? right : right === null ? left : b.logical('&&', left, right);
+		}
+		return null;
+	}
+
+	function walkGuarded(node, test, truthy) {
+		const guard = necessaryTypeofGuard(test, truthy);
+		if (guard === null) {
+			walk(node, null, null);
 			return;
 		}
+		const previous = guards;
+		guards = { test: guard, parent: guards, id: nextGuard++ };
+		walk(node, null, null);
+		guards = previous;
+	}
+
+	function exits(node) {
+		if (node?.type === 'ReturnStatement' || node?.type === 'ThrowStatement') return true;
+		if (node?.type === 'BlockStatement') return node.body.some(exits);
+		return node?.type === 'IfStatement' && exits(node.consequent) && exits(node.alternate);
+	}
+
+	function walk(n, parent, key) {
+		if (!n || typeof n !== 'object') return;
 		switch (n.type) {
+			case 'BlockStatement': {
+				const previous = guards;
+				for (const statement of n.body) {
+					walk(statement, n, 'body');
+					if (statement.type !== 'IfStatement') continue;
+					const consequentExit = exits(statement.consequent);
+					const alternateExit = exits(statement.alternate);
+					if (consequentExit !== alternateExit) {
+						const guard = necessaryTypeofGuard(statement.test, !consequentExit);
+						if (guard === null) continue;
+						guards = {
+							test: guard,
+							parent: guards,
+							id: nextGuard++,
+						};
+					}
+				}
+				guards = previous;
+				return;
+			}
+			case 'IfStatement':
+			case 'ConditionalExpression':
+				walk(n.test, n, 'test');
+				walkGuarded(n.consequent, n.test, true);
+				walkGuarded(n.alternate, n.test, false);
+				return;
+			case 'LogicalExpression':
+				walk(n.left, n, 'left');
+				if (n.operator === '&&' || n.operator === '||') {
+					walkGuarded(n.right, n.left, n.operator === '&&');
+				} else {
+					walk(n.right, n, 'right');
+				}
+				return;
 			case 'MetaProperty':
 				// `import.meta` and `new.target` contain syntax tokens, not free
 				// bindings. Visiting their Identifier children creates invalid deps.
 				return;
 			case 'Identifier':
-				if (!bound.has(n.name)) push(b.id(n.name), n.name);
+				if (isFree(n, parent, key)) push(b.id(n.name), depPathKey(n));
 				return;
+			case 'UnaryExpression': {
+				const argument = unwrapTsExpr(n.argument);
+				if (n.operator === 'typeof' && argument?.type === 'Identifier') {
+					// A guarded global may not exist. Reading its bare identifier as a
+					// dependency defeats typeof's protection; its type is the witness.
+					if (isFree(argument, n, 'argument')) {
+						push(b.unary('typeof', b.id(argument.name)), `typeof:${argument.name}`);
+					}
+					return;
+				}
+				break;
+			}
 			case 'MemberExpression': {
 				const propertyName = staticDepMemberName(n);
 				if (n.object.type === 'Identifier' && propertyName !== null) {
-					if (!bound.has(n.object.name)) {
+					if (isFree(n.object, n, 'object')) {
 						const member = b.member(
 							b.id(n.object.name),
 							n.computed
@@ -16653,30 +16790,10 @@ function collectDepPaths(expr) {
 					}
 					return;
 				}
-				walk(n.object, bound);
-				if (n.computed) walk(n.property, bound);
-				return;
+				break;
 			}
-			case 'FunctionExpression':
-			case 'ArrowFunctionExpression': {
-				const inner = new Set(bound);
-				for (const p of n.params || []) collectPatternNames(p, inner);
-				walk(n.body, inner);
-				return;
-			}
-			case 'Property':
-				if (n.computed) walk(n.key, bound);
-				walk(n.value, bound);
-				return;
-			case 'VariableDeclarator':
-				walk(n.init, bound);
-				return;
-			default:
-				for (const k in n) {
-					if (k === 'loc' || k === 'start' || k === 'end' || k === 'metadata') continue;
-					walk(n[k], bound);
-				}
 		}
+		forEachRuntimeAstChild(n, (child, childKey) => walk(child, n, childKey));
 	}
 }
 
@@ -16909,29 +17026,13 @@ function makeCreationMemoCall(
 		// composable Symbol for every warmable creation site.
 		true,
 	);
-	let deps = collectDepPaths(expr);
 	// Chain-local roots must dep on the LOCAL'S identity, not a one-level
 	// member path: `userPromise.then(…)` would otherwise dep on
 	// `userPromise.then` — Promise.prototype.then, identical across every
 	// promise — and the derived creation would never refresh when its upstream
 	// promise does. Coarsen member deps rooted at render-created locals to the
 	// bare identifier (dedup follows).
-	if (coarsenDepRoots !== null) {
-		const seen = new Set();
-		const coarsened = [];
-		for (const dep of deps) {
-			const member = depPathMember(dep);
-			const next =
-				member?.object.type === 'Identifier' && coarsenDepRoots.has(member.object.name)
-					? b.id(member.object.name)
-					: dep;
-			const key = depPathKey(next);
-			if (key !== null && seen.has(key)) continue;
-			if (key !== null) seen.add(key);
-			coarsened.push(next);
-		}
-		deps = coarsened;
-	}
+	const deps = collectDepPaths(expr, coarsenDepRoots);
 	// Server mirror: `puMemo` — keyed CROSS-PASS creation cache (a fresh
 	// SSRScope per pass makes client useMemo semantics useless there).
 	const memoHelper = ctx.nativeReads
@@ -19864,7 +19965,70 @@ function memberProps(hn, src) {
 		// node so the extracted fragment keeps it (dev hydration LOC / DevTools). Without
 		// this, fragment extraction would silently drop the upstream position.
 		loc: src && src.loc,
+		// The extracted prop carries the already-evaluated source value. Preserve
+		// primitive value proofs separately from the renderer's text assertions:
+		// an authored `as string` still permits a signal handle at runtime.
+		...(isPrimitiveValueExpression(src)
+			? { metadata: { ...src?.metadata, octane_primitive_value: true } }
+			: null),
 	};
+}
+
+function isPrimitiveValueExpression(node) {
+	if (!node || typeof node !== 'object') return false;
+	if (
+		node.type === 'TSAsExpression' ||
+		node.type === 'TSTypeAssertion' ||
+		node.type === 'TSSatisfiesExpression' ||
+		node.type === 'TSNonNullExpression' ||
+		node.type === 'TSInstantiationExpression' ||
+		node.type === 'ParenthesizedExpression' ||
+		node.type === 'ChainExpression'
+	) {
+		return isPrimitiveValueExpression(node.expression);
+	}
+	if (
+		node.metadata?.octane_string_child ||
+		node.metadata?.octane_primitive_text_child ||
+		node.metadata?.octane_primitive_value
+	) {
+		return true;
+	}
+	if (node.type === 'Literal') {
+		return (
+			node.regex == null &&
+			(node.value == null || (typeof node.value !== 'object' && typeof node.value !== 'function'))
+		);
+	}
+	if (
+		node.type === 'StringLiteral' ||
+		node.type === 'NumericLiteral' ||
+		node.type === 'BigIntLiteral' ||
+		node.type === 'BooleanLiteral' ||
+		node.type === 'NullLiteral' ||
+		node.type === 'TemplateLiteral' ||
+		node.type === 'UnaryExpression' ||
+		node.type === 'BinaryExpression' ||
+		node.type === 'UpdateExpression'
+	) {
+		return true;
+	}
+	if (node.type === 'ConditionalExpression') {
+		return (
+			isPrimitiveValueExpression(node.consequent) && isPrimitiveValueExpression(node.alternate)
+		);
+	}
+	if (node.type === 'LogicalExpression') {
+		return isPrimitiveValueExpression(node.left) && isPrimitiveValueExpression(node.right);
+	}
+	if (node.type === 'SequenceExpression') {
+		return isPrimitiveValueExpression(node.expressions.at(-1));
+	}
+	if (node.type === 'AssignmentExpression') {
+		if (node.operator === '=') return isPrimitiveValueExpression(node.right);
+		return node.operator === '+=' || NUMERIC_TEXT_OPERATORS.has(node.operator.slice(0, -1));
+	}
+	return false;
 }
 function objectProp(hn, valNode) {
 	return b.prop('init', b.id(hn), valNode);
@@ -21054,6 +21218,8 @@ function rewriteJsxValues(node, ctx, eagerMapCallbackRoots = false, eagerMapCall
 		if (isFunctionNode(n) && n.body?.type === 'JSXCodeBlock') {
 			const name = n.id?.name ?? allocCompilerName(ctx, '__template');
 			const previousLocals = ctx.currentComponentLocals;
+			// A nested body must not replace the enclosing component's warm plan.
+			const previousWarm = ctx._pendingWarm;
 			ctx.currentComponentLocals = collectComponentLocals(n);
 			try {
 				const compiled =
@@ -21063,6 +21229,7 @@ function rewriteJsxValues(node, ctx, eagerMapCallbackRoots = false, eagerMapCall
 				return functionExpressionFromDeclaration({ ...compiled, id: n.id ?? null }, n);
 			} finally {
 				ctx.currentComponentLocals = previousLocals;
+				ctx._pendingWarm = previousWarm;
 			}
 		}
 		if (
@@ -25267,7 +25434,7 @@ function planJsx(
 			}
 			if (!noTemplate && cc.signalSite != null && (ctx.signalBindingsUsed || ctx.nativeReads)) {
 				ctx.signalBindingsUsed = true;
-				ctx.signalBindingsEager = true;
+				if (isDirectSignalHandleExpression(cc.valueExpr)) ctx.signalBindingsEager = true;
 				ctx.runtimeNeeded.add('bindSignalChild');
 				const tokenKey = `_sigch$${cc.id}`;
 				bag.constField(tokenKey, b.literal(null));
@@ -27810,7 +27977,7 @@ function emitElementHtml(
 		const site = directSignalSite(ctx, node, 'input');
 		ensureDirectControlSite(site);
 		ctx.signalBindingsUsed = true;
-		ctx.signalBindingsEager = true;
+		if (isDirectSignalHandleExpression(expression)) ctx.signalBindingsEager = true;
 		return { ...binding, signalDirect: true, signalSite: site };
 	};
 	const hostSignalSite = directSignalSite(ctx, node, 'binding');
@@ -28579,7 +28746,15 @@ function emitElementHtml(
 			);
 		if (signalHostSources) {
 			ctx.signalBindingsUsed = true;
-			ctx.signalBindingsEager = true;
+			if (
+				hasDirectSignalStyle ||
+				hostClientSources.some((source) =>
+					source.spread
+						? spreadContainsDirectSignalHandle(source.binding.expr)
+						: isDirectSignalHandleExpression(source.binding.expr),
+				)
+			)
+				ctx.signalBindingsEager = true;
 		}
 		hostCommitClientBinding = {
 			id: bindings.length,

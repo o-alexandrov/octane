@@ -211,10 +211,12 @@ import {
 import { createNativeReadRetry, type NativeReadRetry } from './signals/native-read-retry.js';
 import {
 	activeCandidate,
+	createSignalActionFrame,
 	swapActiveSignalCandidate,
 	withoutSignalCandidate,
 } from './signals/transition-state.js';
-import { SignalCandidateFrame } from './signals/transition-candidate.js';
+import { installNativeSignalActionExtension } from './signals/transition-candidate.js';
+import type { SignalActionFrame } from './signals/transition-action.js';
 import {
 	NativeAdoptionMiss,
 	NATIVE_TRANSITION_CONSUMER,
@@ -1154,6 +1156,7 @@ function scheduleNativeRead(target: Block): void {
 
 function ensureNativeReadDriver(): NativeReadDriver {
 	if (NATIVE_READ_DRIVER !== null) return NATIVE_READ_DRIVER;
+	installNativeSignalActionExtension();
 	NATIVE_READ_DRIVER = createNativeReadDriver({
 		capture: () => WIP_CAPTURE,
 		cleanup: registerHookCleanup,
@@ -2124,7 +2127,7 @@ interface TransitionActionBatch {
 	pendingHolds?: number;
 	workComplete?: boolean;
 	/** Allocated only by a native write inside this Action. */
-	native?: SignalCandidateFrame;
+	native?: SignalActionFrame;
 	nativeWake?: () => void;
 	nativeBlocks?: Set<Block>;
 	nativeBoundaries?: Map<TrySlot, TrackedThenable<any>>;
@@ -2446,7 +2449,7 @@ let ACTIVE_TRANSITION_ACTION_BATCH: TransitionActionBatch | null = null;
 let IN_FLIGHT_TRANSITION_ACTION_BATCH: TransitionActionBatch | null = null;
 let nativeActionResolverInstalled = false;
 
-function nativeCandidateForAction(batch: TransitionActionBatch): SignalCandidateFrame {
+function nativeCandidateForAction(batch: TransitionActionBatch): SignalActionFrame | undefined {
 	let candidate = batch.native;
 	if (candidate !== undefined && !candidate.validate()) {
 		if (candidate.hasWrites()) candidate.rebase();
@@ -2455,7 +2458,7 @@ function nativeCandidateForAction(batch: TransitionActionBatch): SignalCandidate
 			candidate = undefined;
 		}
 	}
-	return candidate ?? (batch.native = new SignalCandidateFrame());
+	return candidate ?? (batch.native = createSignalActionFrame?.());
 }
 
 /** Setters, not reads, consult the same post-await batch as ordinary hooks. */
@@ -20227,8 +20230,9 @@ function writeDirectSignalBinding(binding: DirectSignalBinding, value: unknown):
 		}
 	} else if (binding.kind === 'value') {
 		const element = binding.target as Element;
-		if (element.localName === 'select') setSelectValue(element, value);
-		else setValue(element, value);
+		const tag = element.localName;
+		if (tag === 'select') setSelectValue(element, value);
+		else setValue(element, value, tag === 'textarea' && isWritableSignal(binding.handle));
 	} else {
 		setChecked(binding.target as Element, value);
 	}
@@ -23032,6 +23036,7 @@ export function setHostPropSources(
 	hasNestedChildren = false,
 	readStyle?: (value: unknown) => unknown,
 	deferControl = false,
+	writableTextareaValue = false,
 ): Record<string, unknown> {
 	const props = new Map<string, HostPropWriter>();
 	const resolved = resolveHostPropSources(el, sources, props, readStyle);
@@ -23051,6 +23056,7 @@ export function setHostPropSources(
 			props.get('checked')?.value,
 			props.get('defaultChecked')?.value,
 			props.get('multiple')?.value,
+			writableTextareaValue,
 		);
 	return resolved;
 }
@@ -23100,17 +23106,21 @@ function resolveSignalHostPropSources(
 	sources: readonly HostPropSource[],
 	readStyle?: (value: unknown) => unknown,
 	read: (handle: SignalHandle<unknown>) => unknown = readSignalBinding,
+	textarea = false,
 ): {
 	sources: readonly HostPropSource[];
 	handles: Set<SignalHandle<unknown>>;
+	writableTextareaValue?: boolean;
 } {
 	// Children keep their handle for the separate child binding; resolving them
 	// here would subscribe only the host props and strand later child updates.
 	const handles = new Set<SignalHandle<unknown>>();
 	let rows: HostPropSource[] | undefined;
+	let writableTextareaValue = false;
 	for (let i = 0; i < sources.length; i++) {
 		const source = sources[i];
 		if (!source[0]) {
+			if (textarea && source[1] === 'value') writableTextareaValue = isWritableSignal(source[2]);
 			const value =
 				source[1] === 'children' || (source[1] === 'style' && readStyle !== undefined)
 					? source[2]
@@ -23130,6 +23140,7 @@ function resolveSignalHostPropSources(
 		let copy: Record<string, unknown> | undefined;
 		for (const name of Object.keys(spread)) {
 			const current = (spread as Record<string, unknown>)[name];
+			if (textarea && name === 'value') writableTextareaValue = isWritableSignal(current);
 			const value =
 				name === 'children' || (name === 'style' && readStyle !== undefined)
 					? current
@@ -23148,7 +23159,9 @@ function resolveSignalHostPropSources(
 			rows[i] = [true, copy];
 		}
 	}
-	return { sources: rows ?? sources, handles };
+	return textarea
+		? { sources: rows ?? sources, handles, writableTextareaValue }
+		: { sources: rows ?? sources, handles };
 }
 
 function winningSignalHostControl(
@@ -23177,7 +23190,12 @@ function updateSignalHostPropSources(binding: SignalHostPropSourcesBinding): voi
 	if (binding.disposed || binding.pendingControl || binding.scope.block.disposed) return;
 	try {
 		runWithBlockSignalOwner(binding.scope, () => {
-			const next = resolveSignalHostPropSources(binding.sources, binding.readStyle);
+			const next = resolveSignalHostPropSources(
+				binding.sources,
+				binding.readStyle,
+				undefined,
+				binding.element.localName === 'textarea',
+			);
 			binding.resolved = setHostPropSources(
 				binding.element,
 				next.sources,
@@ -23185,6 +23203,8 @@ function updateSignalHostPropSources(binding: SignalHostPropSourcesBinding): voi
 				binding.scope,
 				binding.hasNestedChildren,
 				binding.readStyle,
+				false,
+				next.writableTextareaValue,
 			);
 			if (process.env.NODE_ENV !== 'production' && STAGED_DOM === null)
 				drainDevFormDiagnostics(binding.element);
@@ -23548,7 +23568,12 @@ export function bindSignalHostPropSources(
 		validateDirectSignalControl(element, site);
 		binding.pendingControl ||= activeHydration() !== null && controlSnapshot.editRevision > 0;
 	}
-	const next = resolveSignalHostPropSources(sources, readStyle);
+	const next = resolveSignalHostPropSources(
+		sources,
+		readStyle,
+		undefined,
+		element.localName === 'textarea',
+	);
 	binding.resolved = setHostPropSources(
 		element,
 		next.sources,
@@ -23557,6 +23582,7 @@ export function bindSignalHostPropSources(
 		hasNestedChildren,
 		readStyle,
 		binding.pendingControl,
+		next.writableTextareaValue,
 	);
 	if (STAGED_COMMIT_CAPTURE !== null) {
 		DEFERRED_LAYOUT_DRIVER!.stageAction(() => {
@@ -26338,7 +26364,7 @@ function setNativeChangeDiagnosticMetadata(el: Element, value: unknown): void {
  * attribute write never clobbers what the user typed, and it keeps SSR
  * output, form.reset() baselines, and differential byte-compares aligned.
  */
-export function setValue(el: Element, value: unknown): void {
+export function setValue(el: Element, value: unknown, writableTextareaEcho = false): void {
 	// An unmatched scalar or spread is not permission to steal an offered control.
 	if (CURRENT_SCOPE?.block.idState.renderOwner?.controlLeases?.has(el)) presentationMiss(false);
 	const input = el as HTMLInputElement | HTMLTextAreaElement;
@@ -26390,6 +26416,17 @@ export function setValue(el: Element, value: unknown): void {
 	// the reset button's default action, i.e. any script-dispatched click.
 	// IME: an UNCHANGED rendered value must not cancel an active composition;
 	// a genuinely changed one still wins (React: setState during composition).
+	// A writable textarea's native input already published this exact value. An
+	// echo must retain the browser's edit transaction: changing its text-content
+	// reset baseline splits native Undo into individual keystrokes. Scalar and
+	// read-only values keep the ordinary attribute mirroring contract.
+	if (writableTextareaEcho) {
+		if ((STAGED_DOM?.view(input) ?? input).value === s) return;
+		if (!(ctrl.composing && Object.is(prev, value))) (STAGED_DOM?.view(input) ?? input).value = s;
+		if ((STAGED_DOM?.view(input) ?? input).defaultValue !== s)
+			(STAGED_DOM?.view(input) ?? input).defaultValue = s;
+		return;
+	}
 	if (!(ctrl.composing && Object.is(prev, value)) && valueNeedsWrite(input, value))
 		(STAGED_DOM?.view(input) ?? input).value = s;
 	if ((STAGED_DOM?.view(input) ?? input).defaultValue !== s)
@@ -26828,6 +26865,7 @@ function applyFormControlValues(
 	checked: unknown,
 	defaultChecked: unknown,
 	multiple: unknown,
+	writableTextareaValue = false,
 ): void {
 	const ctrl = armControlled(el);
 	const first = !ctrl.formSeen;
@@ -26870,7 +26908,7 @@ function applyFormControlValues(
 
 	if (tag === 'textarea') {
 		const textarea = el as HTMLTextAreaElement;
-		setValue(textarea, value);
+		setValue(textarea, value, writableTextareaValue);
 		if (value == null) {
 			if (defaultValue != null) setDefaultValue(textarea, defaultValue, first);
 			else if (!first && (STAGED_DOM?.view(textarea) ?? textarea).defaultValue !== '')
@@ -30796,7 +30834,10 @@ function flattenDeoptChildren(out: any[], v: any): void {
 // (the old compact-then-match-in-order behavior morphed them: inputs swapped
 // values, a clicked button could morph into a submit button MID-DISPATCH and
 // fire a phantom form submission). Nested arrays key within their slot;
-// explicit keys ride inside the same scheme.
+// explicit keys ride inside the same scheme. Nested keys start with ':<index>'
+// and end in distinct 'i' (index) and 'k' (explicit key) namespaces, so user keys
+// cannot impersonate deeper wrappers. Top-level string keys starting with ':'
+// escape it as '::'; ordinary flat keys keep their allocation-free path.
 function flattenDeoptChildrenKeyed(outVals: any[], outKeys: any[], v: any, prefix: string): void {
 	if (v == null || v === false || v === true || v === '') return;
 	if (Array.isArray(v)) {
@@ -30804,20 +30845,26 @@ function flattenDeoptChildrenKeyed(outVals: any[], outKeys: any[], v: any, prefi
 		for (let i = 0; i < v.length; i++) {
 			const item = v[i];
 			if (Array.isArray(item)) {
-				flattenDeoptChildrenKeyed(outVals, outKeys, item, prefix + i + ':');
+				flattenDeoptChildrenKeyed(outVals, outKeys, item, prefix + ':' + i);
 			} else if (item == null || item === false || item === true || item === '') {
 				// empty — consumes its position, emits nothing
 			} else {
 				outVals.push(item);
 				const k = keyForItem(item, i);
-				outKeys.push(prefix === '' ? k : prefix + String(k));
+				if (prefix === '') {
+					outKeys.push(typeof k === 'string' && k[0] === ':' ? ':' + k : k);
+				} else {
+					const explicit = item?.$$kind === ELEMENT_TAG && item.key != null;
+					outKeys.push(prefix + ':' + (explicit ? 'k' : 'i') + String(k));
+				}
 			}
 		}
 		return;
 	}
 	outVals.push(v);
+	const k = v?.$$kind === ELEMENT_TAG && v.key != null ? v.key : 0;
 	outKeys.push(
-		prefix === '' ? (v?.$$kind === ELEMENT_TAG && v.key != null ? v.key : 0) : prefix + '0',
+		prefix === '' ? (typeof k === 'string' && k[0] === ':' ? ':' + k : k) : prefix + ':i0',
 	);
 }
 
