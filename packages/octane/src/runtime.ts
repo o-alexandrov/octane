@@ -22177,6 +22177,23 @@ export function setStringData(el: Element, name: string, value: unknown): void {
 	const t = typeof value;
 	let next: string | null;
 	if (value == null || t === 'function' || t === 'symbol') {
+		// Match the generic router's dev diagnostic for dropped function/symbol
+		// values on standard elements (custom elements keep raw semantics — no
+		// warning — and nullish values are a plain absence, never an error).
+		if (
+			process.env.NODE_ENV !== 'production' &&
+			t !== 'undefined' &&
+			value !== null &&
+			(el as any).__oct_loc !== undefined &&
+			!isHtmlCustomElement(el)
+		) {
+			devWarnAttributeOnce(
+				el,
+				name,
+				`Invalid value for prop \`${name}\` on <${el.localName}> tag. ` +
+					'Either remove it from the element, or pass a string or number value to keep it in the DOM.',
+			);
+		}
 		next = null;
 	} else {
 		// Match the generic attribute path's useful DEV diagnostic without pulling
@@ -22192,6 +22209,21 @@ export function setStringData(el: Element, name: string, value: unknown): void {
 				name,
 				`The provided \`${name}\` attribute is an object; it will stringify to ` +
 					'"[object Object]". Pass a string (or a value with a meaningful toString) instead.',
+			);
+		}
+		// The generic router's data-* arm warns on NaN in dev; the lean writer
+		// keeps the same diagnostic so spread-routed and compiled writes agree.
+		if (
+			process.env.NODE_ENV !== 'production' &&
+			t === 'number' &&
+			(el as any).__oct_loc !== undefined &&
+			Number.isNaN(value)
+		) {
+			devWarnAttributeOnce(
+				el,
+				name,
+				`Received NaN for the \`${name}\` attribute. ` +
+					'If this is expected, cast the value to a string.',
 			);
 		}
 		next = typeof value === 'string' ? value : String(value);
@@ -22650,13 +22682,69 @@ function applyStyleValue(
 	}
 }
 
+// Whether `style[name] = value` performs a real declaration write: the name is
+// a string-typed CSSStyleDeclaration IDL attribute (camelCase or a verified
+// vendor spelling the platform exposes). The IDL setter runs the same CSS
+// parse as setProperty but skips the kebab-case conversion and CSSOM's
+// property-name lookup — the direct write is the common case on this path.
+// Only a dashless name can be an IDL attribute: dashed keys (`font-size`,
+// `--custom`, `-webkit-x`) READ through the declaration's named getter, but
+// assigning them never reaches the declaration — a dead expando. `cssText` is
+// excluded by name: its IDL setter replaces the whole declaration, never a
+// per-property write. The typeof probe admits only settable string attributes
+// (methods are functions; `length`/`parentRule` are non-string), so miscased or
+// unsupported spellings fall back to setProperty rather than expanding onto
+// the object. Probed lazily once per property name against a detached element;
+// a DOM-less (SSR/headless) module never touches `document` and always keeps
+// the setProperty path.
+const styleIdlWritableCache = new Map<string, boolean>();
+let styleIdlProbe: CSSStyleDeclaration | null | undefined;
+// Per spec an IDL assignment is `setProperty(prop, value, '')` — a wholesale
+// declaration replace that clears a stale `!important` priority. Some CSSOM
+// implementations (jsdom) instead preserve the existing priority on a
+// camelCase write; on those the important→plain transition still needs
+// setProperty. Probed once alongside the declaration.
+let styleIdlKeepsPriority = false;
+
+function styleIdlWritable(name: string): boolean {
+	const cached = styleIdlWritableCache.get(name);
+	if (cached !== undefined) return cached;
+	let writable = false;
+	// The letter-first check keeps the typeof probe honest: index keys like '0'
+	// READ as strings through the declaration's indexed getter but can never be
+	// IDL attributes, and junk punctuation must fall through to setProperty.
+	const code = name.charCodeAt(0);
+	if (
+		name.indexOf('-') === -1 &&
+		name !== 'cssText' &&
+		((code >= 65 && code <= 90) || (code >= 97 && code <= 122))
+	) {
+		if (styleIdlProbe === undefined) {
+			if (typeof document === 'undefined') {
+				styleIdlProbe = null;
+			} else {
+				const probe = document.createElement('div').style;
+				probe.setProperty('color', 'red', 'important');
+				(probe as any).color = 'blue';
+				styleIdlKeepsPriority = probe.getPropertyPriority('color') === 'important';
+				// Leave the probe declaration empty again so its indexed getters
+				// stay undefined for every later name check.
+				probe.removeProperty('color');
+				styleIdlProbe = probe;
+			}
+		}
+		writable = styleIdlProbe !== null && typeof (styleIdlProbe as any)[name] === 'string';
+	}
+	styleIdlWritableCache.set(name, writable);
+	return writable;
+}
+
 function applyStyleProperty(
 	el: HTMLElement | SVGElement,
 	style: CSSStyleDeclaration,
 	name: string,
 	value: any,
 ): void {
-	const prop = styleName(name);
 	// React parity: a bare number gets `px` unless it's 0, a custom prop, or unitless.
 	let s: string;
 	if (process.env.NODE_ENV !== 'production' && (el as any).__oct_loc !== undefined) {
@@ -22676,12 +22764,24 @@ function applyStyleProperty(
 	const tail = s.trimEnd();
 	if (tail.endsWith(IMPORTANT_SUFFIX)) {
 		style.setProperty(
-			prop,
+			styleName(name),
 			tail.slice(0, tail.length - IMPORTANT_SUFFIX.length).trimEnd(),
 			'important',
 		);
+	} else if (styleIdlWritable(name)) {
+		if (styleIdlKeepsPriority) {
+			// Priority-preserving implementation: a declaration carrying
+			// `!important` keeps it through a plain assignment, so replacing the
+			// declaration (and dropping the flag) takes the explicit route.
+			const prop = styleName(name);
+			if (style.getPropertyPriority(prop) === 'important') {
+				style.setProperty(prop, s);
+				return;
+			}
+		}
+		(style as any)[name] = s;
 	} else {
-		style.setProperty(prop, s);
+		style.setProperty(styleName(name), s);
 	}
 }
 
@@ -22990,10 +23090,7 @@ function resolvedHostPropsEqual(
 	prev: Record<string, unknown>,
 ): boolean {
 	for (const k in next) {
-		if (
-			!Object.prototype.propertyIsEnumerable.call(prev, k) ||
-			!Object.is(next[k], prev[k])
-		)
+		if (!Object.prototype.propertyIsEnumerable.call(prev, k) || !Object.is(next[k], prev[k]))
 			return false;
 	}
 	for (const k in prev) {
@@ -23786,6 +23883,19 @@ export function setSpread(
 		// Controlled fields reassert live DOM drift; other unchanged props need no
 		// event-name parsing or custom-element routing.
 		if (v === pv && !isControlledHostProp(el, k) && !initialHydration) continue;
+		// A `data-*` key is never a delegated event, form control, aliased name, or
+		// namespaced attribute, so it skips the generic router for the lean writer.
+		// setStringData applies the identical coercion the router's data-* arm
+		// computes (booleans stringify; nullish/function/symbol remove) and carries
+		// the same hydration allowAttribute consult and transition journal. Custom
+		// elements need no carve-out — a dashed name never aliases, so verbatim and
+		// aliased routes agree. A name failing VALID_ATTR_NAME stays on the generic
+		// skip-and-warn path: setStringData assumes a valid name and the platform
+		// would throw InvalidCharacterError.
+		if (k.startsWith('data-') && VALID_ATTR_NAME.test(k)) {
+			setStringData(el, k, v);
+			continue;
+		}
 		const ev = eventSlot(k, el);
 		if (ev) {
 			if (v === pv) continue;
