@@ -7,14 +7,15 @@ import {
 	FastPathSvgEdge,
 } from './_fixtures/single-spread-fast-path.tsrx';
 
-// A commit whose single spread source plus named writers all match the
-// committed resolved record takes a raw-source fast path in setHostPropSources,
-// skipping the writer Maps and resolved record the full path would allocate.
-// It is a pure fast path over the resolved-record bail — never a semantic fork —
-// so correctness oracles sit on the DOM boundary (MutationObserver records and
-// setAttribute/removeAttribute call counts). The one internal-facing assertion
-// is the Map-allocation count: the fast path exists to skip that materialization,
-// and a DOM oracle cannot distinguish the two bails.
+// A commit whose single spread source plus named writers keep the committed
+// shape replays the resolved-record plan in setHostPropSources, skipping the
+// writer Maps the full path would allocate — on unchanged commits it skips the
+// resolved record too. It is a pure fast path over the resolved-record bail —
+// never a semantic fork — so correctness oracles sit on the DOM boundary
+// (MutationObserver records and setAttribute/removeAttribute call counts). The
+// one internal-facing assertion is the Map-allocation count: the plan path
+// exists to skip that materialization, and a DOM oracle cannot distinguish the
+// two bails.
 
 function watchWrites(el: Element): MutationObserver {
 	const observer = new MutationObserver(() => {});
@@ -58,7 +59,7 @@ afterEach(() => {
 });
 
 describe('single-spread fast path', () => {
-	it('bails an unchanged svg-edge commit without materializing writer Maps', () => {
+	it('replays the committed plan on shape-stable commits without materializing writer Maps', () => {
 		const setAttribute = vi.spyOn(Element.prototype, 'setAttribute');
 		const removeAttribute = vi.spyOn(Element.prototype, 'removeAttribute');
 		const r = mount(FastPathSvgEdge, { tick: 'a', ...EDGE });
@@ -70,27 +71,47 @@ describe('single-spread fast path', () => {
 		setAttribute.mockClear();
 		removeAttribute.mockClear();
 
-		// Fresh source objects resolving to the committed record: the commit is
-		// real (the tick sibling updates) but the host sees no writes.
-		const unchanged = countMaps(() =>
+		// Identical source objects bail before the resolve runs at all: the
+		// commit is real (the tick sibling updates) but the host sees no writes.
+		const identical = countMaps(() => r.update(FastPathSvgEdge, { tick: 'b', ...EDGE }));
+		expect(r.find('#edge-tick').textContent).toBe('b');
+		expect(observer.takeRecords()).toEqual([]);
+		expect(setAttribute).not.toHaveBeenCalled();
+		expect(removeAttribute).not.toHaveBeenCalled();
+
+		// Fresh containers miss the raw-source bail even at equal values: this
+		// commit pays the full resolve — and attaches the source-shape plan the
+		// following commits replay.
+		const resolved = countMaps(() =>
 			r.update(FastPathSvgEdge, {
-				tick: 'b',
+				tick: 'c',
 				cls: 'edge',
 				d: 'M0 0L1 1',
 				style: { stroke: 'red' },
 				attrs: { 'data-x': '1', title: 'edge' },
 			}),
 		);
-		expect(r.find('#edge-tick').textContent).toBe('b');
-		expect(observer.takeRecords()).toEqual([]);
-		expect(setAttribute).not.toHaveBeenCalled();
-		expect(removeAttribute).not.toHaveBeenCalled();
+		expect(resolved).toBeGreaterThan(identical);
 
-		// A changed spread value falls back to the full resolve, which does
-		// materialize Maps — the delta proves the unchanged commit skipped them.
+		// A shape-stable commit replays the plan — equal values write nothing —
+		// without materializing the writer Map the full resolve builds.
+		const planned = countMaps(() =>
+			r.update(FastPathSvgEdge, {
+				tick: 'd',
+				cls: 'edge',
+				d: 'M0 0L1 1',
+				style: { stroke: 'red' },
+				attrs: { 'data-x': '1', title: 'edge' },
+			}),
+		);
+		expect(observer.takeRecords()).toEqual([]);
+		expect(planned).toBeLessThan(resolved);
+
+		// A changed spread value diffs through the same plan — still no writer
+		// Map — and the write reaches the host.
 		const changed = countMaps(() =>
 			r.update(FastPathSvgEdge, {
-				tick: 'c',
+				tick: 'e',
 				cls: 'edge',
 				d: 'M0 0L1 1',
 				style: { stroke: 'red' },
@@ -98,7 +119,23 @@ describe('single-spread fast path', () => {
 			}),
 		);
 		expect(target.getAttribute('data-x')).toBe('2');
-		expect(changed).toBeGreaterThan(unchanged);
+		expect(changed).toBeLessThan(resolved);
+
+		// A shape change drops the commit back to the full resolve — the writer
+		// Map the plan commits skipped shows up again in the count.
+		const reshaped = countMaps(() =>
+			r.update(FastPathSvgEdge, {
+				tick: 'f',
+				cls: 'edge',
+				d: 'M0 0L1 1',
+				style: { stroke: 'red' },
+				attrs: { 'data-x': '2', title: 'edge', 'data-more': '3' },
+			}),
+		);
+		expect(target.getAttribute('data-more')).toBe('3');
+		expect(reshaped).toBeGreaterThan(changed);
+		observer.disconnect();
+		r.unmount();
 	});
 
 	it('detects in-place mutation of the spread source by value, not identity', () => {
