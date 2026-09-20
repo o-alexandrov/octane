@@ -227,6 +227,17 @@ for (const set of SETS)
 			console.log(
 				`  ${verdict === 'specialized' ? '✓' : '✗'} ${setLabel}${name}: void-root ${verdict}`,
 			);
+			// The verdict is a gate for the compiled apps, not just a report:
+			// losing __createVoidRoot specialization is the regression this
+			// check exists to catch. octane-jsx hand-writes a user-level
+			// createRoot call, so 'generic-root' is its expected verdict and
+			// stays informational.
+			if (name === 'octane-tsrx')
+				assert.equal(
+					verdict,
+					'specialized',
+					`${setLabel}${name}: app-mode root lost __createVoidRoot specialization`,
+				);
 		}
 		const px = set.prefix;
 		Object.assign(entry.ops, {
