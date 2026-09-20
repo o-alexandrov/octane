@@ -31074,10 +31074,17 @@ function makeCompCall(
 						} else {
 							autoMemoWitnesses = [...(calleeInfo.autoMemoImportedComponents || [])];
 							autoMemoContextAware = calleeInfo.autoMemoMayReadContext === true;
-							// The ordinary cache may need a context-stamping Block. The
-							// proven synchronous state-only path keeps its existing lite
-							// representation and therefore adds no mount boundaries.
-							liteEligible = false;
+							if (autoMemoContextAware) {
+								// A context-aware cache needs the context-stamping Block,
+								// so the call keeps the full componentSlot lowering.
+								liteEligible = false;
+							} else {
+								// A context-free callee's guard stamps nothing: keep the
+								// lite representation and memo-wrap the same
+								// componentSlotLite call the unguarded path would emit —
+								// the cache adds no mount boundaries.
+								autoMemoLite = liteEligible;
+							}
 							singleRoot = calleeInfo.singleRoot === true;
 						}
 					}
@@ -31117,13 +31124,16 @@ function makeCompCall(
 	// emitElementHtml). Only a componentSlotLite lowering can lose its
 	// position (no markers, no anchor, no record) — and only when the callee's
 	// body root can take a null-arm branch; anchorlessRootSafe carries that
-	// transitive proof (see anchorlessRootShape). Every non-lite lowering
-	// self-positions: componentSlot mints its marker pair, and the singleRoot
-	// regimes keep the root element from mount. (A staticFragmentRenderer fold
-	// registers only for single-plain-host-root callees, so its authored
-	// info's shape proof holds.)
+	// transitive proof (see anchorlessRootShape). A memo-guarded lite call
+	// (autoMemoLite) is the same markerless regime, so it needs the same
+	// proof. Every non-lite lowering self-positions: componentSlot mints its
+	// marker pair, and the singleRoot regimes keep the root element from
+	// mount. (A staticFragmentRenderer fold registers only for
+	// single-plain-host-root callees, so its authored info's shape proof
+	// holds.)
+	const liteLowering = liteEligible || autoMemoLite;
 	const anchorlessAppendSafe =
-		!liteEligible || ctx.componentInfo?.get(compName)?.anchorlessRootSafe === true;
+		!liteLowering || ctx.componentInfo?.get(compName)?.anchorlessRootSafe === true;
 
 	return {
 		id,

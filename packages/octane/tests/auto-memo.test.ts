@@ -4745,13 +4745,16 @@ describe('compiler-owned component-region memoization', () => {
 		}).code;
 
 		expectCompilerRegion(defaultBuild);
-		expect(defaultBuild).toContain('componentSlotVoid as');
+		// Rows is hookless, void, and context-free: its memo region wraps the
+		// markerless lite lowering. Returned reconciles a JSX descriptor, so it
+		// keeps the full componentSlot.
+		expect(defaultBuild).toContain('componentSlotLite as');
 		expect(defaultBuild).toContain('componentSlot as');
 		expect(defaultBuild).toMatch(/const __memoDep[\w$]* = \(?props\.items\)?;/);
 		expect(defaultBuild).toMatch(/const __memoDep[\w$]* = \(?props\.label\)?;/);
 		expect(defaultBuild).not.toMatch(/const __memoDep[\w$]* = \(?props\)?;/);
 		expect(defaultBuild).toMatch(
-			/if \([^{}]*!_\$hookMemoEqual\(__memoCache[\w$]*\[\d+\], __memoDep[\w$]*\)\) \{\s*_\$componentSlotVoid\([^;]*, Rows,/,
+			/if \([^{}]*!_\$hookMemoEqual\(__memoCache[\w$]*\[\d+\], __memoDep[\w$]*\)\) \{\s*_\$componentSlotLite\([^;]*, Rows,/,
 		);
 		expect(defaultBuild).toMatch(
 			/if \([^{}]*!_\$hookMemoEqual\(__memoCache[\w$]*\[\d+\], __memoDep[\w$]*\)\) \{\s*_\$componentSlot\([^;]*, Returned,/,
