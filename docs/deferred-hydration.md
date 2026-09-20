@@ -526,6 +526,11 @@ adoption callback when discovery, externally streamed ranges, or automatic
 element-removal cleanup is needed; the small binding runtime does not require
 that machinery itself.
 
+For scalar views hydrated without an explicit lease, hydration retains values
+published by a live binding. After releasing that binding, the next normal
+render applies its props even when they equal the historical server props;
+hydration does not cache a skipped write as an applied value.
+
 Each external range belongs to its declared `owner`. Strictly nested ranges are
 allowed, and the closest registered range determines ownership for behaviors
 with an `owner` constraint. Registering the same element for another owner
@@ -674,6 +679,14 @@ composition survive takeover. A later call to the old cleanup cannot dispose the
 successor. Normal controlled-value semantics apply after takeover, including an
 explicit changed model value winning during composition.
 
+A browser-restored textarea value can differ from its server reset baseline
+without an `input` event. Initial writable binding or hydration adopts that live
+value while the model still equals the server baseline and composition is not
+active. During an offered control's takeover, a later restored value transfers
+through the accepted commit outside active composition; a newer model write or
+native edit during retirement keeps precedence. Subsequent explicit model
+updates continue to control the textarea normally.
+
 The successor's value subscription is prepared before either early owner
 retires. If acquiring it fails, the early presentation and control remain
 usable and hydration reports the error. Retirement cleanup must not dispose
@@ -817,6 +830,13 @@ BFCache restoration.
 Deferred hydration is a performance hint. An update outside a dormant boundary
 may open it early when Octane must reconcile the child to avoid stale server
 HTML. `never()` is the exception: its initial server subtree remains static.
+
+When a mounted parent updates a dormant boundary, activation uses the latest
+captures for child state, events, refs, and effects. Development attribute
+mismatch diagnostics compare the server HTML with the initial client captures,
+so a legitimate later attribute update does not produce a hydration warning.
+An initial server/client attribute mismatch is still diagnosed, including when
+a later update corrects it before activation.
 
 Treat `when` as boundary configuration rather than a strategy state machine. If
 the intended meaning of a boundary changes, give `Hydrate` a new `key` to start

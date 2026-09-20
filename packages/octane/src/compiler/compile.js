@@ -1444,6 +1444,7 @@ const INTERNAL_CLIENT_RUNTIME_HELPERS = new Set([
 	'bindSignalText',
 	'bindSignalChild',
 	'bindSignalAttribute',
+	'hydrateClaimedBindingCaches',
 	'bindSignalValue',
 	'bindSignalChecked',
 	'bindSignalHostPropSources',
@@ -15940,6 +15941,8 @@ function preparePresentationHydration(body, node, ctx, hostEnd) {
  * bodies. `cssHash` selects the enclosing scoped-style expression fallback.
  */
 function compileFunctionBody(node, ctx, name, parentNs = 'html', cssHash = null, options = null) {
+	const previousScalarBindingClaims = ctx.scalarBindingClaims;
+	ctx.scalarBindingClaims = node._octaneScalarBindingClaims;
 	const previousPresentationHydration = ctx.presentationHydration;
 	ctx.presentationHydration = node._octanePresentationHydration;
 	const returnedOutput = options?.returnedOutput === true;
@@ -16553,6 +16556,7 @@ function compileFunctionBody(node, ctx, name, parentNs = 'html', cssHash = null,
 		ctx,
 		presentationHostEnd,
 	);
+	ctx.scalarBindingClaims = previousScalarBindingClaims;
 	ctx.presentationHydration = previousPresentationHydration;
 	const emittedFunction = b.function_declaration(
 		b.id(name, node.id ?? node),
@@ -24220,16 +24224,9 @@ const INTRINSIC_MUTATION_METHODS = new Set([
 ]);
 
 function mayWriteTextIntrinsicMember(target) {
+	target = unwrapTsExpr(target);
 	if (!target || typeof target !== 'object') return false;
-	if (
-		target.type === 'TSAsExpression' ||
-		target.type === 'TSTypeAssertion' ||
-		target.type === 'TSNonNullExpression' ||
-		target.type === 'ParenthesizedExpression' ||
-		target.type === 'AssignmentPattern'
-	) {
-		return mayWriteTextIntrinsicMember(target.expression ?? target.left);
-	}
+	if (target.type === 'AssignmentPattern') return mayWriteTextIntrinsicMember(target.left);
 	if (target.type === 'MemberExpression') {
 		return target.computed
 			? target.property?.type !== 'Literal' || TEXT_INTRINSICS.has(target.property.value)
@@ -24280,15 +24277,8 @@ function isPossibleIntrinsicMutator(node) {
 // proofs for the module. Calls still evaluate the authored callee: a replacement
 // may return an element rather than the built-in's primitive result.
 function writesGlobalTextIntrinsic(target, lexical) {
+	target = unwrapTsExpr(target);
 	if (!target || typeof target !== 'object') return false;
-	if (
-		target.type === 'TSAsExpression' ||
-		target.type === 'TSTypeAssertion' ||
-		target.type === 'TSNonNullExpression' ||
-		target.type === 'ParenthesizedExpression'
-	) {
-		return writesGlobalTextIntrinsic(target.expression, lexical);
-	}
 	const unbound = (node, name) => {
 		const scope = lexical.nodeScopes.get(node);
 		return scope !== undefined && !lexical.isBound(scope, name);
@@ -25853,6 +25843,69 @@ function planJsx(
 		if (!updateEmit) continue;
 		if (b.deferred) everyRenderLines.push(updateEmit);
 		else updateLines.push(updateEmit);
+	}
+	if (ctx.scalarBindingClaims) {
+		// Only opted-in scalar views can retain another writer's publication at
+		// hydration. Record their existing cache fields; ordinary output is unchanged.
+		const fields = [];
+		for (const binding of elementBindings) {
+			const key = binding.id;
+			const text = binding.kind === 'textOnlyChild' || binding.kind === 'text';
+			const host = text && !binding.signalDirect ? `_txt$${key}` : `_el$${key}`;
+			if (text && binding.signalDirect)
+				fields.push(bag.letter(`_sig$${key}`), bag.letter(host), '#text-token');
+			if (binding.kind === 'nativeStyle') {
+				fields.push(binding.slotIndex, bag.letter(host), 'style');
+			} else if (binding.kind === 'styleProperties') {
+				for (let i = 0; i < binding.properties.length; i++)
+					fields.push(
+						bag.letter(`_prev$${key}_${i}`),
+						bag.letter(host),
+						`style:${binding.properties[i].name}`,
+					);
+			} else if (binding.kind === 'style') {
+				fields.push(bag.letter(`_sty$${key}`), bag.letter(host), 'style');
+			} else if (
+				text ||
+				['attr', 'stringData', 'booleanAttr', 'ariaAttr', 'class', 'styleProperty'].includes(
+					binding.kind,
+				)
+			) {
+				const cache = binding.signalDirect && !text ? `_sig$${key}` : `_prev$${key}`;
+				fields.push(
+					bag.letter(cache),
+					bag.letter(host),
+					text
+						? '#text'
+						: binding.kind === 'styleProperty'
+							? `style:${binding.name}`
+							: binding.kind === 'class'
+								? 'class'
+								: ATTRIBUTE_ALIASES.get(binding.name) || binding.name,
+				);
+			}
+		}
+		if (fields.length) {
+			const name = `_claims$${ctx.nextHelperId++}`;
+			ctx.hoistedHelpers.push(
+				inheritOriginLoc(
+					b.const(name, b.array(fields.map((value) => b.literal(value)))),
+					planOrigin,
+				),
+			);
+			everyRenderLines.push(
+				inheritOriginLoc(
+					b.stmt(
+						b.call(
+							requireRuntimeForContext(ctx, 'hydrateClaimedBindingCaches'),
+							b.id('__s'),
+							b.id(name),
+						),
+					),
+					planOrigin,
+				),
+			);
+		}
 	}
 	if (keyedSelection !== null && single && !noTemplate) {
 		// Reuse the ordinary root-class write and its exact bag fields. Updating
@@ -30941,7 +30994,7 @@ function autoMemoDependencyOrderKey(original) {
 	return astStructuralKey(node);
 }
 
-function collectAutoMemoDependencyExpressions(nodes) {
+function collectAutoMemoDependencyExpressions(nodes, templateControlFlow = false) {
 	const dependencies = new Set();
 	const dependencyNodes = new Map();
 	const dependencyOrder = new Map();
@@ -31000,6 +31053,19 @@ function collectAutoMemoDependencyExpressions(nodes) {
 			node.type === 'LogicalExpression' ||
 			node.type === 'ConditionalExpression' ||
 			node.type === 'ChainExpression' ||
+			(templateControlFlow &&
+				(node.type === 'JSXIfExpression' ||
+					node.type === 'JSXForExpression' ||
+					node.type === 'JSXSwitchExpression' ||
+					node.type === 'JSXTryExpression' ||
+					node.type === 'IfStatement' ||
+					node.type === 'ForStatement' ||
+					node.type === 'ForOfStatement' ||
+					node.type === 'ForInStatement' ||
+					node.type === 'SwitchStatement' ||
+					node.type === 'TryStatement' ||
+					node.type === 'WhileStatement' ||
+					node.type === 'DoWhileStatement')) ||
 			((node.type === 'MemberExpression' ||
 				node.type === 'OptionalMemberExpression' ||
 				node.type === 'CallExpression' ||
@@ -31074,6 +31140,38 @@ function requireCompiledHydrateAlias(ctx) {
 	}
 	ctx.runtimeNeeded.add(helper);
 	return alias;
+}
+
+function hydrateDiagnosticChildrenCaptures(node, children, ctx) {
+	if (!ctx.dev || ctx.mode === 'server') return undefined;
+	const tag = node.openingElement?.name ?? node.id;
+	if (tag?.type !== 'JSXIdentifier' || ctx.octaneImportLocals?.get(tag.name) !== 'Hydrate')
+		return undefined;
+	const lexical = (ctx.activityLexical ??= createLexicalAnalysis(ctx.activityModuleAst));
+	const binding = lexical.resolveBinding(lexical.nodeScopes.get(tag), tag.name);
+	if (binding?.scope !== lexical.rootScope || binding.importSource?.value !== 'octane')
+		return undefined;
+	const plan = collectAutoMemoDependencyExpressions(children, true);
+	if (!plan.safe || mapCallbackCapturesLexicalReceiver(children)) return null;
+	const free = collectFreeIdentifiers(children, []);
+	const local = collectSubtreeBindings(children, new Set());
+	// A child-local shadow with the same spelling cannot be read from the
+	// enclosing closure. Decline the certificate rather than invent a witness.
+	for (const name of free) if (local.has(name)) return null;
+	const captures = [];
+	const covered = new Set();
+	const dependencyNode = depNodeFor({ autoMemoDepNodes: plan.dependencyNodes });
+	for (const dependency of plan.dependencies) {
+		const expression = dependencyNode(dependency);
+		const roots = collectFreeIdentifiers(expression, []);
+		if (roots.size === 0 || [...roots].some((name) => !free.has(name))) continue;
+		captures.push(expression);
+		for (const name of roots) covered.add(name);
+	}
+	for (const name of free) if (!covered.has(name)) captures.push(b.id(name));
+	// Property reads stay deferred until activation; collecting diagnostic data
+	// must not evaluate a dormant child's getters or call its render function.
+	return inheritOriginLoc(b.arrow([], b.array(captures)), node);
 }
 
 function isPrivateSplitContextProvider(node, ctx) {
@@ -31265,7 +31363,8 @@ function makeCompCall(
 			ctx.runtimeNeeded.add('markChildrenBlock');
 			hasChildrenProp = true;
 			const childrenArgs = [b.id(childrenHelperName)];
-			if (ctx.autoMemo && ctx.mode !== 'server') {
+			const diagnosticCaptures = hydrateDiagnosticChildrenCaptures(node, children, ctx);
+			if ((ctx.autoMemo && ctx.mode !== 'server') || diagnosticCaptures !== undefined) {
 				// These functions close over parent locals and are recreated on every
 				// render. A module-owned token distinguishes a real Provider body
 				// handoff from fresh captures without invalidating ordinary cache hits.
@@ -31273,6 +31372,8 @@ function makeCompCall(
 				ctx.hoistedHelpers.push(inheritOriginLoc(b.const(bodyIdentity, b.object([])), node));
 				childrenArgs.push(b.id(bodyIdentity));
 			}
+			if (diagnosticCaptures !== undefined)
+				childrenArgs.push(diagnosticCaptures ?? b.literal(null));
 			let childrenValue = b.call('_$markChildrenBlock', ...childrenArgs);
 			if (ctx.presentationHydration?.structural && node._octaneBindingSite)
 				childrenValue = b.call(
