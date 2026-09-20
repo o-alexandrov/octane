@@ -31771,7 +31771,22 @@ function makeForCall(node, ctx, inlinedSubs, parentNs = 'html', cssHash = null) 
 		// PURE would strand consumers on Provider updates (the ordinary forBlock
 		// survivor shortcut has no compiler-cache epoch cell to consult).
 		if (itemMemoContextAware && autoMemoDeps === null) itemMemo = false;
-		const hostPure = !hasParentClosure && !hasHook && !hasNestedComp && !hasRenderCall;
+		// A body whose only nested structure is host-only conditional content —
+		// an @if over host output, including a narrowly proven nested keyed @for —
+		// renders nothing opaque of its own, so with no parent captures it is a
+		// pure function of the item: an unchanged item identity leaves nothing
+		// inside the conditional able to move. Two extra gates keep the
+		// identity-only skip honest: a render-time hazard like an assignment in
+		// the @if test fails containsAutoMemoUnsafeStructure, and a live imported
+		// member read (`@if (mod.flag)`) can mutate while the import's identity —
+		// the only thing the skip compares — stays fixed.
+		const hostConditionalPure =
+			hasNestedComp &&
+			hasOnlyHostConditionalItemBodies(subStmts) &&
+			!containsAutoMemoUnsafeStructure(subStmts, ctx) &&
+			!containsImportedMemberRead(bodyAst, ctx.importedNames);
+		const hostPure =
+			!hasParentClosure && !hasHook && !hasRenderCall && (!hasNestedComp || hostConditionalPure);
 		const structuredHostDepEligible =
 			ctx.autoMemo === true &&
 			hasNestedComp &&
