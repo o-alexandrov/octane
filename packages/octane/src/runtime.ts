@@ -22980,6 +22980,28 @@ function resolveHostPropSources(
 	return resolved;
 }
 
+/**
+ * Shallow equality over resolved host-prop records: identical own key sets with
+ * `Object.is` values. A key only `prev` still carries is a pending removal — a
+ * real DOM write — so both directions must agree before a commit may bail.
+ */
+function resolvedHostPropsEqual(
+	next: Record<string, unknown>,
+	prev: Record<string, unknown>,
+): boolean {
+	for (const k in next) {
+		if (
+			!Object.prototype.propertyIsEnumerable.call(prev, k) ||
+			!Object.is(next[k], prev[k])
+		)
+			return false;
+	}
+	for (const k in prev) {
+		if (!Object.prototype.propertyIsEnumerable.call(next, k)) return false;
+	}
+	return true;
+}
+
 export function setHostPropSources(
 	el: Element,
 	sources: readonly HostPropSource[],
@@ -22994,8 +23016,33 @@ export function setHostPropSources(
 	const resolved = resolveHostPropSources(el, sources, props, readStyle);
 	const tag = el.localName;
 	const formHost = tag === 'input' || tag === 'textarea' || tag === 'select';
-	setSpread(el, resolved, prev, scope, true, formHost);
-	setDangerouslySetInnerHTMLSources(el, sources, hasNestedChildren);
+	// A commit whose fully-resolved record matches the last commit's has no write
+	// tail to run: every per-key writer already identity-skips, and the
+	// HTML-source reassert short-circuits on an equal resolved value, so the
+	// loops would be a pure re-scan. The compare must be on the RESOLVED record —
+	// `snapshotSpread` re-allocates each source every render, so source identity
+	// can never fire. `prev === undefined` mounts and hydration adoptions never
+	// reach this; hydration-active commits and hidden-display elements keep the
+	// full path because their writers carry extra bookkeeping the resolved
+	// record does not capture.
+	const unchanged =
+		prev !== undefined &&
+		activeHydration() === null &&
+		(hiddenStyleWriter === null ||
+			!('style' in resolved) ||
+			!HIDDEN_DISPLAYS.has(el as HTMLElement)) &&
+		resolvedHostPropsEqual(resolved, prev);
+	if (unchanged) {
+		// Only the write tail is skipped — dev validation and the JS-only
+		// suppress/diagnostic stamps still run, so the element surface is
+		// identical to a full commit. Controlled-form reassertion below is
+		// outside the tail and still fires.
+		stampSpreadPropFlags(el, resolved);
+		if (process.env.NODE_ENV !== 'production') queueDevFormDiagnostic(el, scope);
+	} else {
+		setSpread(el, resolved, prev, scope, true, formHost);
+		setDangerouslySetInnerHTMLSources(el, sources, hasNestedChildren);
+	}
 	// Form writers use the exact JSX spelling, independently of DOM aliases:
 	// e.g. a later VALUE attribute must not replace the controlled value prop.
 	// The raw writer Map already resolved source precedence and getter reads.
@@ -23010,7 +23057,7 @@ export function setHostPropSources(
 			props.get('multiple')?.value,
 			writableTextareaValue,
 		);
-	return resolved;
+	return unchanged ? prev : resolved;
 }
 
 const SIGNAL_HOST_PROP_SOURCES = /* @__PURE__ */ Symbol('octane.signal-host-prop-sources');
@@ -23577,23 +23624,18 @@ function isAggregatedFormControlProp(el: Element, name: string): boolean {
 	return false;
 }
 
-export function setSpread(
-	el: Element,
-	value: any,
-	prev: any,
-	mountScope?: Scope,
-	skipDangerouslySetInnerHTML = false,
-	skipFormControls = false,
-): void {
+/**
+ * The JS-only surface a spread commit stamps ahead of its write loops: dev prop
+ * validation plus the suppress/diagnostic flags the loops and later
+ * interactions consult. Shared with the resolved-record bail in
+ * setHostPropSources, so a commit whose write tail is skipped leaves the
+ * identical element surface.
+ */
+function stampSpreadPropFlags(el: Element, value: any): void {
 	if (process.env.NODE_ENV !== 'production' && value != null) {
 		devValidateAriaProps(el, Object(value) as Record<string, unknown>);
 		devValidateHostProps(el, Object(value) as Record<string, unknown>);
 	}
-	// `mountScope` is passed only on the mount call (not on updates). When present
-	// a spread-supplied ref attach is DEFERRED to commit so a callback ref sees a
-	// connected node — same React-19 timing as element/fragment refs. Updates
-	// defer too when the caller passes its scope (compiled output does), keeping
-	// every attach ordered after every queued detach within the commit.
 	// Stamp `suppressHydrationWarning` BEFORE either loop (order-independent, like React
 	// reading it off props ahead of the diff) so the attribute/class/style writes below
 	// see the flag no matter where the key sits in the spread object. A JS flag only —
@@ -23621,6 +23663,22 @@ export function setSpread(
 	) {
 		setNativeChangeDiagnosticMetadata(el, value.__octaneNativeChangeDiagnostic);
 	}
+}
+
+export function setSpread(
+	el: Element,
+	value: any,
+	prev: any,
+	mountScope?: Scope,
+	skipDangerouslySetInnerHTML = false,
+	skipFormControls = false,
+): void {
+	// `mountScope` is passed only on the mount call (not on updates). When present
+	// a spread-supplied ref attach is DEFERRED to commit so a callback ref sees a
+	// connected node — same React-19 timing as element/fragment refs. Updates
+	// defer too when the caller passes its scope (compiled output does), keeping
+	// every attach ordered after every queued detach within the commit.
+	stampSpreadPropFlags(el, value);
 	if (!skipDangerouslySetInnerHTML) {
 		if (value != null && Object.prototype.propertyIsEnumerable.call(Object(value), 'children')) {
 			(STAGED_DOM?.view(el as any) ?? (el as any))[DANGER_HTML_SPREAD_CHILD] = value.children;
