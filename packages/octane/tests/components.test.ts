@@ -171,3 +171,41 @@ describe('hand-written descriptor renderer (return-based body, no compiler)', ()
 		r.unmount();
 	});
 });
+
+// Issue #1186: a return-based body that returns `undefined` must CLEAR its
+// previous subtree, exactly like `null`/`false`/`''` — React treats an
+// `undefined` return as empty (the `cond && <Child/>` shape where `cond` is
+// object-or-undefined). The runtime used to treat `undefined` as "no decision"
+// and left the outgoing DOM mounted.
+describe('return-based body: falsy returns', () => {
+	const Child = () => createElement('nav', null, 'SIDEBAR');
+
+	it.each([
+		['undefined', undefined, '<!----><!---->'],
+		['null', null, '<!----><!---->'],
+		['false', false, '<!----><!---->'],
+		['empty string', '', '<!----><!---->'],
+		['zero', 0, '<!---->0<!---->'],
+	] as const)('a return of %s clears the previous subtree', (_name, empty, html) => {
+		const Host = (p: { shown: boolean }) => (p.shown ? createElement(Child, null) : (empty as any));
+		const r = mount(Host as any, { shown: true });
+		expect(r.html()).toBe('<!----><nav>SIDEBAR</nav><!---->');
+		r.update(Host as any, { shown: false });
+		expect(r.html()).toBe(html);
+		r.unmount();
+	});
+
+	it('useState toggle returning undefined clears the subtree', () => {
+		let set: (v: boolean) => void = () => {};
+		const Host = () => {
+			const [shown, setShown] = useState(true);
+			set = setShown;
+			return shown ? createElement(Child, null) : (undefined as any);
+		};
+		const r = mount(Host as any);
+		expect(r.container.querySelector('nav')).not.toBeNull();
+		act(() => set(false));
+		expect(r.container.querySelector('nav')).toBeNull();
+		r.unmount();
+	});
+});

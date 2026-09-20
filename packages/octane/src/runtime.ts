@@ -1801,6 +1801,12 @@ export interface Block extends Scope {
 	 * the bail's lazy consumer refresh is sound.
 	 */
 	$$implicitBail: boolean;
+	/**
+	 * The body that last produced a renderable return value for this block —
+	 * lets `undefined` mean "render nothing" only for bodies that use the
+	 * return-value protocol (see renderBlockInner).
+	 */
+	$$returningBody: ComponentBody | undefined;
 	/** Per-render `use(thenable)` call-order counter; reset at the top of renderBlock. */
 	__thenableIdx: number;
 	/**
@@ -10092,6 +10098,9 @@ class BlockImpl {
 	// Arming makes the block a stamping target (like __memo) so the bail's lazy
 	// consumer refresh has the context deps it needs.
 	declare $$implicitBail: boolean;
+	// The body that last produced a renderable return value — see the Block
+	// interface; gates `undefined` → empty reconciliation in renderBlockInner.
+	declare $$returningBody: ComponentBody | undefined;
 	// __thenableIdx is reset every renderBlock so pre-init costs nothing.
 	declare __thenableIdx: number;
 	// Render-loop guard bookkeeping (see the Block interface).
@@ -10186,6 +10195,7 @@ class BlockImpl {
 		this.$$ctxCache = null;
 		this.$$ctxCacheOwner = null;
 		this.$$implicitBail = false;
+		this.$$returningBody = undefined;
 		this.__thenableIdx = 0;
 		this.drainStamp = 0;
 		this.drainRenders = 0;
@@ -10656,7 +10666,31 @@ function renderBlockInner(block: Block): true | undefined {
 			renderRetry = true;
 			return true;
 		}
-		if (out !== undefined && block.outputHandler !== null) block.outputHandler(block, out);
+		if (block.outputHandler !== null) {
+			if (out !== undefined) {
+				// This body returns renderable values. Stamp WHICH body did so a
+				// later `undefined` reads as "render nothing" (React parity —
+				// `null`, `false`, `''` already clear; SSR maps `undefined` to
+				// empty) rather than the imperative convention where `@{}` /
+				// `__children$N` bodies return `undefined` after writing their own
+				// slots. Keyed to the body: a swapped-in imperative body (a
+				// `__children$N` render body replacing a render prop, childSlot's
+				// in-place body swap) does not inherit the stamp.
+				block.$$returningBody = block.body;
+				block.outputHandler(block, out);
+			} else if (
+				block.$$returningBody === block.body &&
+				(block.slots[0] as any)?.$$returnSlot === true
+			) {
+				// `undefined` from a return-dialect body reconciles the return
+				// slot to empty, same as `null`. The `$$returnSlot` mark proves
+				// slot 0 is still the handler-installed record — an imperative
+				// body write adopting it (componentSlot/childSlot on slot 0)
+				// drops the mark at the adopt site, covering trampoline bodies
+				// whose `block.body` identity survives an inner dialect flip.
+				block.outputHandler(block, null);
+			}
+		}
 		finishEffectRender(block);
 		if (!block.mounted) block.mounted = true;
 		if (block.renderStatus === RENDER_RETRYING) block.renderStatus = RENDER_VALID;
@@ -10939,6 +10973,10 @@ function renderReturnedValue(block: Block, out: unknown): void {
 		const last = incoming.end ?? incoming.block?.endMarker ?? first;
 		replaceSharedBlockBoundary(block, replacedStart, replacedEnd, first, last);
 	}
+	// Mark slot 0 as the private return slot so a later `undefined` return is
+	// reconciled to empty rather than read as an imperative body's output.
+	const installed = block.slots[0] as any;
+	if (installed !== undefined && installed.$$returnSlot !== true) installed.$$returnSlot = true;
 }
 
 // Tear down a block's private return slot when renderBlock's return value flips
@@ -29569,6 +29607,11 @@ function componentSlotImpl(
 		return;
 	}
 	let state = parentScope.slots[slotKey] as CompSlot | undefined;
+	// An imperative body write adopting a record the return-value reconciler
+	// marked (`$$returnSlot`) makes it body-owned — drop the mark so a later
+	// `undefined` return is not reconciled against it (renderBlockInner).
+	if (state !== undefined && (state as any).$$returnSlot === true)
+		(state as any).$$returnSlot = undefined;
 	let hydrationCursor: Node | null = null;
 	if (state === undefined) {
 		let start: Comment | null = null;
@@ -33387,6 +33430,11 @@ export function childSlot(
 	// uses it to pick the ANCHORLESS regime, the promotion after it to detect a
 	// mode flip out of that regime, and the classifier to route the value.
 	let state = parentScope.slots[slotKey] as ChildSlot | undefined;
+	// An imperative body write adopting a record the return-value reconciler
+	// marked (`$$returnSlot`) makes it body-owned — drop the mark so a later
+	// `undefined` return is not reconciled against it (renderBlockInner).
+	if (state !== undefined && (state as any).$$returnSlot === true)
+		(state as any).$$returnSlot = undefined;
 	// Once a host gains component children, keep its reconciled Block while it
 	// remains a host descriptor. Dropping back to the raw path would recreate
 	// the host and every surviving input when the last component is removed.
