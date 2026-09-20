@@ -4595,6 +4595,13 @@ function hasOnlyHostConditionalItemBodies(stmts) {
 			type === 'FunctionExpression' ||
 			type === 'FunctionDeclaration'
 		) {
+			// Function boundaries aren't walked for conditionals (their internals
+			// aren't the item body's own output shape), but a render-position
+			// component inside one — a memoizable call's callback argument like
+			// `renderTags(xs, t => <Tag/>)` — is still opaque content the
+			// host-only contract excludes: its own context reads must not be
+			// stranded by an identity-only skip.
+			if (functionBodyContainsComponent(node)) disallowed = true;
 			return;
 		}
 		if ((type === 'Element' || type === 'JSXElement') && isComponentTag(node)) {
@@ -4651,6 +4658,39 @@ function hasOnlyHostConditionalItemBodies(stmts) {
 	}
 	for (const statement of stmts) walk(statement);
 	return hasConditional && !disallowed;
+}
+
+/**
+ * Whether a function boundary's body reaches a component tag at any depth —
+ * e.g. the `t => <Tag/>` argument of a memoizable projection call.
+ * hasOnlyHostConditionalItemBodies skips function internals for shape
+ * purposes, so this separately guards the component-content exclusion it
+ * cannot see.
+ */
+function functionBodyContainsComponent(fn) {
+	let found = false;
+	const seen = new WeakSet();
+	function walk(n) {
+		if (found || !n) return;
+		if (Array.isArray(n)) {
+			for (const x of n) walk(x);
+			return;
+		}
+		if (typeof n !== 'object') return;
+		const t = n.type;
+		if (!t || seen.has(n)) return;
+		seen.add(n);
+		if ((t === 'Element' || t === 'JSXElement') && isComponentTag(n)) {
+			found = true;
+			return;
+		}
+		for (const key in n) {
+			if (AST_WALK_SKIP_KEYS.has(key)) continue;
+			walk(n[key]);
+		}
+	}
+	walk(fn.body ?? fn);
+	return found;
 }
 
 /**

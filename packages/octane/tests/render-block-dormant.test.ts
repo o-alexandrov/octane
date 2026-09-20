@@ -35,8 +35,8 @@ const SLOT_COUNT = Symbol('count');
 const SLOT_EFF = Symbol('eff');
 const SLOT_PROMISE = Symbol('promise');
 
-describe('renderBlockInner dormant-path guards', () => {
-	it('repeatedly re-renders a fully dormant block correctly', () => {
+describe('first use of effects, context, suspension, and transitions', () => {
+	it('re-renders a component that uses only state correctly', () => {
 		// No effects, context reads, thenables, or transitions: every update pays
 		// only the dormant prologue. Assert the plain render result is unchanged.
 		function Counter(props: { base: number }) {
@@ -59,7 +59,7 @@ describe('renderBlockInner dormant-path guards', () => {
 		r.unmount();
 	});
 
-	it('lands the full effect path on the render that first registers an effect, and disconnects it when skipped', async () => {
+	it('fires a conditionally reached effect on the render that first registers it, and cleans it up when skipped', async () => {
 		// The block renders dormant (effectSlots === null) until `on` opens the
 		// guard — that render must still enqueue the new effect. Closing the
 		// guard leaves a registered slot unreached, which finishEffectRender must
@@ -98,7 +98,7 @@ describe('renderBlockInner dormant-path guards', () => {
 		r.unmount();
 	});
 
-	it('suspends correctly when a previously dormant block first calls use()', async () => {
+	it("suspends to the fallback on a component's first use() call and resolves through it", async () => {
 		// Mount and update with no thenable state at all (__thenables undefined),
 		// then arm: a state update introduces the first use() call, which must
 		// suspend, show the fallback, and resolve through the resume path.
@@ -129,7 +129,7 @@ describe('renderBlockInner dormant-path guards', () => {
 		r.unmount();
 	});
 
-	it('records context deps from the render that first reads, so memo bail still refreshes on later provider commits', () => {
+	it('still refreshes a memo component that first reads context mid-life on later provider commits', () => {
 		// Reader is memo'd and props-stable after arming, so the only way the
 		// second provider value reaches it is the lazy context-refresh path —
 		// which needs $$ctxDirect/$$ctxReads recorded by the armed render and the
@@ -154,7 +154,7 @@ describe('renderBlockInner dormant-path guards', () => {
 		r.unmount();
 	});
 
-	it('runs a transition update that suspends inside a boundary after dormant renders', async () => {
+	it('keeps committed content visible while a suspending transition resolves', async () => {
 		// The transition's offscreen probe render arms a NON-root WIP_CAPTURE —
 		// the capture-record path the dormant guard must not eat — and its
 		// discard/commit exercises the journal entries that stay unconditional.

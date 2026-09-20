@@ -4185,14 +4185,17 @@ function journalObjectOnce(obj: object): void {
 }
 
 /**
- * Journal the three fields a signal host-prop binding mutates per commit. The
- * shape is fixed at creation, so field entries restore it exactly — cheaper
+ * Journal the fields a signal host-prop binding mutates per commit. Restoring
+ * by value is exact: `input`/`pendingControl` are tested by `!== undefined`,
+ * `disposed` is a boolean, and `sources`/`resolved` swap wholesale. Cheaper
  * than journalObjectOnce's whole-record clone on this hot path.
  */
 function journalSignalHostBinding(binding: SignalHostPropSourcesBinding): void {
 	TRANSITION_JOURNAL!.push(JOURNAL_PROP, binding, 'sources', binding.sources);
 	TRANSITION_JOURNAL!.push(JOURNAL_PROP, binding, 'resolved', binding.resolved);
 	TRANSITION_JOURNAL!.push(JOURNAL_PROP, binding, 'pendingControl', binding.pendingControl);
+	TRANSITION_JOURNAL!.push(JOURNAL_PROP, binding, 'input', binding.input);
+	TRANSITION_JOURNAL!.push(JOURNAL_PROP, binding, 'disposed', binding.disposed);
 }
 
 /** Defaults can move a pristine control's caret just like a live-value write. */
@@ -11400,7 +11403,11 @@ export function componentSlotLite<P>(
 			// Same owner-resolution order as runWithBlockSignalOwner, but the
 			// per-mount closure only exists when the owner actually changes.
 			const owner = scopeSignalOwner(scope);
-			if (owner !== undefined) STREAMED_SIGNAL_OWNER_ACTIVATOR?.(owner);
+			if (
+				owner !== undefined &&
+				(process.env.NODE_ENV === 'production' || hydrateAttributeProbe === null)
+			)
+				STREAMED_SIGNAL_OWNER_ACTIVATOR?.(owner);
 			if (owner === undefined || currentSignalOwner() === owner) {
 				comp(props, scope, undefined);
 			} else runWithSignalOwner(owner, () => comp(props, scope, undefined));
@@ -23830,7 +23837,6 @@ function resolveHostPropSources(
 ): Record<string, unknown> {
 	let classMerges: Array<{ rawName: string; value: unknown; order: number }> | null = null;
 	let sourceOrder = 0;
-	let spreadIndex = -1;
 	function record(rawName: unknown, value: unknown, src: number, skey: number): void {
 		if (typeof rawName !== 'string') return;
 		const order = sourceOrder++;
@@ -23869,7 +23875,6 @@ function resolveHostPropSources(
 		}
 		const spread = source[1];
 		if (spread == null || (typeof spread !== 'object' && typeof spread !== 'function')) continue;
-		spreadIndex = i;
 		let skey = 0;
 		for (const name of Object.keys(Object(spread))) {
 			record(name, (spread as Record<string, unknown>)[name], i, skey++);
@@ -23930,6 +23935,15 @@ function resolveHostPropSources(
 }
 
 const SOURCES_PLAN = /* @__PURE__ */ Symbol('octane.host-prop-sources-plan');
+/**
+ * Consecutive failed plan verifications after which an element stops paying
+ * attachSourcesPlan's per-commit allocations — a source shape that never
+ * stabilizes reverts to the full path for good. ponytail: poisoned is
+ * permanent; a shape that stabilizes later keeps the full path (reviving it
+ * would take a decay or per-shape plans).
+ */
+const SOURCES_PLAN_MISSES = /* @__PURE__ */ Symbol('octane.host-prop-sources-plan-misses');
+const SOURCES_PLAN_MISS_LIMIT = 3;
 
 /**
  * A committed source-shape descriptor letting the next commit rebuild the
@@ -23965,7 +23979,7 @@ interface ResolvedSourcesPlan {
  * Preclassified writer arm for one resolved key — the same dispatch
  * setSpreadBody re-derives per key per commit. `extra` carries the arm's
  * operand: the eventSlot record for W_EVENT, the canonical attribute name for
- * W_ACTION. `controlled` keeps isControlledHostProp's per-element answer.
+ * W_ACTION.
  */
 interface PlanEntry {
 	key: string;
@@ -23973,7 +23987,6 @@ interface PlanEntry {
 	skey: number;
 	kind: number;
 	extra?: unknown;
-	controlled?: boolean;
 }
 
 const W_SKIP = 0;
@@ -24055,12 +24068,14 @@ function attachSourcesPlan(
 					: kind === W_ACTION
 						? formActionAttributeName(el, writer.name)
 						: undefined,
-			controlled: kind === W_ATTR ? isControlledHostProp(el, writer.name) : undefined,
 		};
 		if (writer.skey < 0) srcEntry[writer.src] = i;
 		else spreadEntry[writer.skey] = i;
 	}
 	Object.defineProperty(resolved, SOURCES_PLAN, {
+		// Configurable so an unchanged commit retaining `prev` can re-stamp the
+		// accurate plan over a stale one after a shape change.
+		configurable: true,
 		value: {
 			len: sources.length,
 			shape,
@@ -24077,36 +24092,28 @@ function attachSourcesPlan(
 
 const EMPTY_KEYS: readonly string[] = [];
 
-interface SourcesPlanScan {
-	value: unknown;
-	checked: unknown;
-}
-
 /**
- * One pass over `sources` verifying the committed shape — and, because every
- * value is already in hand, collecting the `value`/`checked` winners and
- * declining on live signal handles the same way resolveSignalHostPropSources
- * detects them. `children` and `readStyle`-style values stay raw in both
- * paths, so a handle there is intentionally not flagged. A null return means
- * "shape changed or signals present": the caller takes the full path, which
- * still produces a correct result either way.
+ * One pass over `sources` verifying the committed shape and declining on live
+ * signal handles the same way resolveSignalHostPropSources detects them.
+ * `children` and `readStyle`-style values stay raw in both paths, so a handle
+ * there is intentionally not flagged. A false return means "shape changed or
+ * signals present": the caller takes the full path, which still produces a
+ * correct result either way.
  */
 function scanSourcesForPlan(
 	sources: readonly HostPropSource[],
 	plan: ResolvedSourcesPlan,
 	prev: Record<string, unknown>,
 	readStyle: ((value: unknown) => unknown) | undefined,
-): SourcesPlanScan | null {
-	if (sources.length !== plan.len) return null;
+): boolean {
+	if (sources.length !== plan.len) return false;
 	plan.diffLen = 0;
 	const entries = plan.entries;
-	let value: unknown;
-	let checked: unknown;
 	for (let i = 0; i < plan.len; i++) {
 		const source = sources[i];
 		const shape = plan.shape[i];
 		if (shape === SPREAD_SHAPE) {
-			if (!source[0]) return null;
+			if (!source[0]) return false;
 			const candidate = source[1];
 			const committed = plan.spreadKeys!;
 			if (
@@ -24122,12 +24129,10 @@ function scanSourcesForPlan(
 				const record = candidate as Record<string, unknown>;
 				let k = 0;
 				for (const name in record) {
-					if (name !== committed[k]) return null;
+					if (name !== committed[k]) return false;
 					const current = record[name];
 					const ei = plan.spreadEntry[k];
 					k++;
-					if (name === 'value') value = current;
-					else if (name === 'checked') checked = current;
 					if (ei >= 0) {
 						const styled =
 							readStyle !== undefined && entries[ei].key === 'style' ? readStyle(current) : current;
@@ -24139,7 +24144,7 @@ function scanSourcesForPlan(
 					}
 					if (!scanHandles || name === 'children') continue;
 					if (name === 'style' && readStyle !== undefined) continue;
-					if (isSignalHandle(current)) return null;
+					if (isSignalHandle(current)) return false;
 					if (
 						name === 'style' &&
 						current !== null &&
@@ -24147,18 +24152,16 @@ function scanSourcesForPlan(
 						!Array.isArray(current)
 					) {
 						for (const inner of Object.keys(current)) {
-							if (isSignalHandle((current as Record<string, unknown>)[inner])) return null;
+							if (isSignalHandle((current as Record<string, unknown>)[inner])) return false;
 						}
 					}
 				}
-				if (k !== committed.length) return null;
-			} else if (committed.length !== 0) return null;
+				if (k !== committed.length) return false;
+			} else if (committed.length !== 0) return false;
 			continue;
 		}
-		if (source[0] || source[1] !== shape || source[3] === true) return null;
+		if (source[0] || source[1] !== shape || source[3] === true) return false;
 		const current = source[2];
-		if (shape === 'value') value = current;
-		else if (shape === 'checked') checked = current;
 		const ei = plan.srcEntry[i];
 		if (ei >= 0) {
 			const styled =
@@ -24170,7 +24173,7 @@ function scanSourcesForPlan(
 			}
 		}
 		if (shape === 'children' || (shape === 'style' && readStyle !== undefined)) continue;
-		if (isSignalHandle(current)) return null;
+		if (isSignalHandle(current)) return false;
 		if (
 			shape === 'style' &&
 			current !== null &&
@@ -24178,11 +24181,11 @@ function scanSourcesForPlan(
 			!Array.isArray(current)
 		) {
 			for (const inner of Object.keys(current)) {
-				if (isSignalHandle((current as Record<string, unknown>)[inner])) return null;
+				if (isSignalHandle((current as Record<string, unknown>)[inner])) return false;
 			}
 		}
 	}
-	return { value, checked };
+	return true;
 }
 
 /**
@@ -24204,7 +24207,7 @@ function buildFromSourcesPlan(
 		plan.diffVal[j] = undefined;
 	}
 	plan.diffLen = 0;
-	Object.defineProperty(next, SOURCES_PLAN, { value: plan });
+	Object.defineProperty(next, SOURCES_PLAN, { configurable: true, value: plan });
 	return next;
 }
 
@@ -24286,7 +24289,7 @@ function writePlannedDiff(
 					setStringData(el, key, v);
 					continue;
 				case W_ATTR:
-					if (v === pv && !entry.controlled) continue;
+					if (v === pv) continue;
 					setAttribute(el, key, v);
 					continue;
 				default:
@@ -24297,6 +24300,46 @@ function writePlannedDiff(
 	} finally {
 		if (journalReplay) JOURNAL_ATTR_SUPPRESS = false;
 	}
+}
+
+/**
+ * Replay the committed sources plan against this commit's sources — one flat
+ * pass verifies the shape, then builds and writes only the diffs. Returns the
+ * record to commit (`prev` itself when nothing changed) or null when there is
+ * no plan, hydration is active, the shape changed, or signal handles appear —
+ * the caller then takes the full path. Failed verifications count toward
+ * SOURCES_PLAN_MISS_LIMIT, after which the element stops paying
+ * attachSourcesPlan's allocations entirely.
+ */
+function replaySourcesPlan(
+	el: Element,
+	sources: readonly HostPropSource[],
+	prev: Record<string, unknown>,
+	scope: Scope,
+	hasNestedChildren: boolean,
+	readStyle: ((value: unknown) => unknown) | undefined,
+): Record<string, unknown> | null {
+	if (activeHydration() !== null) return null;
+	const plan = (prev as Record<symbol, unknown>)[SOURCES_PLAN] as ResolvedSourcesPlan | undefined;
+	if (plan === undefined) return null;
+	if (!scanSourcesForPlan(sources, plan, prev, readStyle)) {
+		const tagged = el as any;
+		tagged[SOURCES_PLAN_MISSES] = ((tagged[SOURCES_PLAN_MISSES] as number | undefined) ?? 0) + 1;
+		return null;
+	}
+	(el as any)[SOURCES_PLAN_MISSES] = 0;
+	const next = buildFromSourcesPlan(plan, prev);
+	if (
+		next === prev &&
+		(hiddenStyleWriter === null || !('style' in next) || !HIDDEN_DISPLAYS.has(el as HTMLElement))
+	) {
+		stampSpreadPropFlags(el, prev);
+		if (process.env.NODE_ENV !== 'production') queueDevFormDiagnostic(el, scope);
+		return prev;
+	}
+	writePlannedDiff(el, next, prev, plan, scope);
+	commitResolvedDangerSources(el, next, hasNestedChildren);
+	return next;
 }
 
 /**
@@ -24446,30 +24489,9 @@ export function setHostPropSources(
 	// over the winner entries rebuilds (or bails into) the resolved record
 	// without materializing either writer Map. Form hosts stay on the full
 	// path: their control reassertion below reads the raw writer Map.
-	if (prev !== undefined && !formHost && hydration === null) {
-		const plan = (prev as Record<symbol, unknown>)[SOURCES_PLAN] as ResolvedSourcesPlan | undefined;
-		if (plan !== undefined) {
-			const scan = scanSourcesForPlan(sources, plan, prev, readStyle);
-			if (scan !== null) {
-				// Sources here are already resolved, so a handle scan finding one
-				// means a raw value the resolve left alone — the full path treats
-				// it identically; route there rather than writing it through.
-				const next = buildFromSourcesPlan(plan, prev);
-				const unchanged =
-					next === prev &&
-					(hiddenStyleWriter === null ||
-						!('style' in next) ||
-						!HIDDEN_DISPLAYS.has(el as HTMLElement));
-				if (unchanged) {
-					stampSpreadPropFlags(el, prev);
-					if (process.env.NODE_ENV !== 'production') queueDevFormDiagnostic(el, scope);
-					return prev;
-				}
-				writePlannedDiff(el, next, prev, plan, scope);
-				commitResolvedDangerSources(el, next, hasNestedChildren);
-				return next;
-			}
-		}
+	if (prev !== undefined && !formHost) {
+		const replayed = replaySourcesPlan(el, sources, prev, scope, hasNestedChildren, readStyle);
+		if (replayed !== null) return replayed;
 	}
 	// Single-spread sources whose writers all match the committed record bail
 	// without materializing the writer Maps or resolved record at all — the
@@ -24489,10 +24511,6 @@ export function setHostPropSources(
 	const props = new Map<string, HostPropWriter>();
 	const winners: HostPropWriter[] = [];
 	const resolved = resolveHostPropSources(el, sources, props, readStyle, winners);
-	// Plan attach waits for the second commit: a mount's resolved record has no
-	// successor to replay for, so mount-only elements never pay the plan's
-	// allocations. The second commit resolves fully once more, then replays.
-	if (!formHost && prev !== undefined) attachSourcesPlan(el, resolved, sources, winners);
 	// A commit whose fully-resolved record matches the last commit's has no write
 	// tail to run: every per-key writer already identity-skips, and the
 	// HTML-source reassert short-circuits on an equal resolved value, so the
@@ -24533,7 +24551,21 @@ export function setHostPropSources(
 			props.get('defaultChecked')?.value,
 			props.get('multiple')?.value,
 		);
-	return unchanged ? prev : resolved;
+	const out = unchanged ? prev : resolved;
+	// Plan attach waits for the second commit: a mount's resolved record has no
+	// successor to replay for, so mount-only elements never pay the plan's
+	// allocations. The plan stamps the record actually retained — on an
+	// unchanged commit resolvedHostPropsEqual just proved `prev` carries the
+	// identical keys, so the plan replays correctly against it — rather than
+	// dying with a discarded `resolved`. Elements whose scans keep failing stop
+	// paying the attach once SOURCES_PLAN_MISS_LIMIT trips.
+	if (
+		!formHost &&
+		prev !== undefined &&
+		(((el as any)[SOURCES_PLAN_MISSES] as number | undefined) ?? 0) < SOURCES_PLAN_MISS_LIMIT
+	)
+		attachSourcesPlan(el, out!, sources, winners);
+	return out;
 }
 
 const SIGNAL_HOST_PROP_SOURCES = /* @__PURE__ */ Symbol('octane.signal-host-prop-sources');
@@ -25034,44 +25066,25 @@ export function bindSignalHostPropSources(
 		binding.sources = sources;
 	}
 	// When the committed record carries a shape plan, one scan verifies the
-	// shape, collects the control winners, and detects signal handles at once.
-	// A clean scan means zero handles — winners can never be signals, so the
-	// whole control snapshot/validation ladder degenerates to its null case —
-	// and the commit replays the plan without a second pass. Form hosts never
-	// carry a plan, so their reassertion path is unreachable here.
-	const plan =
+	// shape and detects signal handles at once. A clean scan means zero
+	// handles — winners can never be signals, so the whole control
+	// snapshot/validation ladder degenerates to its null case — and the commit
+	// replays the plan without a second pass. Form hosts never carry a plan,
+	// so their reassertion path is unreachable here.
+	const replayed =
 		binding.resolved === undefined
-			? undefined
-			: ((binding.resolved as Record<symbol, unknown>)[SOURCES_PLAN] as
-					ResolvedSourcesPlan | undefined);
-	const scan =
-		plan === undefined || activeHydration() !== null
 			? null
-			: scanSourcesForPlan(sources, plan, binding.resolved!, readStyle);
+			: replaySourcesPlan(element, sources, binding.resolved, scope, hasNestedChildren, readStyle);
 	let handles: Set<SignalHandle<unknown>>;
 	let valueControl: SignalHandle<unknown> | null;
 	let checkedControl: SignalHandle<unknown> | null;
 	let controlSnapshot: ReturnType<typeof snapshotHydrationControl>;
-	if (scan !== null) {
+	if (replayed !== null) {
 		handles = EMPTY_SIGNAL_HANDLES;
 		valueControl = null;
 		checkedControl = null;
 		controlSnapshot = null;
-		const prev = binding.resolved!;
-		const next = buildFromSourcesPlan(plan!, prev);
-		if (
-			next === prev &&
-			(hiddenStyleWriter === null ||
-				!('style' in next) ||
-				!HIDDEN_DISPLAYS.has(element as HTMLElement))
-		) {
-			stampSpreadPropFlags(element, prev);
-			if (process.env.NODE_ENV !== 'production') queueDevFormDiagnostic(element, scope);
-		} else {
-			writePlannedDiff(element, next, prev, plan!, scope);
-			commitResolvedDangerSources(element, next, hasNestedChildren);
-			binding.resolved = next;
-		}
+		binding.resolved = replayed;
 	} else {
 		valueControl = winningSignalHostControl(sources, 'value');
 		if (valueControl !== null && scope.block.idState.renderOwner?.controlLeases?.has(element))
@@ -25304,6 +25317,10 @@ function setSpreadBody(
 	// A fresh props cache is not a snapshot of attributes already present in SSR.
 	const hydration = prev === undefined ? activeHydration() : null;
 	const initialHydration = hydration !== null && !hydration.isFresh(el);
+	// The per-key routing in this loop is re-derived ahead-of-time by
+	// planEntryKind into writePlannedDiff's preclassified arms — any change to
+	// how a key is dispatched here must be mirrored there or plan replay
+	// misroutes the prop.
 	for (const k of Object.keys(Object(value))) {
 		if (k === 'key' || k === 'children') continue;
 		if (skipDangerouslySetInnerHTML && k === 'dangerouslySetInnerHTML') continue;
@@ -35637,6 +35654,35 @@ function refreshContextConsumers(block: Block): void {
 	}
 }
 
+/**
+ * The hazards that veto every props-equality bail (memo, $$stable, implicit):
+ * each names a reason the body must re-run regardless of prop equality. A new
+ * bail hazard belongs here so the bail paths cannot desynchronize.
+ */
+function blockBailUnsafe(block: Block): boolean {
+	// A body that suspended or threw on its initial attempt has no committed
+	// props/output to reuse; the retry must execute until the Block mounts.
+	// This also makes lazy-resolved memo metadata safe to publish during that
+	// attempt.
+	if (!block.mounted || block.renderStatus !== RENDER_VALID) return true;
+	// A descendant compare (lazy re-resolution, custom comparator) can veto the
+	// bail on non-prop grounds — the kept subtree must not strand it.
+	if (block.$$compareInChain === true) return true;
+	// A render attempt that suspended or hid inside a try subtree may have
+	// queued an Effect Event impl the drain then dropped — its version is ahead
+	// of the last completed render. Bailing would strand that unpublished
+	// payload forever, so fall through and let the re-render re-queue it.
+	if (block.effectEventRenderVersion !== block.effectEventCompletedVersion) return true;
+	// A rolled-back transition update re-applies inside the state hook during
+	// render; bailing would skip the body that consumes it and strand the
+	// pending value on the rolled-back DOM.
+	if (blockHasHeldUpdate(block)) return true;
+	// The drain loop dropped this block's own queued update when a sibling's
+	// suspend aborted the transaction. Its state cells still hold the update;
+	// only the body reads them — bailing strands the pre-abort screen forever.
+	return block.suppressedUpdate === true;
+}
+
 // React.memo's bail, shared by BOTH same-component update paths (componentSlot for
 // compiled component positions, childSlot for value-position children — provider
 // children, `.ts` binding trees). Skip the body when new props compare equal to the
@@ -35650,26 +35696,7 @@ function refreshContextConsumers(block: Block): void {
 // what makes the memo terminate.
 function tryMemoBail(block: Block, comp: any, props: any): boolean {
 	if ((comp as any).__memo !== true && (comp as any).$$stable !== true) return false;
-	// A memo body that suspended or threw on its initial attempt has no committed
-	// props/output to reuse. This also makes lazy-resolved memo metadata safe to
-	// publish during that attempt: the retry must execute until the Block mounts.
-	if (!block.mounted || block.renderStatus !== RENDER_VALID) return false;
-	// A descendant compare (lazy re-resolution, custom comparator) can veto this
-	// bail on non-prop grounds — the kept subtree must not strand it.
-	if (block.$$compareInChain === true) return false;
-	// A render attempt that suspended or hid inside a try subtree may have queued
-	// an Effect Event impl the drain then dropped — its version is ahead of the
-	// last completed render. Bailing would strand that unpublished payload
-	// forever, so fall through and let the re-render re-queue it.
-	if (block.effectEventRenderVersion !== block.effectEventCompletedVersion) return false;
-	// A rolled-back transition update re-applies inside the state hook during
-	// render; bailing here would skip the body that consumes it and strand the
-	// pending value on the rolled-back DOM.
-	if (blockHasHeldUpdate(block)) return false;
-	// The drain loop dropped this block's own queued update when a sibling's
-	// suspend aborted the transaction. Its state cells still hold the update;
-	// only the body reads them — bailing strands the pre-abort screen forever.
-	if (block.suppressedUpdate) return false;
+	if (blockBailUnsafe(block)) return false;
 	const compare = (comp as any).__compare as ((prev: any, next: any) => boolean) | undefined;
 	// React.memo's optional comparator: returns true when props are equal
 	// (→ skip the render). Falls back to a shallow Object.is comparison.
@@ -35697,23 +35724,9 @@ function tryMemoBail(block: Block, comp: any, props: any): boolean {
 // bailing it could strand consumers. Returns true when the update was handled.
 function tryImplicitBail(block: Block): boolean {
 	if (block.$$implicitBail !== true) return false;
-	// A first attempt that suspended or threw has no committed output to reuse.
-	// Its identity-equal retry must execute until this Block mounts successfully.
-	if (!block.mounted || block.renderStatus !== RENDER_VALID) return false;
+	if (blockBailUnsafe(block)) return false;
 	const checkLazyBody = (block.body as any)[LAZY_BODY_CHECK] as LazyBodyCheck | undefined;
 	if (checkLazyBody !== undefined && !checkLazyBody(block)) return false;
-	// A descendant compare (lazy re-resolution, custom comparator) can veto this
-	// bail on non-prop grounds — the kept subtree must not strand it.
-	if (block.$$compareInChain === true) return false;
-	// Same unpublished-payload hole as tryMemoBail: an attempt whose Effect
-	// Event impl was dropped while hidden must re-render to re-queue it.
-	if (block.effectEventRenderVersion !== block.effectEventCompletedVersion) return false;
-	// Same held-update hole as tryMemoBail: the state hook that re-applies the
-	// rolled-back value only runs if the body does.
-	if (blockHasHeldUpdate(block)) return false;
-	// Same aborted-suppression hole as tryMemoBail: the unconsumed update is
-	// only picked up by running the body.
-	if (block.suppressedUpdate) return false;
 	if (!ctxBailDepsClean(block)) return false;
 	restampCtxDeps(block);
 	reconnectBailedEffects(block);

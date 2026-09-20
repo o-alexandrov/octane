@@ -111,6 +111,19 @@ describe('@for item-body purity with host-only conditional content', () => {
 		expect(flags[0]! & PURE).toBe(0);
 	});
 
+	it('declines when an imported call hides a component inside a function argument', () => {
+		// `renderTags` is a memoizable imported projection, so the render-call
+		// gate walks its arguments and defers the arrow — the component inside
+		// reaches PURE only through the host-conditional shape gate.
+		const flags = compileList(
+			'<li>@if (item.flag) {{renderTags(item.tags, (t) => <Tag x={t} />)}}</li>',
+			"import { renderTags } from './lib';\n" +
+				'function Tag(props) @{ <span>{props.x as string}</span> }',
+		);
+		expect(flags).toHaveLength(1);
+		expect(flags[0]! & PURE).toBe(0);
+	});
+
 	it('declines a body that captures a parent local, keeping the depEligible path', () => {
 		const flags = appListFlags(
 			compile(
