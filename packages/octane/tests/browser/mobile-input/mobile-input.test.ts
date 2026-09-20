@@ -50,6 +50,10 @@ async function openCase(mobile: boolean, legacyMovement = false): Promise<Page> 
 	page = await browser.newPage(mobile ? devices['Galaxy S9+'] : undefined);
 	failures = [];
 	page.on('pageerror', (error) => failures.push(error.message));
+	page.on('console', (message) => {
+		if (message.type() === 'error' || message.type() === 'warning')
+			failures.push(`${message.type()}: ${message.text()}`);
+	});
 	if (legacyMovement) {
 		await page.addInitScript(() => {
 			Object.defineProperty(Element.prototype, 'moveBefore', {
@@ -109,6 +113,63 @@ const compositionCases = [
 ];
 
 describe.sequential('real-browser mobile input continuity', () => {
+	it.each([true, false])(
+		'restores the same focused editor after a native update reparents it (anchor=%s)',
+		async (anchor) => {
+			const current = await openCase(false, true);
+			await current.evaluate((anchor) => window.__mobileInput.mountDockingEditor(anchor), anchor);
+			const input = current.locator('#editor-home input');
+			await input.fill('Unsaved editing');
+			const editor = await current.locator('octane-docking-editor').elementHandle();
+			const originalInput = await input.elementHandle();
+			await input.evaluate((element: HTMLInputElement) => element.setSelectionRange(2, 8));
+
+			await current.evaluate(() => window.__mobileInput.dockEditor());
+
+			expect(
+				await editor!.evaluate((element) => ({
+					parent: element.parentElement?.id,
+					next: element.nextElementSibling?.id ?? null,
+				})),
+			).toEqual({ parent: 'editor-home', next: anchor ? 'editor-anchor' : null });
+			expect(await input.inputValue()).toBe('Unsaved editing');
+			expect(
+				await originalInput!.evaluate((element: HTMLInputElement) => ({
+					same: element === document.querySelector('#editor-home input'),
+					focused: document.activeElement === element,
+					selection: [element.selectionStart, element.selectionEnd],
+				})),
+			).toEqual({ same: true, focused: true, selection: [2, 8] });
+			expect(await current.locator('#editor-dock').textContent()).toBe('Dock toolbar');
+			expect(await current.locator('#editor-dock').locator('*').count()).toBe(0);
+		},
+	);
+
+	it.each(
+		(['first', 'last'] as const).flatMap((position) =>
+			[false, true].map((shadow) => ({ position, shadow })),
+		),
+	)(
+		'restores a relocated native editor at the $position position without moveBefore (shadow=$shadow)',
+		async ({ position, shadow }) => {
+			const current = await openCase(true, true);
+			const restored = await current.evaluate(
+				({ position, shadow }) => window.__mobileInput.restoreRelocatedEditor(position, shadow),
+				{ position, shadow },
+			);
+			expect(restored).toEqual({
+				order: position === 'first' ? [2, 1, 3, 4] : [2, 3, 4, 1],
+				sameHosts: true,
+				sourceRetained: true,
+				sameInput: true,
+				connected: true,
+				focused: true,
+				selection: [2, 9],
+				value: position === 'first' ? 'second field' : 'first field',
+			});
+		},
+	);
+
 	it.each(compositionCases)(
 		'preserves active Korean composition through $kind row $id reorder (mobile=$mobile, legacy=$legacy, shadow=$shadow)',
 		async ({ kind, id, mobile, legacy, shadow }) => {

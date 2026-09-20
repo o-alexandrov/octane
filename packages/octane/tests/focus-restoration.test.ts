@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createElement, createRoot, flushSync, useLayoutEffect } from '../src/index.js';
 import { mount } from './_helpers';
+import { DockingEditorApp, registerDockingEditor } from './_fixtures/docking-editor';
 import { FastHostControlledList } from './_fixtures/for.tsrx';
+import { createRelocatingNativeEditors } from './_fixtures/relocating-native-editor.js';
 
 const rows = [
 	{ id: 1, label: 'first value' },
@@ -71,6 +73,91 @@ function DescriptorInputRows(props: { items: FocusRow[] }) {
 }
 
 describe('focus and text selection survive DOM updates', () => {
+	it.each([true, false])(
+		'restores a focused editor moved into another container during its update (anchor=%s)',
+		(anchor) => {
+			registerDockingEditor();
+			const dock = document.createElement('aside');
+			dock.id = 'editor-dock';
+			const toolbar = document.createElement('button');
+			toolbar.textContent = 'Dock toolbar';
+			dock.appendChild(toolbar);
+			document.body.appendChild(dock);
+			const rendered = mount(DockingEditorApp, { dock: '', anchor });
+			try {
+				const parent = rendered.find('#editor-home');
+				Object.defineProperty(parent, 'moveBefore', { configurable: true, value: undefined });
+				const children = Array.from(parent.childNodes);
+				const editor = rendered.find('octane-docking-editor');
+				const input = rendered.find('input') as HTMLInputElement;
+				input.value = 'Unsaved editing';
+				input.focus();
+				input.setSelectionRange(2, 8, 'backward');
+
+				rendered.update(DockingEditorApp, { dock: dock.id, anchor });
+
+				expect(Array.from(parent.childNodes)).toEqual(children);
+				expect(Array.from(dock.childNodes)).toEqual([toolbar]);
+				expect(editor.parentNode).toBe(parent);
+				expect(rendered.find('input')).toBe(input);
+				expect(input.value).toBe('Unsaved editing');
+				expect(document.activeElement).toBe(input);
+				expect([input.selectionStart, input.selectionEnd]).toEqual([2, 8]);
+			} finally {
+				try {
+					rendered.unmount();
+				} finally {
+					dock.remove();
+				}
+			}
+		},
+	);
+
+	it.each([
+		{ position: 'first', focusedId: 2, order: [2, 1, 3, 4] },
+		{ position: 'last', focusedId: 1, order: [2, 3, 4, 1] },
+	])(
+		'restores a focused native editor relocated by its host update at the $position position',
+		({ focusedId, order }) => {
+			const external = document.createElement('section');
+			const sourceSibling = document.createElement('span');
+			sourceSibling.textContent = 'external editor toolbar';
+			external.appendChild(sourceSibling);
+			document.body.appendChild(external);
+			const RelocatingEditors = createRelocatingNativeEditors(external, focusedId);
+			let rendered: ReturnType<typeof mount> | undefined;
+			try {
+				rendered = mount(RelocatingEditors, { items: rows, revision: 0 });
+				const parent = rendered.find('section');
+				// Exercise platforms that do not provide a native state-preserving move.
+				Object.defineProperty(parent, 'moveBefore', { configurable: true, value: undefined });
+				const initial = Array.from(parent.children);
+				const editor = initial[focusedId - 1]!;
+				const input = editor.querySelector('input')!;
+				input.focus();
+				input.setSelectionRange(2, 9);
+
+				rendered.update(RelocatingEditors, {
+					items: order.map((id) => rows[id - 1]!),
+					revision: 1,
+				});
+
+				expect(Array.from(parent.children)).toEqual(order.map((id) => initial[id - 1]));
+				expect(Array.from(external.childNodes)).toEqual([sourceSibling]);
+				expect(editor.parentNode).toBe(parent);
+				expect(editor.querySelector('input')).toBe(input);
+				expect(document.activeElement).toBe(input);
+				expect([input.selectionStart, input.selectionEnd]).toEqual([2, 9]);
+			} finally {
+				try {
+					rendered?.unmount();
+				} finally {
+					external.remove();
+				}
+			}
+		},
+	);
+
 	// Per ReactDOM-test.js, "preserves focus": DOM mutations may blur a
 	// surviving control, but focus must be restored before the commit ends.
 	it('keeps the focused keyed input and its selected text when its row moves', () => {

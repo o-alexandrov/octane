@@ -1,6 +1,8 @@
 import { createElement, createRoot, flushSync, type Root } from '../../../src/index.js';
 import { NestedConditionalList } from '../../_fixtures/for.tsrx';
 import { mountPresentationRows } from './presentation.tsrx';
+import { DockingEditorApp, registerDockingEditor } from '../../_fixtures/docking-editor.js';
+import { createRelocatingNativeEditors } from '../../_fixtures/relocating-native-editor.js';
 
 type ListKind = 'compiled' | 'descriptor' | 'presentation';
 type TouchName = 'touchmove' | 'touchstart';
@@ -139,6 +141,55 @@ function reverse() {
 	return snapshot();
 }
 
+function restoreRelocatedEditor(position: 'first' | 'last', shadow = false) {
+	root?.unmount();
+	root = undefined;
+	presentation?.dispose();
+	presentation = undefined;
+	const external = document.createElement('section');
+	const sourceSibling = document.createElement('span');
+	sourceSibling.textContent = 'external editor toolbar';
+	external.appendChild(sourceSibling);
+	document.body.appendChild(external);
+	const focusedId = position === 'first' ? 2 : 1;
+	const order = position === 'first' ? [2, 1, 3, 4] : [2, 3, 4, 1];
+	const Editors = createRelocatingNativeEditors(external, focusedId, shadow);
+	try {
+		root = createRoot(document.querySelector('#root')!);
+		root.render(Editors, { items: rows, revision: 0 });
+		flushSync(() => {});
+		const parent = document.querySelector('#root section')!;
+		const initial = Array.from(parent.children);
+		const host = initial[focusedId - 1]!;
+		const input = (host.shadowRoot ?? host).querySelector('input')!;
+		input.focus();
+		input.setSelectionRange(2, 9);
+
+		flushSync(() =>
+			root!.render(Editors, { items: order.map((id) => rows[id - 1]!), revision: 1 }),
+		);
+
+		const placed = Array.from(parent.children);
+		return {
+			order: placed.map((host) => Number(host.getAttribute('data-row'))),
+			sameHosts: placed.every((host, index) => host === initial[order[index]! - 1]),
+			sourceRetained: external.childNodes.length === 1 && external.firstChild === sourceSibling,
+			sameInput: (host.shadowRoot ?? host).querySelector('input') === input,
+			connected: input.isConnected,
+			focused: (input.getRootNode() as Document | ShadowRoot).activeElement === input,
+			selection: [input.selectionStart, input.selectionEnd],
+			value: input.value,
+		};
+	} finally {
+		try {
+			root?.unmount();
+			root = undefined;
+		} finally {
+			external.remove();
+		}
+	}
+}
+
 function cancelBodyTouch(name: TouchName, capture: boolean) {
 	root?.unmount();
 	let observed = false;
@@ -166,7 +217,36 @@ function cancelBodyTouch(name: TouchName, capture: boolean) {
 	return { observed, defaultPrevented: event.defaultPrevented };
 }
 
-window.__mobileInput = { mount, reverse, snapshot, cancelBodyTouch };
+let dockingAnchor = false;
+
+function mountDockingEditor(anchor: boolean): void {
+	root?.unmount();
+	presentation?.dispose();
+	presentation = undefined;
+	registerDockingEditor();
+	const dock = document.createElement('aside');
+	dock.id = 'editor-dock';
+	dock.textContent = 'Dock toolbar';
+	document.body.appendChild(dock);
+	dockingAnchor = anchor;
+	root = createRoot(document.querySelector('#root')!);
+	root.render(DockingEditorApp, { dock: '', anchor });
+	flushSync(() => {});
+}
+
+function dockEditor(): void {
+	flushSync(() => root!.render(DockingEditorApp, { dock: 'editor-dock', anchor: dockingAnchor }));
+}
+
+window.__mobileInput = {
+	mount,
+	reverse,
+	snapshot,
+	cancelBodyTouch,
+	restoreRelocatedEditor,
+	mountDockingEditor,
+	dockEditor,
+};
 
 declare global {
 	interface Window {
@@ -175,6 +255,9 @@ declare global {
 			reverse: typeof reverse;
 			snapshot: typeof snapshot;
 			cancelBodyTouch: typeof cancelBodyTouch;
+			restoreRelocatedEditor: typeof restoreRelocatedEditor;
+			mountDockingEditor: typeof mountDockingEditor;
+			dockEditor: typeof dockEditor;
 		};
 	}
 }
