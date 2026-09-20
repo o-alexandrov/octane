@@ -125,7 +125,7 @@ for (const set of SETS)
 		const outDir = path.join(OUT_ROOT, set.prefix + name);
 		const setLabel = set.prefix ? path.basename(set.root) + '/' : '';
 		console.log(`building ${setLabel}${name} (production, normalized minify)…`);
-		await build({
+		const result = await build({
 			root: appRoot,
 			logLevel: 'warn',
 			build: {
@@ -194,9 +194,39 @@ for (const set of SETS)
 		);
 		let entry = byName.get(name);
 		if (entry === undefined) {
-			entry = { name, ops: {}, meta: { files: [] } };
+			entry = { name, ops: {}, meta: { files: [], voidRoots: {} } };
 			byName.set(name, entry);
 			targets.push(entry);
+		}
+		// Void-root specialization verdict (octane targets only): the compiled
+		// app root should reach `__createVoidRoot`, not the generic `createRoot`.
+		// Inspected from this build's own result — the same renderedExports
+		// assertion run-minimal.mjs makes for its minimal scenarios. A
+		// non-specialized verdict means the proof chain broke upstream; a
+		// missing runtime module reports as its own verdict, not a crash.
+		if (name.startsWith('octane-')) {
+			let runtimeExports;
+			let runtimeSeen = false;
+			for (const bundle of Array.isArray(result) ? result : result ? [result] : []) {
+				for (const chunk of bundle.output ?? []) {
+					if (chunk.type !== 'chunk') continue;
+					for (const [id, mod] of Object.entries(chunk.modules ?? {})) {
+						if (id.endsWith('/packages/octane/src/runtime.ts')) {
+							runtimeSeen = true;
+							runtimeExports = mod.renderedExports ?? [];
+						}
+					}
+				}
+			}
+			const verdict = !runtimeSeen
+				? 'no-runtime-module'
+				: runtimeExports.includes('__createVoidRoot') && !runtimeExports.includes('createRoot')
+					? 'specialized'
+					: 'generic-root';
+			entry.meta.voidRoots[`${set.prefix}${name}`] = verdict;
+			console.log(
+				`  ${verdict === 'specialized' ? '✓' : '✗'} ${setLabel}${name}: void-root ${verdict}`,
+			);
 		}
 		const px = set.prefix;
 		Object.assign(entry.ops, {
