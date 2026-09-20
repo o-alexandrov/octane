@@ -10459,7 +10459,13 @@ function renderBlockInner(block: Block): true | undefined {
 	// fresh invalidation during this attempt replaces RETRYING, so successful
 	// hidden renders cannot erase work still waiting for their reveal.
 	if (block.renderStatus === RENDER_INVALID) block.renderStatus = RENDER_RETRYING;
-	if (WIP_CAPTURE !== null) recordCapturedRender(WIP_CAPTURE, block);
+	// Root-transaction captures already learn rendered blocks from their
+	// JOURNAL_RENDER entries; recordCapturedRender early-returns on this same
+	// predicate, so skip the call outright on the dominant scheduled-update path.
+	// `rootTransaction` is write-once at capture creation (beginRootRender), so a
+	// non-root capture armed mid-render still takes the full path on entry.
+	if (WIP_CAPTURE !== null && WIP_CAPTURE.rootTransaction !== true)
+		recordCapturedRender(WIP_CAPTURE, block);
 	// A held in-place attempt has no capture. Its completed bodies must lose
 	// bailout validity with their rolled-back DOM. Record both owners: a nested
 	// journal can roll back even while its enclosing capture survives.
@@ -10606,7 +10612,12 @@ function renderBlockInner(block: Block): true | undefined {
 			return true;
 		}
 		if (out !== undefined && block.outputHandler !== null) block.outputHandler(block, out);
-		finishEffectRender(block);
+		// finishEffectRender exists to invalidate registered effect slots this
+		// render never reached; it early-returns on `effectSlots === null` (the
+		// render version it also checks is 0 exactly then — see above). effectSlots
+		// is populated mid-body by enqueueEffect, so a block's first useEffect
+		// still lands the full path on the render that registered it.
+		if (block.effectSlots !== null) finishEffectRender(block);
 		if (!block.mounted) block.mounted = true;
 		if (block.renderStatus === RENDER_RETRYING) block.renderStatus = RENDER_VALID;
 		if (block.effectEventRenderVersion !== 0) {
