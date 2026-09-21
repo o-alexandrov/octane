@@ -1862,6 +1862,91 @@ export const Indirect = indirect(Host);
 		}
 	});
 
+	it('classifies a linked package that receives Octane transitively', () => {
+		const fixtureRoot = mkdtempSync(join(tmpdir(), 'octane-bundler-transitive-'));
+		try {
+			const root = join(fixtureRoot, 'app');
+			const modules = join(root, 'node_modules');
+			mkdirSync(modules, { recursive: true });
+			writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'app', private: true }));
+
+			// A toolkit package is the single place the repository pins Octane.
+			const toolkitRoot = join(fixtureRoot, 'toolkit');
+			mkdirSync(join(toolkitRoot, 'node_modules/octane'), { recursive: true });
+			writeFileSync(
+				join(toolkitRoot, 'package.json'),
+				JSON.stringify({ name: 'toolkit', dependencies: { octane: '0.0.0' } }),
+			);
+			writeFileSync(
+				join(toolkitRoot, 'node_modules/octane/package.json'),
+				JSON.stringify({ name: 'octane' }),
+			);
+
+			const createLinkedPackage = (name: string, extraManifest: Record<string, unknown>) => {
+				const packageRoot = join(fixtureRoot, name);
+				mkdirSync(join(packageRoot, 'src'), { recursive: true });
+				mkdirSync(join(packageRoot, 'node_modules'), { recursive: true });
+				const manifest = join(packageRoot, 'package.json');
+				writeFileSync(manifest, JSON.stringify({ name, ...extraManifest }));
+				writeFileSync(
+					join(packageRoot, 'src/App.tsx'),
+					`export function App() { return <p>${name}</p>; }\n`,
+				);
+				symlinkSync(packageRoot, join(modules, name), 'dir');
+				return {
+					root: packageRoot,
+					manifest: realpathSync(manifest),
+					source: realpathSync(join(modules, name, 'src/App.tsx')),
+				};
+			};
+
+			const linkToolkit = (packageRoot: string) => {
+				symlinkSync(toolkitRoot, join(packageRoot, 'node_modules/toolkit'), 'dir');
+			};
+
+			const transitive = createLinkedPackage('linked-transitive', {
+				dependencies: { toolkit: 'link:../toolkit' },
+			});
+			linkToolkit(transitive.root);
+			const reactPackage = createLinkedPackage('linked-react', {
+				dependencies: { toolkit: 'link:../toolkit', react: '^19.0.0' },
+			});
+			linkToolkit(reactPackage.root);
+			// Octane is installed for this package, but nothing it depends on wants it.
+			const hoistedOnly = createLinkedPackage('linked-hoisted', {
+				dependencies: { lodash: '^4.0.0' },
+			});
+			mkdirSync(join(hoistedOnly.root, 'node_modules/octane'), { recursive: true });
+			writeFileSync(
+				join(hoistedOnly.root, 'node_modules/octane/package.json'),
+				JSON.stringify({ name: 'octane' }),
+			);
+
+			const compiler = createOctaneCompiler({ root });
+
+			const compiled = compiler.transform(
+				`export function App() { return <p>transitive</p>; }`,
+				transitive.source,
+			);
+			expect(compiled?.kind).toBe('compile');
+			expect(compiled?.code).toContain('<p>transitive</p>');
+			expect(compiled?.dependencies).toContain(transitive.manifest);
+			expect(compiled?.dependencies).toContain(
+				join(realpathSync(transitive.root), 'node_modules/toolkit/package.json'),
+			);
+
+			expect(
+				compiler.transform(`export function App() { return <p>react</p>; }`, reactPackage.source),
+			).toMatchObject({ kind: 'none' });
+
+			expect(
+				compiler.transform(`export function App() { return <p>hoisted</p>; }`, hoistedOnly.source),
+			).toMatchObject({ kind: 'none' });
+		} finally {
+			rmSync(fixtureRoot, { recursive: true, force: true });
+		}
+	});
+
 	it('uses portable source names in profile metadata', () => {
 		const fixtureRoot = mkdtempSync(join(tmpdir(), 'octane-profile-source-'));
 		try {

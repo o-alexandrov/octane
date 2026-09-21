@@ -146,13 +146,85 @@ export function resolveOctaneRuntimeRequest(request, environment) {
 		: OCTANE_RUNTIME_REQUESTS[environment];
 }
 
-function packageUsesOctane(pkg) {
+function packageDeclaresOctane(pkg) {
 	return (
 		pkg.name === 'octane' ||
 		['dependencies', 'optionalDependencies', 'peerDependencies'].some(
 			(field) => typeof pkg[field]?.octane === 'string',
 		)
 	);
+}
+
+/**
+ * A package that declares its own React renderer keeps it. Transitive Octane
+ * reaches every workspace package once one of them depends on Octane, so a mixed
+ * repository needs its React packages to stay React without a per-file opt-out.
+ */
+function packageDeclaresForeignRenderer(pkg) {
+	return ['dependencies', 'optionalDependencies', 'peerDependencies'].some(
+		(field) =>
+			typeof pkg[field]?.react === 'string' || typeof pkg[field]?.['react-dom'] === 'string',
+	);
+}
+
+function packageRuntimeDependencyNames(pkg) {
+	const names = new Set();
+	for (const field of ['dependencies', 'optionalDependencies', 'peerDependencies']) {
+		for (const name of Object.keys(pkg[field] ?? {})) names.add(name);
+	}
+	return names;
+}
+
+/**
+ * Does this package compile as Octane source?
+ *
+ * A declared `octane` dependency is the fast path and the only signal accepted
+ * for an installed package under `node_modules`, where a hoisted copy of Octane
+ * says nothing about the package's own intent.
+ *
+ * A workspace or linked package outside `node_modules` is different: monorepos
+ * and multi-repo checkouts routinely let one shared UI package receive Octane
+ * transitively from a toolkit package it depends on, so requiring a redundant
+ * manifest entry there forced consumers to declare a dependency they do not own
+ * the version of, purely as a compiler marker. Such a package is Octane's when a
+ * package in its declared runtime closure depends on Octane, which is the
+ * condition under which its emitted `octane/jsx-runtime` import resolves.
+ *
+ * The closure walk is deliberately not "is Octane resolvable from here": under a
+ * hoisted install an unrelated package in the same repository resolves the
+ * application's own Octane, and claiming it would compile source that never
+ * asked for Octane.
+ */
+function packageUsesOctane(pkg, dir, collected) {
+	if (packageDeclaresOctane(pkg)) return true;
+	if (/(?:^|[\\/])node_modules(?:[\\/]|$)/.test(dir)) return false;
+	if (packageDeclaresForeignRenderer(pkg)) return false;
+
+	const visited = new Set([realPathOrSelf(dir)]);
+	const pending = [[pkg, dir]];
+	while (pending.length > 0) {
+		const [manifest, manifestDir] = pending.pop();
+		for (const name of packageRuntimeDependencyNames(manifest)) {
+			if (name === 'octane') return true;
+			const dependencyManifestPath = resolveInstalledPackageManifest(name, manifestDir, collected);
+			if (dependencyManifestPath === null) continue;
+			const dependencyDir = nodePath.dirname(dependencyManifestPath);
+			const realDependencyDir = realPathOrSelf(dependencyDir);
+			if (visited.has(realDependencyDir)) continue;
+			visited.add(realDependencyDir);
+			let dependencyManifest = null;
+			try {
+				dependencyManifest = JSON.parse(nodeFs.readFileSync(dependencyManifestPath, 'utf8'));
+			} catch {
+				// An unreadable dependency manifest carries no ownership signal, and the
+				// resolution above already recorded it as watch metadata.
+				continue;
+			}
+			if (packageDeclaresOctane(dependencyManifest)) return true;
+			pending.push([dependencyManifest, dependencyDir]);
+		}
+	}
+	return false;
 }
 
 function packageViteOptimizeDepsExclusions(pkg) {
@@ -206,6 +278,14 @@ function resolveInstalledPackageManifest(name, issuerRoot, collected) {
 		const parent = nodePath.dirname(candidateRoot);
 		if (parent === candidateRoot) return null;
 		candidateRoot = parent;
+	}
+}
+
+function realPathOrSelf(dir) {
+	try {
+		return nodeFs.realpathSync(dir);
+	} catch {
+		return nodePath.resolve(dir);
 	}
 }
 
@@ -607,6 +687,9 @@ class OctaneBundlerCompiler {
 		let result;
 		if (pkg !== null) {
 			const manual = pkg.octane?.hookSlots?.manual;
+			const ownership = { dependencies: new Set(), missingDependencies: new Set() };
+			const usesOctane = packageUsesOctane(pkg, dir, ownership);
+			const ownershipMetadata = finishMetadata(ownership);
 			result = {
 				rule: {
 					name: typeof pkg.name === 'string' ? pkg.name : null,
@@ -617,9 +700,12 @@ class OctaneBundlerCompiler {
 						...Object.keys(pkg.optionalDependencies ?? {}),
 					],
 					viteOptimizeDepsExclusions: packageViteOptimizeDepsExclusions(pkg),
-					usesOctane: packageUsesOctane(pkg),
+					usesOctane,
 				},
-				...metadata([manifest]),
+				...metadata(
+					[manifest, ...ownershipMetadata.dependencies],
+					ownershipMetadata.missingDependencies,
+				),
 			};
 		} else {
 			const parent = nodePath.dirname(dir);
