@@ -24015,11 +24015,12 @@ function resolveHostPropSources(
 
 const SOURCES_PLAN = /* @__PURE__ */ Symbol('octane.host-prop-sources-plan');
 /**
- * Consecutive failed plan verifications after which an element stops paying
+ * Consecutive failed plan verifications after which a host stops paying
  * attachSourcesPlan's per-commit allocations — a source shape that never
- * stabilizes reverts to the full path for good. ponytail: poisoned is
- * permanent; a shape that stabilizes later keeps the full path (reviving it
- * would take a decay or per-shape plans).
+ * stabilizes reverts to the full path for good. Lives on the committed
+ * resolved record beside SOURCES_PLAN, never on the DOM node. ponytail:
+ * poisoned is permanent; a shape that stabilizes later keeps the full path
+ * (reviving it would take a decay or per-shape plans).
  */
 const SOURCES_PLAN_MISSES = /* @__PURE__ */ Symbol('octane.host-prop-sources-plan-misses');
 const SOURCES_PLAN_MISS_LIMIT = 3;
@@ -24387,7 +24388,7 @@ function writePlannedDiff(
  * record to commit (`prev` itself when nothing changed) or null when there is
  * no plan, hydration is active, the shape changed, or signal handles appear —
  * the caller then takes the full path. Failed verifications count toward
- * SOURCES_PLAN_MISS_LIMIT, after which the element stops paying
+ * SOURCES_PLAN_MISS_LIMIT, after which the host stops paying
  * attachSourcesPlan's allocations entirely.
  */
 function replaySourcesPlan(
@@ -24399,14 +24400,14 @@ function replaySourcesPlan(
 	readStyle: ((value: unknown) => unknown) | undefined,
 ): Record<string, unknown> | null {
 	if (activeHydration() !== null) return null;
-	const plan = (prev as Record<symbol, unknown>)[SOURCES_PLAN] as ResolvedSourcesPlan | undefined;
+	const tagged = prev as Record<symbol, unknown>;
+	const plan = tagged[SOURCES_PLAN] as ResolvedSourcesPlan | undefined;
 	if (plan === undefined) return null;
 	if (!scanSourcesForPlan(sources, plan, prev, readStyle)) {
-		const tagged = el as any;
 		tagged[SOURCES_PLAN_MISSES] = ((tagged[SOURCES_PLAN_MISSES] as number | undefined) ?? 0) + 1;
 		return null;
 	}
-	(el as any)[SOURCES_PLAN_MISSES] = 0;
+	if (tagged[SOURCES_PLAN_MISSES]) tagged[SOURCES_PLAN_MISSES] = 0;
 	const next = buildFromSourcesPlan(plan, prev);
 	if (
 		next === prev &&
@@ -24636,14 +24637,17 @@ export function setHostPropSources(
 	// allocations. The plan stamps the record actually retained — on an
 	// unchanged commit resolvedHostPropsEqual just proved `prev` carries the
 	// identical keys, so the plan replays correctly against it — rather than
-	// dying with a discarded `resolved`. Elements whose scans keep failing stop
-	// paying the attach once SOURCES_PLAN_MISS_LIMIT trips.
-	if (
-		!formHost &&
-		prev !== undefined &&
-		(((el as any)[SOURCES_PLAN_MISSES] as number | undefined) ?? 0) < SOURCES_PLAN_MISS_LIMIT
-	)
+	// dying with a discarded `resolved`. Hosts whose scans keep failing stop
+	// paying the attach once SOURCES_PLAN_MISS_LIMIT trips. Copy the miss
+	// count onto a replacement record so poison survives the next resolve
+	// without becoming a DOM expando.
+	const misses =
+		prev === undefined
+			? 0
+			: (((prev as Record<symbol, unknown>)[SOURCES_PLAN_MISSES] as number | undefined) ?? 0);
+	if (!formHost && prev !== undefined && misses < SOURCES_PLAN_MISS_LIMIT)
 		attachSourcesPlan(el, out!, sources, winners);
+	if (out !== prev && misses !== 0) (out as Record<symbol, unknown>)[SOURCES_PLAN_MISSES] = misses;
 	return out;
 }
 

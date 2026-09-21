@@ -27,6 +27,15 @@ function watchWrites(el: Element): MutationObserver {
 	return observer;
 }
 
+// Source-plan bookkeeping belongs on the committed prop record. Stamping it on
+// the host leaks renderer state after teardown and is the hot-path DOM expando
+// the seed/ownership contract forbids.
+function hostOwnSourcePlanKeys(el: Element): string[] {
+	return Object.getOwnPropertySymbols(el)
+		.map((key) => key.description ?? '')
+		.filter((description) => description.startsWith('octane.host-prop-sources'));
+}
+
 const EDGE = {
 	cls: 'edge',
 	d: 'M0 0L1 1',
@@ -171,6 +180,35 @@ describe('a single spread source beside named props', () => {
 			attrs: { value: 'second', 'data-x': '1' },
 		});
 		expect(input.value).toBe('second');
+	});
+
+	it('keeps source-plan bookkeeping off the host across stable and reshaped commits', () => {
+		const r = mount(FastPathDiv, { tick: 'a', cls: 'row', attrs: { title: 'one' } });
+		const target = r.find('#fp-div');
+
+		// Second commit attaches the plan; the third replays it. Neither may
+		// write plan state onto the element — the success path used to reset a
+		// miss counter as a live DOM expando.
+		r.update(FastPathDiv, { tick: 'b', cls: 'row', attrs: { title: 'one' } });
+		r.update(FastPathDiv, { tick: 'c', cls: 'row', attrs: { title: 'one' } });
+		expect(r.find('#div-tick').textContent).toBe('c');
+		expect(target.getAttribute('title')).toBe('one');
+		expect(hostOwnSourcePlanKeys(target)).toEqual([]);
+
+		// Consecutive shape changes still reach the DOM after the plan gives
+		// up, and the miss count that implements that give-up stays off the host
+		// through unmount.
+		r.update(FastPathDiv, { tick: 'd', cls: 'row', attrs: { title: 'one', 'data-x': '1' } });
+		r.update(FastPathDiv, { tick: 'e', cls: 'row', attrs: { 'data-y': '2' } });
+		r.update(FastPathDiv, { tick: 'f', cls: 'row', attrs: { 'data-z': '3' } });
+		r.update(FastPathDiv, { tick: 'g', cls: 'row', attrs: { title: 'done' } });
+		expect(target.getAttribute('title')).toBe('done');
+		expect(target.getAttribute('data-x')).toBeNull();
+		expect(target.getAttribute('data-y')).toBeNull();
+		expect(target.getAttribute('data-z')).toBeNull();
+		expect(hostOwnSourcePlanKeys(target)).toEqual([]);
+		r.unmount();
+		expect(hostOwnSourcePlanKeys(target)).toEqual([]);
 	});
 
 	it('evaluates a spread-source getter once per commit and writes its latest value', () => {
