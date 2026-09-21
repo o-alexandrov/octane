@@ -1912,6 +1912,22 @@ export const Indirect = indirect(Host);
 				dependencies: { toolkit: 'link:../toolkit', react: '^19.0.0' },
 			});
 			linkToolkit(reactPackage.root);
+			// A published wrapper holds the Octane pin, installed the way pnpm lays it
+			// out: the package directory has no `node_modules`, its dependencies are
+			// siblings in the virtual store, and consumers reach it through a symlink.
+			const store = join(modules, '.pnpm/wrapper@1.0.0/node_modules');
+			const wrapperRoot = join(store, 'wrapper');
+			mkdirSync(wrapperRoot, { recursive: true });
+			writeFileSync(
+				join(wrapperRoot, 'package.json'),
+				JSON.stringify({ name: 'wrapper', dependencies: { toolkit: '0.0.0' } }),
+			);
+			symlinkSync(toolkitRoot, join(store, 'toolkit'), 'dir');
+			const nested = createLinkedPackage('linked-nested', {
+				dependencies: { wrapper: '^1.0.0' },
+			});
+			symlinkSync(wrapperRoot, join(nested.root, 'node_modules/wrapper'), 'dir');
+
 			// Octane is installed for this package, but nothing it depends on wants it.
 			const hoistedOnly = createLinkedPackage('linked-hoisted', {
 				dependencies: { lodash: '^4.0.0' },
@@ -1934,6 +1950,10 @@ export const Indirect = indirect(Host);
 			expect(compiled?.dependencies).toContain(
 				join(realpathSync(transitive.root), 'node_modules/toolkit/package.json'),
 			);
+
+			expect(
+				compiler.transform(`export function App() { return <p>nested</p>; }`, nested.source),
+			).toMatchObject({ kind: 'compile' });
 
 			expect(
 				compiler.transform(`export function App() { return <p>react</p>; }`, reactPackage.source),

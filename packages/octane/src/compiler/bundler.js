@@ -224,7 +224,7 @@ function packageUsesOctane(pkg, dir, collected) {
 				continue;
 			}
 			if (packageDeclaresOctane(dependencyManifest)) return true;
-			pending.push([dependencyManifest, dependencyDir]);
+			pending.push([dependencyManifest, realDependencyDir]);
 		}
 	}
 	return false;
