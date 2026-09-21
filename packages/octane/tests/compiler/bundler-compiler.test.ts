@@ -1862,30 +1862,17 @@ export const Indirect = indirect(Host);
 		}
 	});
 
-	it('classifies a linked package that receives Octane transitively', () => {
-		const fixtureRoot = mkdtempSync(join(tmpdir(), 'octane-bundler-transitive-'));
+	it('classifies a linked package by its octane.source marker', () => {
+		const fixtureRoot = mkdtempSync(join(tmpdir(), 'octane-bundler-marker-'));
 		try {
 			const root = join(fixtureRoot, 'app');
 			const modules = join(root, 'node_modules');
 			mkdirSync(modules, { recursive: true });
 			writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'app', private: true }));
 
-			// A toolkit package is the single place the repository pins Octane.
-			const toolkitRoot = join(fixtureRoot, 'toolkit');
-			mkdirSync(join(toolkitRoot, 'node_modules/octane'), { recursive: true });
-			writeFileSync(
-				join(toolkitRoot, 'package.json'),
-				JSON.stringify({ name: 'toolkit', dependencies: { octane: '0.0.0' } }),
-			);
-			writeFileSync(
-				join(toolkitRoot, 'node_modules/octane/package.json'),
-				JSON.stringify({ name: 'octane' }),
-			);
-
 			const createLinkedPackage = (name: string, extraManifest: Record<string, unknown>) => {
 				const packageRoot = join(fixtureRoot, name);
 				mkdirSync(join(packageRoot, 'src'), { recursive: true });
-				mkdirSync(join(packageRoot, 'node_modules'), { recursive: true });
 				const manifest = join(packageRoot, 'package.json');
 				writeFileSync(manifest, JSON.stringify({ name, ...extraManifest }));
 				writeFileSync(
@@ -1900,67 +1887,32 @@ export const Indirect = indirect(Host);
 				};
 			};
 
-			const linkToolkit = (packageRoot: string) => {
-				symlinkSync(toolkitRoot, join(packageRoot, 'node_modules/toolkit'), 'dir');
-			};
-
-			const transitive = createLinkedPackage('linked-transitive', {
-				dependencies: { toolkit: 'link:../toolkit' },
-			});
-			linkToolkit(transitive.root);
-			const reactPackage = createLinkedPackage('linked-react', {
-				dependencies: { toolkit: 'link:../toolkit', react: '^19.0.0' },
-			});
-			linkToolkit(reactPackage.root);
-			// A published wrapper holds the Octane pin, installed the way pnpm lays it
-			// out: the package directory has no `node_modules`, its dependencies are
-			// siblings in the virtual store, and consumers reach it through a symlink.
-			const store = join(modules, '.pnpm/wrapper@1.0.0/node_modules');
-			const wrapperRoot = join(store, 'wrapper');
-			mkdirSync(wrapperRoot, { recursive: true });
-			writeFileSync(
-				join(wrapperRoot, 'package.json'),
-				JSON.stringify({ name: 'wrapper', dependencies: { toolkit: '0.0.0' } }),
-			);
-			symlinkSync(toolkitRoot, join(store, 'toolkit'), 'dir');
-			const nested = createLinkedPackage('linked-nested', {
-				dependencies: { wrapper: '^1.0.0' },
-			});
-			symlinkSync(wrapperRoot, join(nested.root, 'node_modules/wrapper'), 'dir');
-
-			// Octane is installed for this package, but nothing it depends on wants it.
-			const hoistedOnly = createLinkedPackage('linked-hoisted', {
+			// The repository pins Octane once elsewhere; this package only marks itself.
+			const marked = createLinkedPackage('linked-marked', { octane: { source: true } });
+			const unmarked = createLinkedPackage('linked-unmarked', {
 				dependencies: { lodash: '^4.0.0' },
 			});
-			mkdirSync(join(hoistedOnly.root, 'node_modules/octane'), { recursive: true });
-			writeFileSync(
-				join(hoistedOnly.root, 'node_modules/octane/package.json'),
-				JSON.stringify({ name: 'octane' }),
-			);
 
 			const compiler = createOctaneCompiler({ root });
 
 			const compiled = compiler.transform(
-				`export function App() { return <p>transitive</p>; }`,
-				transitive.source,
+				`export function App() { return <p>marked</p>; }`,
+				marked.source,
 			);
 			expect(compiled?.kind).toBe('compile');
-			expect(compiled?.code).toContain('<p>transitive</p>');
-			expect(compiled?.dependencies).toContain(transitive.manifest);
-			expect(compiled?.dependencies).toContain(
-				join(realpathSync(transitive.root), 'node_modules/toolkit/package.json'),
-			);
+			expect(compiled?.code).toContain('<p>marked</p>');
+			expect(compiled?.dependencies).toContain(marked.manifest);
 
 			expect(
-				compiler.transform(`export function App() { return <p>nested</p>; }`, nested.source),
-			).toMatchObject({ kind: 'compile' });
-
-			expect(
-				compiler.transform(`export function App() { return <p>react</p>; }`, reactPackage.source),
+				compiler.transform(`export function App() { return <p>unmarked</p>; }`, unmarked.source),
 			).toMatchObject({ kind: 'none' });
 
+			// The recorded watch path is the real manifest path, so invalidating it
+			// drops the cached ownership decision instead of going stale.
+			writeFileSync(marked.manifest, JSON.stringify({ name: 'linked-marked' }));
+			compiler.invalidate(marked.manifest);
 			expect(
-				compiler.transform(`export function App() { return <p>hoisted</p>; }`, hoistedOnly.source),
+				compiler.transform(`export function App() { return <p>marked</p>; }`, marked.source),
 			).toMatchObject({ kind: 'none' });
 		} finally {
 			rmSync(fixtureRoot, { recursive: true, force: true });
@@ -2121,7 +2073,7 @@ export const Indirect = indirect(Host);
 		}
 	});
 
-	it('discovers a linked package reached through its symlink that receives Octane transitively', () => {
+	it('discovers a linked package reached through its symlink that marks itself Octane source', () => {
 		const fixtureRoot = mkdtempSync(join(tmpdir(), 'octane-bundler-linked-discovery-'));
 		try {
 			const root = join(fixtureRoot, 'app');
@@ -2129,37 +2081,25 @@ export const Indirect = indirect(Host);
 			mkdirSync(modules, { recursive: true });
 			writeFileSync(
 				join(root, 'package.json'),
-				JSON.stringify({ name: 'app', dependencies: { 'linked-transitive': 'link:../linked' } }),
-			);
-
-			const toolkitRoot = join(fixtureRoot, 'toolkit');
-			mkdirSync(join(toolkitRoot, 'node_modules/octane'), { recursive: true });
-			writeFileSync(
-				join(toolkitRoot, 'package.json'),
-				JSON.stringify({ name: 'toolkit', dependencies: { octane: '0.0.0' } }),
-			);
-			writeFileSync(
-				join(toolkitRoot, 'node_modules/octane/package.json'),
-				JSON.stringify({ name: 'octane' }),
+				JSON.stringify({ name: 'app', dependencies: { 'linked-marked': 'link:../linked' } }),
 			);
 
 			// A prepack-only `require` condition makes `require.resolve` fail, so
 			// discovery falls back to the manifest under the package's symlink path.
 			const packageRoot = join(fixtureRoot, 'linked');
-			mkdirSync(join(packageRoot, 'node_modules'), { recursive: true });
+			mkdirSync(packageRoot, { recursive: true });
 			writeFileSync(
 				join(packageRoot, 'package.json'),
 				JSON.stringify({
-					name: 'linked-transitive',
+					name: 'linked-marked',
 					exports: { '.': { require: './dist/index.cjs', default: './src/index.tsx' } },
-					dependencies: { toolkit: 'link:../toolkit' },
+					octane: { source: true },
 				}),
 			);
-			symlinkSync(toolkitRoot, join(packageRoot, 'node_modules/toolkit'), 'dir');
-			symlinkSync(packageRoot, join(modules, 'linked-transitive'), 'dir');
+			symlinkSync(packageRoot, join(modules, 'linked-marked'), 'dir');
 
 			expect(createOctaneCompiler({ root }).discoverSourceDependencies().packages).toContain(
-				'linked-transitive',
+				'linked-marked',
 			);
 		} finally {
 			rmSync(fixtureRoot, { recursive: true, force: true });

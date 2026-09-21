@@ -1,5 +1,5 @@
 ---
-'octane': patch
+'octane': minor
 ---
 
-Compile linked and workspace packages that receive Octane transitively. A package outside `node_modules` no longer needs a redundant `octane` entry in its own manifest to be recognized as Octane source: the compiler walks its declared runtime dependency closure and owns it when a package in that closure depends on Octane. Installed packages under `node_modules` still require their own declaration, and a package declaring `react` or `react-dom` keeps its own renderer.
+Recognize an `octane.source` manifest marker on linked and workspace packages. A package outside `node_modules` that receives Octane transitively from a shared toolkit can now declare `"octane": { "source": true }` instead of re-adding an `octane` version range it does not own, purely as a compiler marker. Installed packages under `node_modules` still require a declared `octane` dependency, and ownership stays explicit per package.

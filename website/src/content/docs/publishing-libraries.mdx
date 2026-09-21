@@ -143,6 +143,21 @@ dependency is enough. In particular, do not copy this setting from another bindi
 for a library that deliberately implements and verifies slot forwarding itself. Leaving
 it out is the correct default for normal `.ts` and `.js` custom hooks.
 
+`source` is the one marker a workspace or linked package may need. A repository that
+pins Octane once in a shared toolkit manifest and consumes it transitively can claim a
+package as Octane source without re-declaring a version range it does not own:
+
+```json
+{
+	"octane": {
+		"source": true
+	}
+}
+```
+
+It applies only to packages outside `node_modules`; a published package installed under
+`node_modules` is recognized by its declared `octane` dependency as before.
+
 The Vite-specific `octane.vite.optimizeDeps.exclude` metadata is similarly narrow: use
 it only when an identity-sensitive dependency must stay outside Vite’s dependency
 optimizer. See [Build tools](/docs/build-tools#vite) for that escape hatch.
