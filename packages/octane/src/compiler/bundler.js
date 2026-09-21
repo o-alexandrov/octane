@@ -757,7 +757,8 @@ class OctaneBundlerCompiler {
 	 * Two carve-outs: installed and linked packages are exempt (their
 	 * manifest `usesOctane` rule — a declared `octane` dependency, or
 	 * `octane.source` for a package outside `node_modules` — is already the
-	 * explicit per-package decision), and `exclude` path fragments are never Octane's — tsrx
+	 * explicit per-package decision), and `exclude` path fragments are never
+	 * Octane's — tsrx
 	 * syntax can target other renderers (e.g. `@tsrx/react`), so a project
 	 * routing part of its `.tsrx` through a different tsrx compiler lists
 	 * those paths in `exclude`, and the exclusion wins even over an
