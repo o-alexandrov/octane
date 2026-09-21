@@ -179,8 +179,10 @@ function packageRuntimeDependencyNames(pkg) {
  * Does this package compile as Octane source?
  *
  * A declared `octane` dependency is the fast path and the only signal accepted
- * for an installed package under `node_modules`, where a hoisted copy of Octane
- * says nothing about the package's own intent.
+ * for an installed package, whose real path lies under `node_modules`, where a
+ * hoisted copy of Octane says nothing about the package's own intent. The test
+ * runs on the real path because a linked package is routinely first seen through
+ * its `node_modules` symlink.
  *
  * A workspace or linked package outside `node_modules` is different: monorepos
  * and multi-repo checkouts routinely let one shared UI package receive Octane
@@ -197,11 +199,12 @@ function packageRuntimeDependencyNames(pkg) {
  */
 function packageUsesOctane(pkg, dir, collected) {
 	if (packageDeclaresOctane(pkg)) return true;
-	if (/(?:^|[\\/])node_modules(?:[\\/]|$)/.test(dir)) return false;
+	const realDir = realPathOrSelf(dir);
+	if (/(?:^|[\\/])node_modules(?:[\\/]|$)/.test(realDir)) return false;
 	if (packageDeclaresForeignRenderer(pkg)) return false;
 
-	const visited = new Set([realPathOrSelf(dir)]);
-	const pending = [[pkg, dir]];
+	const visited = new Set([realDir]);
+	const pending = [[pkg, realDir]];
 	while (pending.length > 0) {
 		const [manifest, manifestDir] = pending.pop();
 		for (const name of packageRuntimeDependencyNames(manifest)) {

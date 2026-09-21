@@ -2100,6 +2100,51 @@ export const Indirect = indirect(Host);
 			rmSync(root, { recursive: true, force: true });
 		}
 	});
+
+	it('discovers a linked package reached through its symlink that receives Octane transitively', () => {
+		const fixtureRoot = mkdtempSync(join(tmpdir(), 'octane-bundler-linked-discovery-'));
+		try {
+			const root = join(fixtureRoot, 'app');
+			const modules = join(root, 'node_modules');
+			mkdirSync(modules, { recursive: true });
+			writeFileSync(
+				join(root, 'package.json'),
+				JSON.stringify({ name: 'app', dependencies: { 'linked-transitive': 'link:../linked' } }),
+			);
+
+			const toolkitRoot = join(fixtureRoot, 'toolkit');
+			mkdirSync(join(toolkitRoot, 'node_modules/octane'), { recursive: true });
+			writeFileSync(
+				join(toolkitRoot, 'package.json'),
+				JSON.stringify({ name: 'toolkit', dependencies: { octane: '0.0.0' } }),
+			);
+			writeFileSync(
+				join(toolkitRoot, 'node_modules/octane/package.json'),
+				JSON.stringify({ name: 'octane' }),
+			);
+
+			// A prepack-only `require` condition makes `require.resolve` fail, so
+			// discovery falls back to the manifest under the package's symlink path.
+			const packageRoot = join(fixtureRoot, 'linked');
+			mkdirSync(join(packageRoot, 'node_modules'), { recursive: true });
+			writeFileSync(
+				join(packageRoot, 'package.json'),
+				JSON.stringify({
+					name: 'linked-transitive',
+					exports: { '.': { require: './dist/index.cjs', default: './src/index.tsx' } },
+					dependencies: { toolkit: 'link:../toolkit' },
+				}),
+			);
+			symlinkSync(toolkitRoot, join(packageRoot, 'node_modules/toolkit'), 'dir');
+			symlinkSync(packageRoot, join(modules, 'linked-transitive'), 'dir');
+
+			expect(createOctaneCompiler({ root }).discoverSourceDependencies().packages).toContain(
+				'linked-transitive',
+			);
+		} finally {
+			rmSync(fixtureRoot, { recursive: true, force: true });
+		}
+	});
 });
 
 describe('requireDirective ownership gate', () => {
