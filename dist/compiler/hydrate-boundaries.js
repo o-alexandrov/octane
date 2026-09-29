@@ -1,0 +1,2617 @@
+/**
+ * Compiler-owned `<Hydrate>` child extraction.
+ *
+ * A split boundary imports the same authored module with a stable resource
+ * query. The queried transform receives the original source again and derives
+ * the requested child module from that source alone; no adapter-owned virtual
+ * module cache is required. This is important for Rspack, whose loader is
+ * intentionally instantiated afresh for every resource query.
+ */
+import { builders as b, parseModule, strongHash } from '@tsrx/core';
+import { inheritGeneratedOrigin } from './generated-origin.js';
+import {
+	createLexicalAnalysis,
+	forEachRuntimeAstChild,
+	isIdentifierReference,
+} from './compile-universal.js';
+
+import { findPrivateCompiledContextProofs } from './private-context.js';
+
+export const HYDRATE_QUERY_PARAM = 'octane-hydrate';
+
+// Only this extraction pass can certify the loader/child ABI. Keep provenance
+// off authored attributes and parser metadata; COW rewrites preserve tag nodes.
+const compiledSplitHydrateTags = new WeakMap();
+
+export function compiledSplitHydrateTagsForAst(ast) {
+	return compiledSplitHydrateTags.get(ast);
+}
+
+// Query captures keep module-owned identities, but their generated const
+// bindings no longer look like imports or same-module declarations. Keep that
+// provenance on the prepared tree, outside parser metadata and authored props.
+const splitModuleCaptures = new WeakMap();
+export function moduleCapturesForHydrateAst(ast) {
+	return splitModuleCaptures.get(ast);
+}
+
+function isCompiledSplitHydrateBoundary(boundary) {
+	if (boundary.disabled || boundary.independent || boundary.permanentStatic) return false;
+	const opening = boundary.node.openingElement;
+	if (opening.name?.type !== 'JSXIdentifier') return false;
+	if (
+		(opening.attributes ?? []).some((attribute) => {
+			const name = attribute.name?.name;
+			return (
+				attribute.type !== 'JSXAttribute' ||
+				attribute.name?.type !== 'JSXIdentifier' ||
+				typeof name !== 'string' ||
+				name === 'children' ||
+				name === 'fallback' ||
+				name.startsWith('__')
+			);
+		})
+	)
+		return false;
+	return !(boundary.node.children ?? []).some((child) => {
+		const expression = unwrapExpression(
+			child.type === 'JSXExpressionContainer' ? child.expression : null,
+		);
+		return ['ArrowFunctionExpression', 'FunctionExpression'].includes(expression?.type);
+	});
+}
+
+// Generated captures preserve a proven private Context identity, not an authored
+// escape. Certificates belong only to this prepared AST and exact parser tags.
+const privateSplitContexts = new WeakMap();
+export function privateCompiledContextsForHydrateAst(ast) {
+	return privateSplitContexts.get(ast);
+}
+
+function privateContextCaptureBoundary(boundary) {
+	if (boundary.disabled || boundary.independent || boundary.permanentStatic) return false;
+	const opening = boundary.node.openingElement;
+	if (opening?.name?.type !== 'JSXIdentifier') return false;
+	return (opening.attributes ?? []).every((attribute) => {
+		const name = attribute.name?.name;
+		return (
+			attribute.type === 'JSXAttribute' &&
+			attribute.name?.type === 'JSXIdentifier' &&
+			typeof name === 'string' &&
+			name !== 'children' &&
+			!name.startsWith('__')
+		);
+	});
+}
+
+function originalSplitContextProofs(analysis, moduleMovePlan) {
+	const contexts = findPrivateCompiledContextProofs(analysis.ast);
+	if (contexts.size === 0) return contexts;
+	const captured = new Set();
+	for (const boundary of analysis.boundaries) {
+		if (boundary.disabled || hasPermanentStaticAncestor(boundary)) continue;
+		const moduleBindings = moduleMovePlan.bindingsByPath.get(boundary.path) ?? new Set();
+		const names = collectCaptures(
+			boundary.node.children,
+			analysis.imports.importBindings,
+			boundary.shadowedImports,
+			moduleBindings.size === 0 ? null : moduleBindings,
+		);
+		for (const name of names) {
+			if (!contexts.has(name)) continue;
+			if (!privateContextCaptureBoundary(boundary)) contexts.delete(name);
+			else captured.add(name);
+		}
+	}
+	return new Map([...contexts].filter(([name]) => captured.has(name)));
+}
+
+function certifySplitContexts(ast, contexts, captureBindings) {
+	if (contexts.size === 0) return;
+	const byId = new Map(),
+		byTag = new Map(),
+		present = new WeakSet();
+	for (const [name, context] of contexts) {
+		byId.set(context.id, context.callee);
+		for (const tag of context.providerTags) byTag.set(tag, captureBindings.get(name) ?? context.id);
+	}
+	const callees = new Set(),
+		providers = new Map();
+	mapAstCow(ast, (node) => {
+		present.add(node);
+		if (byId.has(node)) callees.add(byId.get(node));
+		if (byTag.has(node)) providers.set(node, byTag.get(node));
+		return undefined;
+	});
+	for (const [tag, binding] of providers) if (!present.has(binding)) providers.delete(tag);
+	if (callees.size > 0 || providers.size > 0) privateSplitContexts.set(ast, { callees, providers });
+}
+
+const SKIP_KEYS = new Set(['type', 'loc', 'start', 'end', 'range', 'metadata', 'parent']);
+const TRANSPARENT_TS_EXPRESSIONS = new Set([
+	'ParenthesizedExpression',
+	'TSAsExpression',
+	'TSInstantiationExpression',
+	'TSNonNullExpression',
+	'TSSatisfiesExpression',
+	'TSTypeAssertion',
+]);
+
+function mapAstCow(value, replace) {
+	if (!value || typeof value !== 'object') return value;
+	if (Array.isArray(value)) {
+		let output = null;
+		for (let index = 0; index < value.length; index++) {
+			const mapped = mapAstCow(value[index], replace);
+			if (output === null && mapped !== value[index]) output = value.slice(0, index);
+			if (output !== null && mapped !== null) output.push(mapped);
+		}
+		return output ?? value;
+	}
+	const replacement = replace(value);
+	if (replacement !== undefined) return replacement;
+	let output = null;
+	for (const [key, child] of Object.entries(value)) {
+		if (SKIP_KEYS.has(key)) continue;
+		const mapped = mapAstCow(child, replace);
+		if (mapped !== child) {
+			if (output === null) output = { ...value };
+			output[key] = mapped;
+		}
+	}
+	return output ?? value;
+}
+
+/**
+ * Copy-on-write post-order mapper for rewrites where a replaced parent must
+ * retain rewrites made to nested nodes. `replace` receives both the parser-owned
+ * node used as a WeakMap key and the child-mapped working copy.
+ */
+function mapAstCowPost(value, replace) {
+	if (!value || typeof value !== 'object') return value;
+	if (Array.isArray(value)) {
+		let output = null;
+		for (let index = 0; index < value.length; index++) {
+			const mapped = mapAstCowPost(value[index], replace);
+			if (output === null && mapped !== value[index]) output = value.slice(0, index);
+			if (output !== null && mapped !== null) output.push(mapped);
+		}
+		return output ?? value;
+	}
+	let output = null;
+	for (const [key, child] of Object.entries(value)) {
+		if (SKIP_KEYS.has(key)) continue;
+		const mapped = mapAstCowPost(child, replace);
+		if (mapped !== child) {
+			if (output === null) output = { ...value };
+			output[key] = mapped;
+		}
+	}
+	const working = output ?? value;
+	const replacement = replace(value, working);
+	return replacement === undefined ? working : replacement;
+}
+
+function jsxExpressionAttribute(name, expression, origin) {
+	return inheritGeneratedOrigin(
+		b.jsx_attribute(
+			b.jsx_id(name, origin),
+			b.jsx_expression_container(expression, origin),
+			false,
+			origin,
+		),
+		origin,
+	);
+}
+
+function objectProperty(name, value) {
+	return b.prop('init', b.id(name), value);
+}
+
+function independentManifestExpression(manifest, captures, origin) {
+	const template = b.object([
+		objectProperty('version', b.literal(1)),
+		objectProperty(
+			'boundaryId',
+			b.literal(manifest.boundaryId, JSON.stringify(manifest.boundaryId)),
+		),
+		objectProperty(
+			'exportName',
+			b.literal(manifest.exportName, JSON.stringify(manifest.exportName)),
+		),
+		objectProperty(
+			'captureSchema',
+			b.array(
+				manifest.captureSchema.map((capture) =>
+					b.object([
+						objectProperty('name', b.literal(capture.name, JSON.stringify(capture.name))),
+						objectProperty('type', b.literal('json', "'json'")),
+					]),
+				),
+			),
+		),
+		objectProperty('hookSeed', b.literal(manifest.hookSeed)),
+		objectProperty('idSeed', b.literal(manifest.idSeed)),
+		objectProperty(
+			'signalSites',
+			b.array(manifest.signalSites.map((site) => b.literal(site, JSON.stringify(site)))),
+		),
+		objectProperty('parentDependencies', b.literal(false, 'false')),
+	]);
+	return inheritGeneratedOrigin(
+		b.object([
+			objectProperty('manifestTemplate', template),
+			objectProperty('captures', b.array(captures.map((name) => b.id(name)))),
+		]),
+		origin,
+	);
+}
+
+function hydrateLoaderExpression(boundary, request) {
+	const query = `${request}?${HYDRATE_QUERY_PARAM}=${encodeURIComponent(boundary.path)}`;
+	return inheritGeneratedOrigin(
+		b.arrow([], {
+			type: 'ImportExpression',
+			source: b.literal(query, JSON.stringify(query)),
+			metadata: { path: [] },
+		}),
+		boundary.node,
+	);
+}
+
+function permanentStaticName(name, origin) {
+	return inheritGeneratedOrigin(
+		b.jsx_member(name, b.jsx_id(PERMANENT_STATIC_HYDRATE_MEMBER, origin)),
+		origin,
+	);
+}
+
+function nameOf(node) {
+	if (node?.type === 'Identifier' || node?.type === 'JSXIdentifier') return node.name;
+	if (node?.type === 'Literal' && typeof node.value === 'string') return node.value;
+	return null;
+}
+
+function collectBindingNames(pattern, output) {
+	if (!pattern) return;
+	if (pattern.type === 'TSParameterProperty') {
+		collectBindingNames(pattern.parameter, output);
+		return;
+	}
+	if (pattern.type === 'Identifier' || pattern.type === 'JSXIdentifier') {
+		output.add(pattern.name);
+		return;
+	}
+	if (pattern.type === 'RestElement') {
+		collectBindingNames(pattern.argument, output);
+		return;
+	}
+	if (pattern.type === 'AssignmentPattern') {
+		collectBindingNames(pattern.left, output);
+		return;
+	}
+	if (pattern.type === 'ArrayPattern') {
+		for (const element of pattern.elements ?? []) collectBindingNames(element, output);
+		return;
+	}
+	if (pattern.type === 'ObjectPattern') {
+		for (const property of pattern.properties ?? []) {
+			collectBindingNames(property.argument ?? property.value, output);
+		}
+	}
+}
+
+function directDeclaration(statement) {
+	if (
+		statement?.type === 'ExportNamedDeclaration' ||
+		statement?.type === 'ExportDefaultDeclaration'
+	) {
+		return statement.declaration;
+	}
+	return statement;
+}
+
+function directScopeBindings(statements) {
+	const bindings = new Set();
+	for (const statement of statements ?? []) {
+		const declaration = directDeclaration(statement);
+		if (declaration?.type === 'VariableDeclaration') {
+			for (const item of declaration.declarations ?? []) collectBindingNames(item.id, bindings);
+		} else if (
+			(declaration?.type === 'FunctionDeclaration' ||
+				declaration?.type === 'ClassDeclaration' ||
+				declaration?.type === 'TSEnumDeclaration') &&
+			declaration.id
+		) {
+			collectBindingNames(declaration.id, bindings);
+		}
+	}
+	return bindings;
+}
+
+function topLevelBindingNames(ast) {
+	const bindings = new Set();
+	for (const statement of ast.body ?? []) {
+		const declaration = directDeclaration(statement);
+		if (declaration?.type === 'VariableDeclaration') {
+			for (const item of declaration.declarations ?? []) collectBindingNames(item.id, bindings);
+		} else if (
+			(declaration?.type === 'FunctionDeclaration' ||
+				declaration?.type === 'ClassDeclaration' ||
+				declaration?.type === 'TSEnumDeclaration') &&
+			declaration.id
+		) {
+			collectBindingNames(declaration.id, bindings);
+		}
+	}
+	return bindings;
+}
+
+function functionVarBindings(body) {
+	const bindings = new Set();
+	const seen = new WeakSet();
+	const visit = (node, root = false) => {
+		if (!node || typeof node !== 'object') return;
+		if (Array.isArray(node)) {
+			for (const child of node) visit(child);
+			return;
+		}
+		if (seen.has(node)) return;
+		seen.add(node);
+		if (
+			!root &&
+			(node.type === 'FunctionDeclaration' ||
+				node.type === 'FunctionExpression' ||
+				node.type === 'ArrowFunctionExpression' ||
+				node.type === 'ClassDeclaration' ||
+				node.type === 'ClassExpression' ||
+				node.type === 'StaticBlock' ||
+				node.type === 'TSModuleDeclaration')
+		) {
+			return;
+		}
+		if (node.type === 'VariableDeclaration' && node.kind === 'var') {
+			for (const item of node.declarations ?? []) collectBindingNames(item.id, bindings);
+		}
+		for (const [key, value] of Object.entries(node)) {
+			if (SKIP_KEYS.has(key)) continue;
+			visit(value);
+		}
+	};
+	visit(body, true);
+	return bindings;
+}
+
+function collectImports(ast) {
+	const hydrateNames = new Set();
+	const hookNames = new Set();
+	const neverNames = new Set();
+	const conditionNames = new Set();
+	const importBindings = new Set();
+	const declarations = [];
+	for (const statement of ast.body ?? []) {
+		if (statement.type !== 'ImportDeclaration') continue;
+		declarations.push(statement);
+		for (const specifier of statement.specifiers ?? []) {
+			if (specifier.local?.name) importBindings.add(specifier.local.name);
+			if (
+				statement.source?.value === 'octane' &&
+				statement.importKind !== 'type' &&
+				specifier.type === 'ImportSpecifier' &&
+				specifier.importKind !== 'type' &&
+				nameOf(specifier.imported) === 'Hydrate' &&
+				specifier.local?.name
+			) {
+				hydrateNames.add(specifier.local.name);
+			}
+			if (
+				statement.source?.value === 'octane' &&
+				statement.importKind !== 'type' &&
+				specifier.type === 'ImportSpecifier' &&
+				specifier.importKind !== 'type' &&
+				/^use(?:[A-Z0-9_]|$)/.test(nameOf(specifier.imported) ?? '') &&
+				specifier.local?.name
+			) {
+				hookNames.add(specifier.local.name);
+			}
+			if (
+				statement.source?.value === 'octane/hydration' &&
+				statement.importKind !== 'type' &&
+				specifier.type === 'ImportSpecifier' &&
+				specifier.importKind !== 'type' &&
+				(nameOf(specifier.imported) === 'never' || nameOf(specifier.imported) === 'condition') &&
+				specifier.local?.name
+			) {
+				(nameOf(specifier.imported) === 'never' ? neverNames : conditionNames).add(
+					specifier.local.name,
+				);
+			}
+		}
+	}
+	return { declarations, hookNames, hydrateNames, neverNames, conditionNames, importBindings };
+}
+
+function addRelevantBindings(pattern, shadowed, relevant) {
+	const bindings = new Set();
+	collectBindingNames(pattern, bindings);
+	for (const binding of bindings) if (relevant.has(binding)) shadowed.add(binding);
+}
+
+function addRelevantDirectBindings(statements, shadowed, relevant) {
+	for (const binding of directScopeBindings(statements)) {
+		if (relevant.has(binding)) shadowed.add(binding);
+	}
+}
+
+function collectRelevantFunctionVars(body, shadowed, relevant) {
+	for (const binding of functionVarBindings(body)) {
+		if (relevant.has(binding)) shadowed.add(binding);
+	}
+}
+
+function jsxAttributeName(attribute) {
+	if (attribute?.type !== 'JSXAttribute' && attribute?.type !== 'Attribute') return null;
+	return nameOf(attribute.name);
+}
+
+function unwrapExpression(node) {
+	let value = node;
+	while (value && TRANSPARENT_TS_EXPRESSIONS.has(value.type)) value = value.expression;
+	return value;
+}
+
+function literalSplitDisabled(node) {
+	let split = null;
+	for (const attribute of node.openingElement?.attributes ?? []) {
+		if (jsxAttributeName(attribute) === 'split') split = attribute;
+	}
+	if (split === null || split.value == null) return false;
+	const value =
+		split.value.type === 'JSXExpressionContainer'
+			? unwrapExpression(split.value.expression)
+			: split.value;
+	return value?.type === 'Literal' && value.value === false;
+}
+
+function literalIndependentEnabled(node, filename) {
+	let independent = null;
+	let hasSpread = false;
+	for (const attribute of node.openingElement?.attributes ?? []) {
+		if (attribute.type === 'JSXSpreadAttribute' || attribute.type === 'SpreadAttribute') {
+			hasSpread = true;
+			continue;
+		}
+		if (jsxAttributeName(attribute) === 'independent') independent = attribute;
+	}
+	if (independent === null) return false;
+	const raw =
+		independent.value == null
+			? null
+			: independent.value.type === 'JSXExpressionContainer'
+				? unwrapExpression(independent.value.expression)
+				: independent.value;
+	const enabled = independent.value == null || (raw?.type === 'Literal' && raw.value === true);
+	const disabled = raw?.type === 'Literal' && raw.value === false;
+	if (!enabled && !disabled) {
+		throw extractionError(
+			'OCTANE_HYDRATE_INDEPENDENT_LITERAL',
+			filename,
+			independent,
+			'`independent` must be the literal `true` or `false` so standalone ownership is decided at build time',
+		);
+	}
+	if (enabled && hasSpread) {
+		throw extractionError(
+			'OCTANE_HYDRATE_INDEPENDENT_SPREAD',
+			filename,
+			independent,
+			'an independent boundary cannot combine its ownership request with Hydrate prop spreads; author the boundary options directly',
+		);
+	}
+	if (enabled && literalSplitDisabled(node)) {
+		throw extractionError(
+			'OCTANE_HYDRATE_INDEPENDENT_SPLIT',
+			filename,
+			independent,
+			'an independent boundary requires its own split client entry; remove `split={false}` or remove `independent`',
+		);
+	}
+	return enabled;
+}
+
+/**
+ * An independent island activates without its lexical parent, so the client
+ * cannot re-evaluate `when`. The server serializes each built-in automatic
+ * strategy's parameters; reject the authored forms that need the parent:
+ * function-form `when` and `condition()`. Opaque values are checked at SSR.
+ */
+function assertIndependentWhen(node, conditionNames, shadowedImports, filename) {
+	for (const attribute of node.openingElement?.attributes ?? []) {
+		if (jsxAttributeName(attribute) !== 'when') continue;
+		const raw =
+			attribute.value?.type === 'JSXExpressionContainer'
+				? attribute.value.expression
+				: attribute.value;
+		const expression = unwrapExpression(raw);
+		const callee =
+			expression?.type === 'CallExpression' ? unwrapExpression(expression.callee) : null;
+		const kind =
+			expression?.type === 'ArrowFunctionExpression' || expression?.type === 'FunctionExpression'
+				? 'a function-form `when`'
+				: callee?.type === 'Identifier' &&
+					  conditionNames.has(callee.name) &&
+					  !shadowedImports.has(callee.name)
+					? '`condition()`'
+					: null;
+		if (kind !== null) {
+			throw extractionError(
+				'OCTANE_HYDRATE_INDEPENDENT_WHEN',
+				filename,
+				attribute,
+				`an independent boundary cannot use ${kind} because its lexical parent never runs on the client to re-evaluate it. Use load(), idle(), visible(), media(), interaction(), or never(), or remove \`independent\``,
+			);
+		}
+	}
+}
+
+/**
+ * Recognize only the exact server-only form whose client subtree may be erased.
+ * Spreads and indirect strategies stay on the ordinary persistent-wrapper path:
+ * either could change the final `split`, `when`, or `children` value at runtime.
+ */
+function isPermanentStaticBoundary(node, neverNames, shadowedImports) {
+	let split = null;
+	let when = null;
+	const attributes = node.openingElement?.attributes ?? [];
+	if (attributes.length !== 2) return false;
+	for (const attribute of attributes) {
+		if (attribute.type === 'JSXSpreadAttribute' || attribute.type === 'SpreadAttribute') {
+			return false;
+		}
+		const name = jsxAttributeName(attribute);
+		if (name === 'children') return false;
+		if (name === 'split') split = attribute;
+		else if (name === 'when') when = attribute;
+	}
+	if (split === null || when === null || !literalSplitDisabled(node)) return false;
+	const raw = when.value?.type === 'JSXExpressionContainer' ? when.value.expression : when.value;
+	const expression = unwrapExpression(raw);
+	if (expression?.type !== 'CallExpression' || (expression.arguments?.length ?? 0) !== 0) {
+		return false;
+	}
+	const callee = unwrapExpression(expression.callee);
+	return (
+		callee?.type === 'Identifier' &&
+		neverNames.has(callee.name) &&
+		!shadowedImports.has(callee.name)
+	);
+}
+
+const PERMANENT_STATIC_HYDRATE_MEMBER = '__octanePermanentStatic';
+
+function formatLocation(filename, node) {
+	const start = node?.loc?.start;
+	return start ? `${filename}:${start.line}:${start.column}` : filename;
+}
+
+function extractionError(code, filename, node, message) {
+	const error = new Error(
+		`Octane Hydrate compiler: ${message} (${formatLocation(filename, node)})`,
+	);
+	error.code = code;
+	error.filename = filename;
+	error.loc = node?.loc?.start ?? null;
+	return error;
+}
+
+function isFunction(node) {
+	const value = unwrapExpression(node);
+	return (
+		value?.type === 'FunctionExpression' ||
+		value?.type === 'ArrowFunctionExpression' ||
+		value?.type === 'FunctionDeclaration'
+	);
+}
+
+function isRenderableChild(child) {
+	if (!child || child.type === 'JSXStyleElement') return false;
+	if (child.type === 'JSXText') return !/^\s*$/.test(child.value ?? '');
+	if (child.type === 'JSXExpressionContainer') {
+		return child.expression != null && child.expression.type !== 'JSXEmptyExpression';
+	}
+	return true;
+}
+
+function assertDirectChildren(boundary, filename) {
+	if (!boundary.node.closingElement) {
+		throw extractionError(
+			'OCTANE_HYDRATE_DIRECT_CHILDREN',
+			filename,
+			boundary.node,
+			'splitting requires direct JSX children. Use an opening/closing tag or set `split={false}`',
+		);
+	}
+	if ((boundary.node.children ?? []).some(isRenderableChild)) return;
+	const indirect = (boundary.node.openingElement?.attributes ?? []).find(
+		(attribute) =>
+			attribute.type === 'JSXSpreadAttribute' ||
+			attribute.type === 'SpreadAttribute' ||
+			jsxAttributeName(attribute) === 'children',
+	);
+	if (indirect) {
+		throw extractionError(
+			'OCTANE_HYDRATE_DIRECT_CHILDREN',
+			filename,
+			indirect,
+			'splitting cannot extract `children` supplied by a prop or spread. Author JSX children directly or set `split={false}`',
+		);
+	}
+}
+
+function isHookCall(node, hookNames) {
+	if (node?.type !== 'CallExpression') return false;
+	if (node.callee?.type === 'Identifier') {
+		return hookNames.has(node.callee.name) || /^use(?:[A-Z0-9_]|$)/.test(node.callee.name);
+	}
+	return (
+		node.callee?.type === 'MemberExpression' &&
+		!node.callee.computed &&
+		node.callee.property?.type === 'Identifier' &&
+		/^use(?:[A-Z0-9_]|$)/.test(node.callee.property.name)
+	);
+}
+
+function collectSubtreeNodes(value, output) {
+	if (!value || typeof value !== 'object') return;
+	if (Array.isArray(value)) {
+		for (const child of value) collectSubtreeNodes(child, output);
+		return;
+	}
+	if (output.has(value)) return;
+	output.add(value);
+	for (const [key, child] of Object.entries(value)) {
+		if (!SKIP_KEYS.has(key)) collectSubtreeNodes(child, output);
+	}
+}
+
+function subtreeContainsNode(root, target) {
+	if (root === target) return true;
+	const seen = new WeakSet();
+	const visit = (value) => {
+		if (!value || typeof value !== 'object') return false;
+		if (Array.isArray(value)) {
+			for (const child of value) {
+				if (visit(child)) return true;
+			}
+			return false;
+		}
+		if (seen.has(value)) return false;
+		seen.add(value);
+		if (value === target) return true;
+		for (const [key, child] of Object.entries(value)) {
+			if (!SKIP_KEYS.has(key) && visit(child)) return true;
+		}
+		return false;
+	};
+	return visit(root);
+}
+
+function collectOwnStyleBlocks(nodes) {
+	const blocks = [];
+	for (const node of nodes ?? []) {
+		if (node?.type === 'JSXStyleElement' && !isFloatStyleResource(node)) blocks.push(node);
+	}
+	return blocks;
+}
+
+function isFloatStyleResource(node) {
+	let hasHref = false;
+	let hasPrecedence = false;
+	for (const attribute of node.openingElement?.attributes ?? []) {
+		if (attribute?.type !== 'JSXAttribute' && attribute?.type !== 'Attribute') continue;
+		const name = jsxAttributeName(attribute);
+		if (name === 'href') hasHref = true;
+		else if (name === 'precedence') hasPrecedence = true;
+	}
+	return hasHref && hasPrecedence;
+}
+
+function isStampableHost(node) {
+	if (node?.type !== 'JSXElement' && node?.type !== 'Element') return false;
+	if (node.metadata?.dynamicElement) return true;
+	const name = node.openingElement?.name ?? node.name;
+	if (!name) return false;
+	if (name.type === 'JSXIdentifier' || name.type === 'Identifier') {
+		return name.name !== 'style' && !/^[A-Z]/.test(name.name);
+	}
+	// Namespaced hosts (`svg:rect`) are stamped by the style-scope pass;
+	// member expressions are composites and are not.
+	return name.type === 'JSXNamespacedName' || name.type === 'NamespacedName';
+}
+
+function walkStampableHosts(node, visitHost) {
+	if (!node || typeof node !== 'object') return;
+	if (Array.isArray(node)) {
+		for (const child of node) walkStampableHosts(child, visitHost);
+		return;
+	}
+	if (isFunction(node)) return;
+	if (isStampableHost(node)) visitHost(node);
+	for (const [key, child] of Object.entries(node)) {
+		if (!SKIP_KEYS.has(key)) walkStampableHosts(child, visitHost);
+	}
+}
+
+/**
+ * A children list that holds standalone `<style>` blocks is one lexical style
+ * scope (plan S8.5 / RFC sibling scopes). Extraction is safe when that whole
+ * scope — its blocks and the host elements they stamp — sits inside the split
+ * boundary, because both compiles keep the authored-position hash. A scope
+ * that has blocks or stamped hosts on both sides of the boundary would emit
+ * disagreeing class lists; that is still `OCTANE_HYDRATE_SPLIT_STYLE`. Styles
+ * nested in functions never joined the enclosing scopes and are not checked.
+ */
+function styleScopeStraddlesBoundary(list, own, inside) {
+	let hasInside = false;
+	let hasOutside = false;
+	const mark = (node) => {
+		if (inside.has(node)) hasInside = true;
+		else hasOutside = true;
+	};
+	for (const block of own) mark(block);
+	for (const item of list) {
+		if (own.includes(item)) continue;
+		walkStampableHosts(item, mark);
+	}
+	return hasInside && hasOutside;
+}
+
+function assertHydrateStyleScopes(boundary, filename) {
+	const inside = new WeakSet();
+	collectSubtreeNodes(boundary.node.children, inside);
+	const seenLists = new WeakSet();
+	const seen = new WeakSet();
+	const visit = (node, inFunction) => {
+		if (!node || typeof node !== 'object') return;
+		if (Array.isArray(node)) {
+			for (const child of node) visit(child, inFunction);
+			return;
+		}
+		if (seen.has(node)) return;
+		seen.add(node);
+		if (TRANSPARENT_TS_EXPRESSIONS.has(node.type)) {
+			visit(node.expression, inFunction);
+			return;
+		}
+		if (!inFunction && isFunction(node)) {
+			const nested = !subtreeContainsNode(node, boundary.node);
+			for (const [key, child] of Object.entries(node)) {
+				if (!SKIP_KEYS.has(key)) visit(child, nested);
+			}
+			return;
+		}
+		if (
+			!inFunction &&
+			(node.type === 'JSXElement' || node.type === 'JSXFragment' || node.type === 'Element') &&
+			Array.isArray(node.children)
+		) {
+			const own = collectOwnStyleBlocks(node.children);
+			if (own.length > 0 && !seenLists.has(node.children)) {
+				seenLists.add(node.children);
+				if (styleScopeStraddlesBoundary(node.children, own, inside)) {
+					const reported = own.find((block) => inside.has(block)) ?? own[0];
+					throw extractionError(
+						'OCTANE_HYDRATE_SPLIT_STYLE',
+						filename,
+						reported,
+						'a scoped <style> cannot straddle a split Hydrate boundary — its style scope has blocks or stamped elements on both sides. Keep the whole scope inside the boundary, move it entirely outside, extract a child component, or set `split={false}`',
+					);
+				}
+			}
+		}
+		for (const [key, child] of Object.entries(node)) {
+			if (!SKIP_KEYS.has(key)) visit(child, inFunction);
+		}
+	};
+	visit(boundary.ast ?? boundary.node, false);
+}
+
+function validateBoundary(boundary, filename, hookNames) {
+	for (const child of boundary.node.children ?? []) {
+		if (child?.type === 'JSXExpressionContainer' && isFunction(child.expression)) {
+			throw extractionError(
+				'OCTANE_HYDRATE_FUNCTION_CHILD',
+				filename,
+				child,
+				'function children cannot be split. Extract the function into a component or set `split={false}`',
+			);
+		}
+	}
+
+	const seen = new WeakSet();
+	const visit = (node, directHooks = true, capturesThis = true, capturesSuper = true) => {
+		if (!node || typeof node !== 'object') return;
+		if (Array.isArray(node)) {
+			for (const child of node) visit(child, directHooks, capturesThis, capturesSuper);
+			return;
+		}
+		if (seen.has(node)) return;
+		seen.add(node);
+		if (TRANSPARENT_TS_EXPRESSIONS.has(node.type)) {
+			visit(node.expression, directHooks, capturesThis, capturesSuper);
+			return;
+		}
+		if (node.type === 'ThisExpression' && capturesThis) {
+			throw extractionError(
+				'OCTANE_HYDRATE_THIS_CAPTURE',
+				filename,
+				node,
+				'`this` cannot be captured by a split child. Pass its value through a local or set `split={false}`',
+			);
+		}
+		if (node.type === 'Super' && capturesSuper) {
+			throw extractionError(
+				'OCTANE_HYDRATE_SUPER_CAPTURE',
+				filename,
+				node,
+				'`super` cannot be captured by a split child. Extract a component or set `split={false}`',
+			);
+		}
+		if (directHooks && isHookCall(node, hookNames)) {
+			throw extractionError(
+				'OCTANE_HYDRATE_DIRECT_HOOK',
+				filename,
+				node,
+				'direct hook calls cannot move into a split child. Call the hook in a child component or set `split={false}`',
+			);
+		}
+		if (isFunction(node)) {
+			// A nested function keeps hook calls in its own invocation. Ordinary
+			// functions also bind their own receiver; arrows still capture `this`
+			// and `super` from the component scope that extraction would replace.
+			const lexicalReceiver = unwrapExpression(node).type === 'ArrowFunctionExpression';
+			for (const [key, value] of Object.entries(node)) {
+				if (
+					SKIP_KEYS.has(key) ||
+					(key === 'expression' && TRANSPARENT_TS_EXPRESSIONS.has(node.type))
+				) {
+					continue;
+				}
+				visit(value, false, lexicalReceiver && capturesThis, lexicalReceiver && capturesSuper);
+			}
+			return;
+		}
+		for (const [key, value] of Object.entries(node)) {
+			if (
+				SKIP_KEYS.has(key) ||
+				(key === 'expression' && TRANSPARENT_TS_EXPRESSIONS.has(node.type))
+			) {
+				continue;
+			}
+			visit(value, directHooks, capturesThis, capturesSuper);
+		}
+	};
+	visit(boundary.node.children);
+	assertHydrateStyleScopes(boundary, filename);
+}
+
+/** Resolve Hydrate boundaries and assign source-order paths under their nearest boundary. */
+export function analyzeHydrateBoundaries(source, filename = 'unknown.tsrx', parsedAst = null) {
+	const ast = parsedAst ?? parseModule(source, filename);
+	const imports = collectImports(ast);
+	if (imports.hydrateNames.size === 0) {
+		return { ast, boundaries: [], imports, roots: [] };
+	}
+
+	const boundaries = [];
+	const roots = [];
+	const relevantBindings = new Set([...imports.importBindings, ...topLevelBindingNames(ast)]);
+	const seen = new WeakSet();
+	const walk = (node, shadowed, parentBoundary) => {
+		if (!node || typeof node !== 'object') return;
+		if (Array.isArray(node)) {
+			for (const child of node) walk(child, shadowed, parentBoundary);
+			return;
+		}
+		if (seen.has(node)) return;
+		seen.add(node);
+		if (TRANSPARENT_TS_EXPRESSIONS.has(node.type)) {
+			walk(node.expression, shadowed, parentBoundary);
+			return;
+		}
+		if (node.type?.startsWith('TS')) return;
+
+		if (node.type === 'JSXElement' || node.type === 'Element') {
+			const tag = node.openingElement?.name ?? node.name;
+			const local = nameOf(tag);
+			const isBoundary =
+				(tag?.type === 'JSXIdentifier' || tag?.type === 'Identifier') &&
+				imports.hydrateNames.has(local) &&
+				!shadowed.has(local);
+			let boundary = parentBoundary;
+			if (isBoundary) {
+				const siblings = parentBoundary === null ? roots : parentBoundary.children;
+				const index = siblings.length;
+				const path = parentBoundary === null ? String(index) : `${parentBoundary.path}.${index}`;
+				const independent = literalIndependentEnabled(node, filename);
+				if (independent) assertIndependentWhen(node, imports.conditionNames, shadowed, filename);
+				boundary = {
+					children: [],
+					disabled: literalSplitDisabled(node),
+					independent,
+					permanentStatic: isPermanentStaticBoundary(node, imports.neverNames, shadowed),
+					node,
+					parent: parentBoundary,
+					path,
+					shadowedImports: new Set(shadowed),
+				};
+				siblings.push(boundary);
+				boundaries.push(boundary);
+			}
+			// Props/fallbacks execute outside the boundary's deferred child region.
+			walk(node.openingElement?.attributes, shadowed, parentBoundary);
+			walk(node.children, shadowed, boundary);
+			return;
+		}
+
+		if (
+			node.type === 'FunctionDeclaration' ||
+			node.type === 'FunctionExpression' ||
+			node.type === 'ArrowFunctionExpression'
+		) {
+			const inner = new Set(shadowed);
+			if (node.id) addRelevantBindings(node.id, inner, relevantBindings);
+			for (const parameter of node.params ?? []) {
+				addRelevantBindings(parameter, inner, relevantBindings);
+			}
+			collectRelevantFunctionVars(node.body, inner, relevantBindings);
+			walk(node.body, inner, parentBoundary);
+			return;
+		}
+
+		if (node.type === 'BlockStatement' || node.type === 'JSXCodeBlock') {
+			const inner = new Set(shadowed);
+			addRelevantDirectBindings(node.body, inner, relevantBindings);
+			walk(node.body, inner, parentBoundary);
+			if (node.type === 'JSXCodeBlock') walk(node.render, inner, parentBoundary);
+			return;
+		}
+
+		if (node.type === 'CatchClause') {
+			const inner = new Set(shadowed);
+			addRelevantBindings(node.param, inner, relevantBindings);
+			walk(node.body, inner, parentBoundary);
+			return;
+		}
+
+		if (node.type === 'ClassDeclaration' || node.type === 'ClassExpression') {
+			const inner = new Set(shadowed);
+			addRelevantBindings(node.id, inner, relevantBindings);
+			walk(node.superClass, shadowed, parentBoundary);
+			walk(node.body, inner, parentBoundary);
+			walk(node.decorators, shadowed, parentBoundary);
+			return;
+		}
+
+		if (
+			node.type === 'ForStatement' ||
+			node.type === 'ForInStatement' ||
+			node.type === 'ForOfStatement' ||
+			node.type === 'JSXForExpression'
+		) {
+			const declaration = node.type === 'ForStatement' ? node.init : node.left;
+			const inner = new Set(shadowed);
+			if (declaration?.type === 'VariableDeclaration') {
+				for (const item of declaration.declarations ?? []) {
+					addRelevantBindings(item.id, inner, relevantBindings);
+				}
+			}
+			walk(node.right, shadowed, parentBoundary);
+			walk(declaration, inner, parentBoundary);
+			walk(node.test, inner, parentBoundary);
+			walk(node.update, inner, parentBoundary);
+			walk(node.key, inner, parentBoundary);
+			walk(node.body, inner, parentBoundary);
+			walk(node.empty, inner, parentBoundary);
+			return;
+		}
+
+		if (node.type === 'SwitchStatement') {
+			const inner = new Set(shadowed);
+			for (const branch of node.cases ?? []) {
+				addRelevantDirectBindings(branch.consequent, inner, relevantBindings);
+			}
+			walk(node.discriminant, shadowed, parentBoundary);
+			walk(node.cases, inner, parentBoundary);
+			return;
+		}
+
+		if (node.type === 'VariableDeclarator') {
+			walk(node.init, shadowed, parentBoundary);
+			return;
+		}
+		if (node.type === 'ImportDeclaration') return;
+		for (const [key, value] of Object.entries(node)) {
+			if (SKIP_KEYS.has(key)) continue;
+			walk(value, shadowed, parentBoundary);
+		}
+	};
+
+	walk(ast.body, new Set(), null);
+	return { ast, boundaries, imports, roots };
+}
+
+function visitJsxTag(name, visitIdentifier) {
+	if (!name) return;
+	if (name.type === 'JSXIdentifier' || name.type === 'Identifier') {
+		if (/^[A-Z_$]/.test(name.name)) visitIdentifier(name);
+		return;
+	}
+	if (name.type === 'JSXMemberExpression' || name.type === 'MemberExpression') {
+		let object = name.object;
+		while (object?.type === 'JSXMemberExpression' || object?.type === 'MemberExpression') {
+			object = object.object;
+		}
+		if (object?.type === 'JSXIdentifier' || object?.type === 'Identifier') {
+			visitIdentifier(object);
+		}
+	}
+}
+
+/** Collect names whose values must cross from the parent module into a queried child. */
+function collectCaptures(
+	nodes,
+	importBindings,
+	shadowedImports = new Set(),
+	additionalBindings = null,
+) {
+	const captures = new Set();
+	const scopes = [];
+	const seen = new WeakSet();
+	// Module slicing can consult a second binding set without materializing its
+	// union for every boundary. Preserve the single-set path for all other walks.
+	const isBound =
+		additionalBindings === null
+			? (name) => {
+					if (importBindings.has(name) && !shadowedImports.has(name)) return true;
+					for (let index = scopes.length - 1; index >= 0; index--) {
+						if (scopes[index].has(name)) return true;
+					}
+					return false;
+				}
+			: (name) => {
+					if (
+						(importBindings.has(name) || additionalBindings.has(name)) &&
+						!shadowedImports.has(name)
+					) {
+						return true;
+					}
+					for (let index = scopes.length - 1; index >= 0; index--) {
+						if (scopes[index].has(name)) return true;
+					}
+					return false;
+				};
+	const reference = (node) => {
+		if (node?.name && !isBound(node.name)) captures.add(node.name);
+	};
+	const visitPatternDefaults = (pattern) => {
+		if (!pattern) return;
+		if (pattern.type === 'AssignmentPattern') {
+			visit(pattern.right);
+			visitPatternDefaults(pattern.left);
+		} else if (pattern.type === 'ArrayPattern') {
+			for (const element of pattern.elements ?? []) visitPatternDefaults(element);
+		} else if (pattern.type === 'ObjectPattern') {
+			for (const property of pattern.properties ?? []) {
+				if (property.computed) visit(property.key);
+				visitPatternDefaults(property.argument ?? property.value);
+			}
+		} else if (pattern.type === 'RestElement') {
+			visitPatternDefaults(pattern.argument);
+		}
+	};
+	const visit = (node) => {
+		if (!node || typeof node !== 'object') return;
+		if (Array.isArray(node)) {
+			for (const child of node) visit(child);
+			return;
+		}
+		if (seen.has(node)) return;
+		seen.add(node);
+		if (TRANSPARENT_TS_EXPRESSIONS.has(node.type)) {
+			visit(node.expression);
+			return;
+		}
+		if (node.type?.startsWith('TS')) return;
+		if (node.type === 'Identifier') {
+			reference(node);
+			return;
+		}
+		if (node.type === 'JSXElement' || node.type === 'Element') {
+			visitJsxTag(node.openingElement?.name ?? node.name, reference);
+			for (const attribute of node.openingElement?.attributes ?? node.attributes ?? []) {
+				if (attribute.type === 'JSXSpreadAttribute' || attribute.type === 'SpreadAttribute') {
+					visit(attribute.argument);
+				} else {
+					visit(attribute.value);
+				}
+			}
+			visit(node.children);
+			return;
+		}
+		if (node.type === 'JSXAttribute' || node.type === 'Attribute') {
+			visit(node.value);
+			return;
+		}
+		if (node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression') {
+			visit(node.object);
+			if (node.computed) visit(node.property);
+			return;
+		}
+		if (node.type === 'Property' || node.type === 'PropertyDefinition') {
+			if (node.computed) visit(node.key);
+			if (node.shorthand) visit(node.value ?? node.key);
+			else visit(node.value);
+			return;
+		}
+		if (
+			node.type === 'FunctionDeclaration' ||
+			node.type === 'FunctionExpression' ||
+			node.type === 'ArrowFunctionExpression'
+		) {
+			const parameterBindings = new Set();
+			collectBindingNames(node.id, parameterBindings);
+			for (const parameter of node.params ?? []) {
+				collectBindingNames(parameter, parameterBindings);
+			}
+			// A non-simple parameter list executes outside the function body's `var`
+			// environment. Defaults and computed parameter keys can therefore still
+			// reference a module binding with the same name as a body-local `var`.
+			scopes.push(parameterBindings);
+			for (const parameter of node.params ?? []) visitPatternDefaults(parameter);
+			scopes.pop();
+			const bodyBindings = new Set(parameterBindings);
+			for (const binding of functionVarBindings(node.body)) bodyBindings.add(binding);
+			scopes.push(bodyBindings);
+			visit(node.body);
+			scopes.pop();
+			return;
+		}
+		if (node.type === 'BlockStatement' || node.type === 'JSXCodeBlock') {
+			scopes.push(directScopeBindings(node.body));
+			visit(node.body);
+			if (node.type === 'JSXCodeBlock') visit(node.render);
+			scopes.pop();
+			return;
+		}
+		if (node.type === 'CatchClause') {
+			const bindings = new Set();
+			collectBindingNames(node.param, bindings);
+			scopes.push(bindings);
+			visitPatternDefaults(node.param);
+			visit(node.body);
+			scopes.pop();
+			return;
+		}
+		if (
+			node.type === 'ForStatement' ||
+			node.type === 'ForInStatement' ||
+			node.type === 'ForOfStatement' ||
+			node.type === 'JSXForExpression'
+		) {
+			const declaration = node.type === 'ForStatement' ? node.init : node.left;
+			const bindings = new Set();
+			if (declaration?.type === 'VariableDeclaration') {
+				for (const item of declaration.declarations ?? []) collectBindingNames(item.id, bindings);
+			}
+			visit(node.right);
+			scopes.push(bindings);
+			if (declaration?.type === 'VariableDeclaration') {
+				for (const item of declaration.declarations ?? []) visit(item.init);
+			} else visit(declaration);
+			visit(node.test);
+			visit(node.update);
+			visit(node.key);
+			visit(node.body);
+			visit(node.empty);
+			scopes.pop();
+			return;
+		}
+		if (node.type === 'VariableDeclarator') {
+			visit(node.init);
+			visitPatternDefaults(node.id);
+			return;
+		}
+		if (
+			node.type === 'ImportDeclaration' ||
+			node.type === 'LabeledStatement' ||
+			node.type === 'BreakStatement' ||
+			node.type === 'ContinueStatement' ||
+			node.type === 'MetaProperty'
+		) {
+			if (node.type === 'LabeledStatement') visit(node.body);
+			return;
+		}
+		for (const [key, value] of Object.entries(node)) {
+			if (SKIP_KEYS.has(key)) continue;
+			visit(value);
+		}
+	};
+	visit(nodes);
+	return [...captures];
+}
+
+function captureBindingScope(lexical, node, name) {
+	return (
+		lexical.resolveBinding(lexical.nodeScopes.get(node) ?? lexical.rootScope, name)?.scope ??
+		lexical.rootScope
+	);
+}
+
+// A pattern binding's value is its declarator initializer or, when that part is
+// undefined, any default on the path to it (`const { value = new Map() } = props`).
+function recordPatternInitializers(pattern, scopeNode, values, record) {
+	if (!pattern) return;
+	if (pattern.type === 'TSParameterProperty') {
+		recordPatternInitializers(pattern.parameter, scopeNode, values, record);
+	} else if (pattern.type === 'Identifier') {
+		for (const value of values) record(pattern.name, scopeNode, value);
+		if (values.length === 0) record(pattern.name, scopeNode, null);
+	} else if (pattern.type === 'AssignmentPattern') {
+		recordPatternInitializers(pattern.left, scopeNode, [...values, pattern.right], record);
+	} else if (pattern.type === 'RestElement') {
+		recordPatternInitializers(pattern.argument, scopeNode, values, record);
+	} else if (pattern.type === 'ArrayPattern') {
+		for (const element of pattern.elements ?? []) {
+			recordPatternInitializers(element, scopeNode, values, record);
+		}
+	} else if (pattern.type === 'ObjectPattern') {
+		for (const property of pattern.properties ?? []) {
+			recordPatternInitializers(property.argument ?? property.value, scopeNode, values, record);
+		}
+	}
+}
+
+function bindingInitializers(ast, lexical) {
+	const initializers = new WeakMap();
+	const seen = new WeakSet();
+	const record = (name, node, value) => {
+		const scope = captureBindingScope(lexical, node, name);
+		let bindings = initializers.get(scope);
+		if (bindings === undefined) initializers.set(scope, (bindings = new Map()));
+		let values = bindings.get(name);
+		if (values === undefined) bindings.set(name, (values = []));
+		values.push(value);
+	};
+	const visit = (node) => {
+		if (!node || typeof node !== 'object' || seen.has(node)) return;
+		seen.add(node);
+		if (Array.isArray(node)) {
+			for (const child of node) visit(child);
+			return;
+		}
+		if (node.type === 'VariableDeclarator') {
+			recordPatternInitializers(node.id, node, [node.init ?? null], record);
+		} else if (
+			(node.type === 'FunctionDeclaration' || node.type === 'ClassDeclaration') &&
+			node.id?.type === 'Identifier'
+		) {
+			// A declaration is its own initializer: the parent creates that identity.
+			record(node.id.name, node, node);
+		}
+		if (isFunction(node)) {
+			// Parameter defaults run in the owner when the caller omits the value.
+			for (const param of node.params ?? [])
+				recordPatternInitializers(param, node.body, [], record);
+		}
+		for (const [key, child] of Object.entries(node)) {
+			if (!SKIP_KEYS.has(key)) visit(child);
+		}
+	};
+	visit(ast);
+	return initializers;
+}
+
+function assignedBindingsOutsideBoundary(ast, boundary, lexical) {
+	const assigned = new WeakMap();
+	const inside = new WeakSet();
+	collectSubtreeNodes(boundary.node.children, inside);
+	const seen = new WeakSet();
+	const visit = (node) => {
+		if (!node || typeof node !== 'object' || seen.has(node) || inside.has(node)) return;
+		seen.add(node);
+		if (Array.isArray(node)) {
+			for (const child of node) visit(child);
+			return;
+		}
+		if (node.type === 'AssignmentExpression' || node.type === 'UpdateExpression') {
+			const names = new Set();
+			collectBindingNames(node.type === 'AssignmentExpression' ? node.left : node.argument, names);
+			for (const name of names) {
+				const scope = captureBindingScope(lexical, node, name);
+				let bindings = assigned.get(scope);
+				if (bindings === undefined) assigned.set(scope, (bindings = new Set()));
+				bindings.add(name);
+			}
+		}
+		for (const [key, child] of Object.entries(node)) {
+			if (!SKIP_KEYS.has(key)) visit(child);
+		}
+	};
+	visit(ast);
+	return assigned;
+}
+
+function unsupportedIndependentInitializer(node, lexical, initializers, assigned, memo) {
+	if (Array.isArray(node)) {
+		return node.some((value) =>
+			unsupportedIndependentInitializer(value, lexical, initializers, assigned, memo),
+		);
+	}
+	const value = unwrapExpression(node);
+	if (value == null) return false;
+	const cached = memo.get(value);
+	if (cached !== undefined) return cached;
+	// A cyclic alias cannot establish a standalone data initializer. The memo
+	// also avoids repeatedly walking shared alias chains within this widget.
+	memo.set(value, true);
+	const visit = (node, parent = null, key = null) => {
+		if (!node || typeof node !== 'object') return false;
+		if (
+			isFunction(node) ||
+			node.type === 'ClassExpression' ||
+			node.type === 'ClassDeclaration' ||
+			node.type === 'NewExpression' ||
+			node.type === 'CallExpression' ||
+			node.type === 'OptionalCallExpression'
+		) {
+			// Calls can create request, DOM, class, store, or closure identity.
+			// Wrapping that result in an alias or object does not erase its owner.
+			return true;
+		}
+		if (node.type === 'Identifier' && isIdentifierReference(node, parent, key, lexical)) {
+			const scope = captureBindingScope(lexical, node, node.name);
+			if (
+				assigned.get(scope)?.has(node.name) ||
+				unsupportedIndependentInitializer(
+					initializers.get(scope)?.get(node.name),
+					lexical,
+					initializers,
+					assigned,
+					memo,
+				)
+			) {
+				return true;
+			}
+		}
+		let unsupported = false;
+		forEachRuntimeAstChild(node, (child, childKey) => {
+			if (!unsupported) unsupported = visit(child, node, childKey);
+		});
+		return unsupported;
+	};
+	const unsupported = visit(value);
+	memo.set(value, unsupported);
+	return unsupported;
+}
+
+function signalSitesInBoundary(boundary) {
+	const sites = new Set();
+	const seen = new WeakSet();
+	const visit = (node) => {
+		if (!node || typeof node !== 'object' || seen.has(node)) return;
+		seen.add(node);
+		if (Array.isArray(node)) {
+			for (const child of node) visit(child);
+			return;
+		}
+		if (node.type === 'CallExpression' || node.type === 'OptionalCallExpression') {
+			const callee = node.callee;
+			const name =
+				callee?.type === 'Identifier'
+					? callee.name
+					: callee?.type === 'MemberExpression' || callee?.type === 'OptionalMemberExpression'
+						? nameOf(callee.property)
+						: null;
+			const site = node.arguments?.[0];
+			if (
+				/^_?\$?__(?:signal|derived|query)At$/.test(name ?? '') &&
+				site?.type === 'Literal' &&
+				typeof site.value === 'string'
+			) {
+				sites.add(site.value);
+			}
+		}
+		for (const [key, child] of Object.entries(node)) {
+			if (!SKIP_KEYS.has(key)) visit(child);
+		}
+	};
+	visit(boundary.node.children);
+	return [...sites].sort();
+}
+
+function independentWidgetMetadata(analysis, filename, moduleMovePlan) {
+	if (!analysis.boundaries.some((boundary) => boundary.independent)) return [];
+	const lexical = createLexicalAnalysis(analysis.ast);
+	const initializers = bindingInitializers(analysis.ast, lexical);
+	const widgets = [];
+	for (const boundary of analysis.boundaries) {
+		if (!boundary.independent) continue;
+		if (hasPermanentStaticAncestor(boundary)) {
+			throw extractionError(
+				'OCTANE_HYDRATE_INDEPENDENT_STATIC_PARENT',
+				filename,
+				boundary.node,
+				'an independent boundary cannot be nested below a permanently static Hydrate owner',
+			);
+		}
+		assertDirectChildren(boundary, filename);
+		validateBoundary(boundary, filename, analysis.imports.hookNames);
+		const moduleBindings = moduleMovePlan.bindingsByPath.get(boundary.path) ?? new Set();
+		const captures = collectCaptures(
+			boundary.node.children,
+			analysis.imports.importBindings,
+			boundary.shadowedImports,
+			moduleBindings.size === 0 ? null : moduleBindings,
+		);
+		const assigned = assignedBindingsOutsideBoundary(analysis.ast, boundary, lexical);
+		// Each widget excludes its own writes, so alias admission is boundary-specific.
+		const initializerMemo = new WeakMap();
+		for (const capture of captures) {
+			const scope = captureBindingScope(lexical, boundary.node, capture);
+			const initializer = initializers.get(scope)?.get(capture);
+			if (
+				assigned.get(scope)?.has(capture) ||
+				unsupportedIndependentInitializer(
+					initializer,
+					lexical,
+					initializers,
+					assigned,
+					initializerMemo,
+				)
+			) {
+				throw extractionError(
+					'OCTANE_HYDRATE_INDEPENDENT_OWNER_CAPTURE',
+					filename,
+					boundary.node,
+					`independent activation cannot preserve parent-owned runtime capture \`${capture}\`. Pass serializable data, move the lifecycle into the widget, or use ordinary parent-first Hydrate`,
+				);
+			}
+		}
+		const boundaryId = `w:${strongHash(`octane:independent-boundary:1\0${filename}\0${boundary.path}`)}`;
+		widgets.push({
+			version: 1,
+			boundaryId,
+			moduleId: filename,
+			exportName: 'default',
+			request: `${sameSourceRequest(filename)}?${HYDRATE_QUERY_PARAM}=${encodeURIComponent(boundary.path)}`,
+			captureSchema: captures.map((name) => ({ name, type: 'json' })),
+			hookSeed: Number.parseInt(strongHash(`${boundaryId}\0hook`), 16),
+			idSeed: Number.parseInt(strongHash(`${boundaryId}\0id`), 16),
+			signalSites: signalSitesInBoundary(boundary),
+			styles: [],
+			parentDependencies: false,
+		});
+	}
+	return widgets;
+}
+
+function declarationBindingSet(node) {
+	const bindings = new Set();
+	if (node?.type === 'VariableDeclaration') {
+		for (const declaration of node.declarations ?? []) {
+			collectBindingNames(declaration.id, bindings);
+		}
+	} else if (
+		(node?.type === 'FunctionDeclaration' || node?.type === 'ClassDeclaration') &&
+		node.id
+	) {
+		collectBindingNames(node.id, bindings);
+	}
+	return bindings;
+}
+
+// `collectCaptures` deliberately ignores erased TypeScript syntax, but these
+// nodes either emit JavaScript or contain runtime initializers. The permanent-
+// static declaration pruner must not prove exclusivity with an analysis that
+// cannot see those references. Keep the direct subtree erasure/import pruning,
+// but leave module declarations intact whenever one of these forms is present.
+const PRIVATE_DECLARATION_PRUNING_UNSAFE_TS_NODES = new Set([
+	'TSEnumDeclaration',
+	'TSExportAssignment',
+	'TSImportEqualsDeclaration',
+	'TSModuleDeclaration',
+	'TSParameterProperty',
+]);
+
+function canPrunePrivateModuleDeclarations(ast) {
+	let safe = true;
+	const seen = new WeakSet();
+	const visit = (node) => {
+		if (!safe || !node || typeof node !== 'object') return;
+		if (Array.isArray(node)) {
+			for (const child of node) visit(child);
+			return;
+		}
+		if (seen.has(node)) return;
+		seen.add(node);
+		// Direct eval can observe module/function lexical bindings that do not
+		// appear as identifier nodes in the parsed AST. Treat even a shadowed
+		// syntactic `eval(...)` conservatively rather than deleting a declaration
+		// whose name may be read from the string payload.
+		if (
+			node.type === 'CallExpression' &&
+			node.callee?.type === 'Identifier' &&
+			node.callee.name === 'eval'
+		) {
+			safe = false;
+			return;
+		}
+		if (PRIVATE_DECLARATION_PRUNING_UNSAFE_TS_NODES.has(node.type)) {
+			safe = false;
+			return;
+		}
+		for (const [key, value] of Object.entries(node)) {
+			if (SKIP_KEYS.has(key)) continue;
+			visit(value);
+		}
+	};
+	visit(ast);
+	return safe;
+}
+
+function localExportBindings(ast) {
+	const bindings = new Set();
+	for (const statement of ast.body ?? []) {
+		if (statement.type === 'ExportNamedDeclaration' && statement.source == null) {
+			for (const specifier of statement.specifiers ?? []) {
+				if (specifier.local?.name) bindings.add(specifier.local.name);
+			}
+		} else if (
+			statement.type === 'ExportDefaultDeclaration' &&
+			statement.declaration?.type === 'Identifier'
+		) {
+			bindings.add(statement.declaration.name);
+		}
+	}
+	return bindings;
+}
+
+/** Private module declarations that can disappear with a proven server-only graph. */
+function privateModuleDeclarationGraph(ast, importBindings) {
+	const records = [];
+	const exportedBindings = localExportBindings(ast);
+	for (const node of ast.body ?? []) {
+		if (
+			node.type !== 'VariableDeclaration' &&
+			node.type !== 'FunctionDeclaration' &&
+			node.type !== 'ClassDeclaration'
+		) {
+			continue;
+		}
+		if (node.declare === true || (node.type === 'FunctionDeclaration' && node.body == null)) {
+			continue;
+		}
+		const bindings = declarationBindingSet(node);
+		if (bindings.size === 0) continue;
+		records.push({
+			bindings,
+			dependencies: new Set(),
+			// Removing one declarator must not discard an unrelated initializer in
+			// the same authored statement. Keep multi-declarator declarations whole.
+			removable:
+				![...bindings].some((binding) => exportedBindings.has(binding)) &&
+				(node.type !== 'VariableDeclaration' ||
+					((node.declarations?.length ?? 0) === 1 && bindings.size === 1)),
+			node,
+		});
+	}
+	const byBinding = new Map();
+	for (const record of records) {
+		for (const binding of record.bindings) byBinding.set(binding, record);
+	}
+	for (const record of records) {
+		for (const dependency of collectCaptures([record.node], importBindings)) {
+			if (byBinding.has(dependency)) record.dependencies.add(dependency);
+		}
+	}
+	return { byBinding, records };
+}
+
+function sortedBoundaryRanges(boundaries) {
+	return boundaries
+		.map((boundary) => ({ end: boundary.node.end, start: boundary.node.start }))
+		.sort((left, right) => left.start - right.start || left.end - right.end);
+}
+
+function declarationContainsBoundary(node, boundaryRanges) {
+	let low = 0;
+	let high = boundaryRanges.length;
+	while (low < high) {
+		const middle = (low + high) >>> 1;
+		if (boundaryRanges[middle].start < node.start) low = middle + 1;
+		else high = middle;
+	}
+	for (let index = low; index < boundaryRanges.length; index++) {
+		const boundary = boundaryRanges[index];
+		if (boundary.start > node.end) break;
+		if (boundary.end <= node.end) return true;
+	}
+	return false;
+}
+
+function movableModuleDeclarations(analysis) {
+	const records = [];
+	let boundaryRanges = null;
+	const moduleBindings = topLevelBindingNames(analysis.ast);
+	const exportedBindings = localExportBindings(analysis.ast);
+	for (const node of analysis.ast.body ?? []) {
+		if (
+			node.type !== 'VariableDeclaration' &&
+			node.type !== 'FunctionDeclaration' &&
+			node.type !== 'ClassDeclaration'
+		) {
+			continue;
+		}
+		if (node.declare === true || (node.type === 'FunctionDeclaration' && node.body == null)) {
+			continue;
+		}
+		// A declaration containing its own Hydrate site needs another extraction
+		// pass after it moves. Keep that uncommon declaration in the parent until
+		// recursive declaration slicing has an explicit protocol of its own.
+		boundaryRanges ??= sortedBoundaryRanges(analysis.boundaries);
+		if (declarationContainsBoundary(node, boundaryRanges)) {
+			continue;
+		}
+		const bindings = declarationBindingSet(node);
+		if (bindings.size === 0) continue;
+		if ([...bindings].some((binding) => exportedBindings.has(binding))) continue;
+		records.push({
+			bindings,
+			dependencies: new Set(),
+			order: records.length,
+			retainedDependencies: new Set(),
+			node,
+		});
+	}
+	const byBinding = new Map();
+	for (const record of records) {
+		for (const binding of record.bindings) byBinding.set(binding, record);
+	}
+	for (const record of records) {
+		for (const dependency of collectCaptures([record.node], analysis.imports.importBindings)) {
+			if (byBinding.has(dependency)) {
+				record.dependencies.add(dependency);
+			} else if (moduleBindings.has(dependency)) {
+				record.retainedDependencies.add(dependency);
+			}
+		}
+	}
+	return { byBinding, records };
+}
+
+function sameSourceRequest(filename) {
+	const normalized = filename.replace(/\\/g, '/');
+	const name = normalized.slice(normalized.lastIndexOf('/') + 1);
+	return './' + name;
+}
+
+function extractionFrontier(boundaries) {
+	const output = [];
+	const visit = (boundary) => {
+		if (boundary.permanentStatic) {
+			output.push(boundary);
+		} else if (boundary.disabled) {
+			for (const child of boundary.children) visit(child);
+		} else {
+			output.push(boundary);
+		}
+	};
+	for (const boundary of boundaries) visit(boundary);
+	return output;
+}
+
+function hasPermanentStaticAncestor(boundary) {
+	for (let parent = boundary.parent; parent !== null; parent = parent.parent) {
+		if (parent.permanentStatic) return true;
+	}
+	return false;
+}
+
+function uniqueGeneratedName(source, preferred) {
+	let name = preferred;
+	while (source.includes(name)) name += '$';
+	return name;
+}
+
+function permanentStaticStyleNodes(boundary) {
+	const styles = [];
+	const seen = new WeakSet();
+	const visit = (node) => {
+		if (!node || typeof node !== 'object' || seen.has(node)) return;
+		seen.add(node);
+		if (Array.isArray(node)) {
+			for (const child of node) visit(child);
+			return;
+		}
+		if (
+			node.type === 'FunctionDeclaration' ||
+			node.type === 'FunctionExpression' ||
+			node.type === 'ArrowFunctionExpression'
+		) {
+			return;
+		}
+		if (node.type === 'JSXStyleElement') {
+			styles.push(node);
+			return;
+		}
+		for (const [key, value] of Object.entries(node)) {
+			if (!SKIP_KEYS.has(key)) visit(value);
+		}
+	};
+	visit(boundary.node.children);
+	return styles.sort((left, right) => left.start - right.start);
+}
+
+function hydrateBoundaryElement(
+	boundary,
+	request,
+	importBindings,
+	additionalModuleBindings = new Set(),
+	referencesOnly = false,
+) {
+	const node = boundary.node;
+	const opening = node.openingElement;
+	if (boundary.permanentStatic) {
+		const children = permanentStaticStyleNodes(boundary);
+		return {
+			...node,
+			children,
+			openingElement: {
+				...opening,
+				name: permanentStaticName(opening.name, opening.name),
+				attributes: [
+					...(opening.attributes ?? []),
+					jsxExpressionAttribute('children', b.literal(null, 'null'), opening),
+				],
+			},
+			closingElement:
+				node.closingElement === null
+					? null
+					: {
+							...node.closingElement,
+							name: permanentStaticName(node.closingElement.name, node.closingElement.name),
+						},
+		};
+	}
+	if (boundary.disabled) return node;
+	assertDirectChildren(boundary, boundary.filename);
+	validateBoundary(boundary, boundary.filename, boundary.hookNames);
+	const captures = collectCaptures(
+		node.children,
+		importBindings,
+		boundary.shadowedImports,
+		additionalModuleBindings.size === 0 ? null : additionalModuleBindings,
+	);
+	const attributes = [...(opening.attributes ?? [])];
+	if (boundary.independent) {
+		attributes.push(
+			jsxExpressionAttribute(
+				'__independent',
+				// Move planning precedes manifest validation, but still needs every capture
+				// reference to distinguish eager declarations from widget-owned code.
+				referencesOnly
+					? inheritGeneratedOrigin(b.array(captures.map((name) => b.id(name))), opening)
+					: independentManifestExpression(boundary.independentManifest, captures, opening),
+				opening,
+			),
+		);
+		attributes.push(
+			jsxExpressionAttribute(
+				'__independentLoad',
+				hydrateLoaderExpression(boundary, request),
+				opening,
+			),
+		);
+	} else {
+		attributes.push(
+			jsxExpressionAttribute('__load', hydrateLoaderExpression(boundary, request), opening),
+		);
+	}
+	if (captures.length > 0) {
+		if (!boundary.independent) {
+			attributes.push(
+				jsxExpressionAttribute(
+					'__data',
+					inheritGeneratedOrigin(b.array(captures.map((name) => b.id(name))), opening),
+					opening,
+				),
+			);
+		}
+	}
+	attributes.push(jsxExpressionAttribute('children', b.literal(null, 'null'), opening));
+	return {
+		...node,
+		children: [],
+		openingElement: { ...opening, attributes },
+	};
+}
+
+function transformHydrateAst(
+	ast,
+	analysis,
+	request,
+	bindingsByPath = new Map(),
+	removedRecords = [],
+	referencesOnly = false,
+) {
+	const replacements = new WeakMap();
+	for (const boundary of extractionFrontier(analysis.roots)) {
+		replacements.set(
+			boundary.node,
+			hydrateBoundaryElement(
+				boundary,
+				request,
+				analysis.imports.importBindings,
+				bindingsByPath.get(boundary.path),
+				referencesOnly,
+			),
+		);
+	}
+	const removed = new WeakSet(removedRecords.map((record) => record.node));
+	return mapAstCow(ast, (node) => {
+		if (removed.has(node)) return null;
+		return replacements.has(node) ? replacements.get(node) : undefined;
+	});
+}
+
+function pruneUnusedImportsAst(ast, preserveBareImports) {
+	const declarations = (ast.body ?? []).filter((node) => node.type === 'ImportDeclaration');
+	if (declarations.length === 0) return ast;
+	const referenced = new Set(
+		collectCaptures(
+			(ast.body ?? []).filter((node) => node.type !== 'ImportDeclaration'),
+			new Set(),
+		),
+	);
+	const replacements = new WeakMap();
+	let changed = false;
+	for (const declaration of declarations) {
+		const specifiers = declaration.specifiers ?? [];
+		if (specifiers.length === 0) {
+			if (!preserveBareImports) {
+				replacements.set(declaration, null);
+				changed = true;
+			}
+			continue;
+		}
+		const kept = specifiers.filter((specifier) => referenced.has(specifier.local?.name));
+		if (kept.length === specifiers.length) continue;
+		replacements.set(declaration, kept.length === 0 ? null : { ...declaration, specifiers: kept });
+		changed = true;
+	}
+	if (!changed) return ast;
+	return mapAstCow(ast, (node) => (replacements.has(node) ? replacements.get(node) : undefined));
+}
+
+function extractedModuleAst(
+	source,
+	analysis,
+	boundary,
+	request,
+	moduleBindingsByPath = new Map(),
+	moduleDeclarationsByPath = new Map(),
+	captureBindings = new Map(),
+) {
+	if (boundary.disabled) {
+		throw extractionError(
+			'OCTANE_HYDRATE_DISABLED_QUERY',
+			boundary.filename,
+			boundary.node,
+			`boundary ${JSON.stringify(boundary.path)} has literal \`split={false}\` and has no split module`,
+		);
+	}
+	assertDirectChildren(boundary, boundary.filename);
+	validateBoundary(boundary, boundary.filename, analysis.imports.hookNames);
+	const moduleBindings = moduleBindingsByPath.get(boundary.path) ?? new Set();
+	const captures = collectCaptures(
+		boundary.node.children,
+		analysis.imports.importBindings,
+		boundary.shadowedImports,
+		moduleBindings.size === 0 ? null : moduleBindings,
+	);
+	const pathName = boundary.path.replace(/[^A-Za-z0-9_$]/g, '_');
+	const componentName = uniqueGeneratedName(source, `__OctaneHydrateBoundary_${pathName}`);
+	const captureName = uniqueGeneratedName(source, `__octaneHydrateCaptures_${pathName}`);
+	const activatorName = uniqueGeneratedName(source, '__octaneCreateIndependentHydrateActivator');
+	const nestedAnalysis = {
+		...analysis,
+		roots: boundary.children,
+	};
+	const fragmentChildren = transformHydrateAst(
+		{
+			type: 'Program',
+			sourceType: 'module',
+			body: boundary.node.children,
+			metadata: { path: [] },
+		},
+		nestedAnalysis,
+		request,
+		moduleBindingsByPath,
+		[],
+		true,
+	).body;
+	const setup =
+		captures.length === 0
+			? []
+			: [
+					inheritGeneratedOrigin(
+						b.const(b.array_pattern(captures.map((name) => b.id(name))), b.id(captureName)),
+						boundary.node,
+					),
+				];
+	if (setup.length > 0) {
+		const pattern = setup[0].declarations[0].id;
+		for (let index = 0; index < captures.length; index++)
+			captureBindings.set(captures[index], pattern.elements[index]);
+	}
+	const codeBlock = inheritGeneratedOrigin(
+		{
+			type: 'JSXCodeBlock',
+			body: setup,
+			render: b.jsx_fragment(fragmentChildren),
+			metadata: { path: [] },
+		},
+		boundary.node,
+	);
+	const generatedComponent = inheritGeneratedOrigin(
+		b.function_declaration(b.id(componentName), [b.id(captureName)], codeBlock),
+		boundary.node,
+	);
+	const generatedNodes = boundary.independent
+		? [
+				generatedComponent,
+				inheritGeneratedOrigin(
+					b.export_default(b.call(b.id(activatorName), b.id(componentName))),
+					boundary.node,
+				),
+			]
+		: [inheritGeneratedOrigin(b.export_default(generatedComponent), boundary.node)];
+	const activatorImport = boundary.independent
+		? [
+				inheritGeneratedOrigin(
+					b.import_declaration(
+						[b.import_specifier('createIndependentHydrateActivator', activatorName)],
+						'octane/internal/client',
+					),
+					boundary.node,
+				),
+			]
+		: [];
+	const program = {
+		...analysis.ast,
+		body: [
+			...analysis.imports.declarations,
+			...activatorImport,
+			...(moduleDeclarationsByPath.get(boundary.path) ?? []).map((record) => record.node),
+			...generatedNodes,
+		],
+	};
+	return pruneUnusedImportsAst(program, false);
+}
+
+function moduleReferencesForBoundary(analysis, boundary, request, moduleBindingsByPath) {
+	assertDirectChildren(boundary, boundary.filename);
+	validateBoundary(boundary, boundary.filename, analysis.imports.hookNames);
+	const collectModuleReferences = (nodes) =>
+		collectCaptures(nodes, analysis.imports.importBindings).filter(
+			(name) => !boundary.shadowedImports.has(name),
+		);
+	if (boundary.children.length === 0) {
+		return collectModuleReferences(boundary.node.children);
+	}
+	const nestedAnalysis = {
+		...analysis,
+		roots: boundary.children,
+	};
+	const fragment = transformHydrateAst(
+		{
+			type: 'Program',
+			sourceType: 'module',
+			body: boundary.node.children,
+			metadata: { path: [] },
+		},
+		nestedAnalysis,
+		request,
+		moduleBindingsByPath,
+		[],
+		true,
+	);
+	return collectModuleReferences(fragment.body);
+}
+
+function createModuleMovePlanAst(analysis, request) {
+	const candidates = movableModuleDeclarations(analysis);
+	if (candidates.records.length === 0) {
+		return {
+			bindingsByPath: new Map(),
+			declarationsByPath: new Map(),
+			movedRecords: [],
+		};
+	}
+	const allBindings = new Set(candidates.byBinding.keys());
+	const allBindingsByPath = new Map();
+	for (const boundary of analysis.boundaries) {
+		if (!boundary.disabled && !hasPermanentStaticAncestor(boundary)) {
+			allBindingsByPath.set(boundary.path, allBindings);
+		}
+	}
+	const provisionalRoot = transformHydrateAst(
+		analysis.ast,
+		analysis,
+		request,
+		allBindingsByPath,
+		candidates.records,
+		true,
+	);
+	const eagerReferences = new Set(
+		collectCaptures(
+			(provisionalRoot.body ?? []).filter((node) => node.type !== 'ImportDeclaration'),
+			analysis.imports.importBindings,
+		),
+	);
+	const eagerRecords = new Set();
+	const dependents = new Map();
+	for (const record of candidates.records) {
+		for (const dependency of record.dependencies) {
+			const dependencyRecord = candidates.byBinding.get(dependency);
+			if (dependencyRecord === undefined || dependencyRecord === record) continue;
+			let records = dependents.get(dependencyRecord);
+			if (records === undefined) dependents.set(dependencyRecord, (records = new Set()));
+			records.add(record);
+		}
+	}
+	const markEager = (seeds) => {
+		const queue = [];
+		const enqueue = (record) => {
+			if (record === undefined || eagerRecords.has(record)) return;
+			eagerRecords.add(record);
+			queue.push(record);
+		};
+		for (const record of seeds) enqueue(record);
+		for (let index = 0; index < queue.length; index++) {
+			const record = queue[index];
+			for (const dependency of record.dependencies) enqueue(candidates.byBinding.get(dependency));
+			for (const dependent of dependents.get(record) ?? []) enqueue(dependent);
+		}
+	};
+	const eagerSeeds = candidates.records.filter((record) => record.retainedDependencies.size > 0);
+	for (const name of eagerReferences) {
+		const record = candidates.byBinding.get(name);
+		if (record !== undefined) eagerSeeds.push(record);
+	}
+	markEager(eagerSeeds);
+
+	const referencesByPath = new Map();
+	for (const boundary of analysis.boundaries) {
+		if (boundary.disabled || hasPermanentStaticAncestor(boundary)) continue;
+		referencesByPath.set(
+			boundary.path,
+			moduleReferencesForBoundary(analysis, boundary, request, allBindingsByPath),
+		);
+	}
+	const recordsForReferences = (childReferences) => {
+		const records = new Set();
+		const queue = [];
+		for (const name of childReferences) {
+			const record = candidates.byBinding.get(name);
+			if (record !== undefined && !eagerRecords.has(record) && !records.has(record)) {
+				records.add(record);
+				queue.push(record);
+			}
+		}
+		for (let index = 0; index < queue.length; index++) {
+			for (const dependency of queue[index].dependencies) {
+				const record = candidates.byBinding.get(dependency);
+				if (record !== undefined && !eagerRecords.has(record) && !records.has(record)) {
+					records.add(record);
+					queue.push(record);
+				}
+			}
+		}
+		return records;
+	};
+	const preliminaryCounts = new Map();
+	const preliminaryRecordsByPath = new Map();
+	for (const [path, references] of referencesByPath) {
+		const records = recordsForReferences(references);
+		preliminaryRecordsByPath.set(path, records);
+		for (const record of records) {
+			preliminaryCounts.set(record, (preliminaryCounts.get(record) ?? 0) + 1);
+		}
+	}
+	markEager([...preliminaryCounts].filter(([, count]) => count > 1).map(([record]) => record));
+
+	const bindingsByPath = new Map();
+	const declarationsByPath = new Map();
+	const movedRecords = new Set();
+	for (const boundary of analysis.boundaries) {
+		if (boundary.disabled || hasPermanentStaticAncestor(boundary)) continue;
+		const records = preliminaryRecordsByPath.get(boundary.path);
+		if (records === undefined) continue;
+		const ordered = [...records]
+			.filter((record) => !eagerRecords.has(record))
+			.sort((left, right) => left.order - right.order);
+		if (ordered.length === 0) continue;
+		bindingsByPath.set(boundary.path, new Set(ordered.flatMap((record) => [...record.bindings])));
+		declarationsByPath.set(boundary.path, ordered);
+		for (const record of ordered) movedRecords.add(record);
+	}
+	return {
+		bindingsByPath,
+		declarationsByPath,
+		movedRecords: candidates.records.filter((record) => movedRecords.has(record)),
+	};
+}
+
+function createPermanentStaticRemovalPlanAst(analysis, request, moduleMovePlan) {
+	const staticBoundaries = analysis.boundaries.filter(
+		(boundary) => boundary.permanentStatic && !hasPermanentStaticAncestor(boundary),
+	);
+	if (staticBoundaries.length === 0 || !canPrunePrivateModuleDeclarations(analysis.ast)) {
+		return [];
+	}
+	const authored = privateModuleDeclarationGraph(analysis.ast, analysis.imports.importBindings);
+	if (authored.records.length === 0) return [];
+	const staticRecords = new Set();
+	const staticQueue = [];
+	const enqueueStatic = (record) => {
+		if (record === undefined || staticRecords.has(record)) return;
+		staticRecords.add(record);
+		staticQueue.push(record);
+	};
+	for (const boundary of staticBoundaries) {
+		for (const reference of collectCaptures(
+			boundary.node.children,
+			analysis.imports.importBindings,
+			boundary.shadowedImports,
+		)) {
+			enqueueStatic(authored.byBinding.get(reference));
+		}
+	}
+	for (let index = 0; index < staticQueue.length; index++) {
+		for (const dependency of staticQueue[index].dependencies) {
+			enqueueStatic(authored.byBinding.get(dependency));
+		}
+	}
+	if (staticRecords.size === 0) return [];
+
+	const preparedAst = transformHydrateAst(
+		analysis.ast,
+		analysis,
+		request,
+		moduleMovePlan.bindingsByPath,
+		moduleMovePlan.movedRecords,
+	);
+	const preparedImports = collectImports(preparedAst);
+	const client = privateModuleDeclarationGraph(preparedAst, preparedImports.importBindings);
+	const removableClientNodes = new WeakSet(
+		client.records.filter((record) => record.removable).map((record) => record.node),
+	);
+	const eagerAst = mapAstCow(preparedAst, (node) =>
+		removableClientNodes.has(node) ? null : undefined,
+	);
+	const eagerReferences = collectCaptures(
+		(eagerAst.body ?? []).filter((node) => node.type !== 'ImportDeclaration'),
+		preparedImports.importBindings,
+	);
+	const protectedRecords = new Set();
+	const protectedQueue = [];
+	const enqueueProtected = (record) => {
+		if (record === undefined || protectedRecords.has(record)) return;
+		protectedRecords.add(record);
+		protectedQueue.push(record);
+	};
+	for (const record of authored.records) {
+		if (!staticRecords.has(record) || !record.removable) enqueueProtected(record);
+	}
+	for (const reference of eagerReferences) enqueueProtected(authored.byBinding.get(reference));
+	const movedBindings = new Set(
+		moduleMovePlan.movedRecords.flatMap((record) => [...record.bindings]),
+	);
+	for (const binding of movedBindings) enqueueProtected(authored.byBinding.get(binding));
+	for (let index = 0; index < protectedQueue.length; index++) {
+		const authoredRecord = protectedQueue[index];
+		let clientRecord;
+		for (const binding of authoredRecord.bindings) {
+			clientRecord = client.byBinding.get(binding);
+			if (clientRecord !== undefined) break;
+		}
+		if (clientRecord === undefined) continue;
+		for (const dependency of clientRecord.dependencies) {
+			enqueueProtected(authored.byBinding.get(dependency));
+		}
+	}
+	return authored.records.filter(
+		(record) =>
+			record.removable &&
+			staticRecords.has(record) &&
+			!protectedRecords.has(record) &&
+			![...record.bindings].some((binding) => movedBindings.has(binding)),
+	);
+}
+
+/** Read the stable Hydrate boundary path from a bundler resource ID. */
+export function hydrateBoundaryPathFromId(id) {
+	const queryIndex = id.indexOf('?');
+	if (queryIndex === -1) return null;
+	const hashIndex = id.indexOf('#', queryIndex);
+	const query = id.slice(queryIndex + 1, hashIndex === -1 ? id.length : hashIndex);
+	const values = new URLSearchParams(query).getAll(HYDRATE_QUERY_PARAM);
+	if (values.length === 0) return null;
+	if (values.length !== 1 || !/^\d+(?:\.\d+)*$/.test(values[0])) {
+		const error = new Error(
+			`Octane Hydrate compiler: invalid ${HYDRATE_QUERY_PARAM} resource query in ${JSON.stringify(id)}.`,
+		);
+		error.code = 'OCTANE_HYDRATE_INVALID_QUERY';
+		throw error;
+	}
+	return values[0];
+}
+
+/**
+ * Prepare either the authored client module or one independently requested
+ * split child. Server modules deliberately bypass this pass and retain their
+ * real children.
+ */
+export function prepareHydrateBoundaries(source, filename, boundaryPath = null, parsedAst = null) {
+	if (!source.includes('Hydrate') || !source.includes('octane')) {
+		if (boundaryPath === null) return null;
+		throw extractionError(
+			'OCTANE_HYDRATE_QUERY_NOT_FOUND',
+			filename,
+			null,
+			`boundary ${JSON.stringify(boundaryPath)} does not exist`,
+		);
+	}
+	const analysis = analyzeHydrateBoundaries(source, filename, parsedAst);
+	if (analysis.boundaries.length === 0) {
+		if (boundaryPath === null) return null;
+		throw extractionError(
+			'OCTANE_HYDRATE_QUERY_NOT_FOUND',
+			filename,
+			null,
+			`boundary ${JSON.stringify(boundaryPath)} does not exist`,
+		);
+	}
+	for (const boundary of analysis.boundaries) {
+		boundary.filename = filename;
+		boundary.hookNames = analysis.imports.hookNames;
+		boundary.ast = analysis.ast;
+	}
+	const request = sameSourceRequest(filename);
+	const moduleMovePlan = createModuleMovePlanAst(analysis, request);
+	const contexts = originalSplitContextProofs(analysis, moduleMovePlan);
+	const captureBindings = new Map();
+	const independentWidgets = independentWidgetMetadata(analysis, filename, moduleMovePlan);
+	let independentIndex = 0;
+	for (const boundary of analysis.boundaries) {
+		if (boundary.independent) {
+			boundary.independentManifest = independentWidgets[independentIndex++];
+		}
+	}
+	const permanentStaticRemoved =
+		boundaryPath === null
+			? createPermanentStaticRemovalPlanAst(analysis, request, moduleMovePlan)
+			: [];
+	let ast;
+	let queriedBoundary;
+	if (boundaryPath === null) {
+		ast = transformHydrateAst(analysis.ast, analysis, request, moduleMovePlan.bindingsByPath, [
+			...moduleMovePlan.movedRecords,
+			...permanentStaticRemoved,
+		]);
+		ast = pruneUnusedImportsAst(ast, true);
+	} else {
+		const boundary = analysis.boundaries.find((candidate) => candidate.path === boundaryPath);
+		if (boundary === undefined) {
+			throw extractionError(
+				'OCTANE_HYDRATE_QUERY_NOT_FOUND',
+				filename,
+				null,
+				`boundary ${JSON.stringify(boundaryPath)} does not exist`,
+			);
+		}
+		queriedBoundary = boundary;
+		ast = extractedModuleAst(
+			source,
+			analysis,
+			boundary,
+			request,
+			moduleMovePlan.bindingsByPath,
+			moduleMovePlan.declarationsByPath,
+			captureBindings,
+		);
+	}
+	if (captureBindings.size > 0) {
+		const moduleFunctions = new Map();
+		for (const statement of analysis.ast.body) {
+			const declaration =
+				statement.type === 'ExportNamedDeclaration' || statement.type === 'ExportDefaultDeclaration'
+					? statement.declaration
+					: statement;
+			if (declaration?.type === 'FunctionDeclaration' && declaration.id?.type === 'Identifier')
+				moduleFunctions.set(declaration.id.name, declaration.id);
+		}
+		const candidates = [...captureBindings].filter(([name]) => moduleFunctions.has(name));
+		if (candidates.length > 0) {
+			const lexical = createLexicalAnalysis(analysis.ast);
+			const bindings = new Map(
+				candidates
+					.filter(
+						([name]) =>
+							lexical.resolveBinding(lexical.nodeScopes.get(queriedBoundary.node), name)?.scope ===
+							lexical.rootScope,
+					)
+					.map(([name, binding]) => [name, { binding, moduleBinding: moduleFunctions.get(name) }]),
+			);
+			if (bindings.size > 0)
+				splitModuleCaptures.set(ast, { moduleBody: analysis.ast.body, bindings });
+		}
+	}
+	const templateTags = new Set(
+		analysis.boundaries
+			.filter(isCompiledSplitHydrateBoundary)
+			.map((boundary) => boundary.node.openingElement.name),
+	);
+	if (templateTags.size > 0) compiledSplitHydrateTags.set(ast, templateTags);
+	certifySplitContexts(ast, contexts, captureBindings);
+	return {
+		ast,
+		boundaryPath,
+		independentWidgets,
+	};
+}
+
+function collectSingleUseConstObjects(ast) {
+	const candidatesByName = new Map();
+	const candidateIds = new WeakSet();
+	const ownerByNode = new WeakMap();
+	const referencesByName = new Map();
+	const seen = new WeakSet();
+	const functions = new Set([
+		'ArrowFunctionExpression',
+		'FunctionDeclaration',
+		'FunctionExpression',
+	]);
+	const collect = (node, owner = null, exported = false) => {
+		if (!node || typeof node !== 'object') return;
+		if (Array.isArray(node)) {
+			for (const child of node) collect(child, owner, exported);
+			return;
+		}
+		if (seen.has(node)) return;
+		seen.add(node);
+		ownerByNode.set(node, owner);
+		if (TRANSPARENT_TS_EXPRESSIONS.has(node.type)) {
+			collect(node.expression, owner, exported);
+			return;
+		}
+		if (node.type?.startsWith('TS')) return;
+		if (node.type === 'ExportNamedDeclaration' || node.type === 'ExportDefaultDeclaration') {
+			collect(node.declaration, owner, true);
+			collect(node.specifiers, owner, true);
+			collect(node.source, owner, true);
+			return;
+		}
+		const childOwner = functions.has(node.type) ? node : owner;
+		if (node.type === 'VariableDeclaration' && node.kind === 'const' && !exported) {
+			for (const declaration of node.declarations ?? []) {
+				const object = unwrapExpression(declaration.init);
+				if (declaration.id?.type !== 'Identifier' || object?.type !== 'ObjectExpression') {
+					continue;
+				}
+				const candidate = {
+					id: declaration.id,
+					name: declaration.id.name,
+					object,
+					owner,
+				};
+				candidateIds.add(declaration.id);
+				let values = candidatesByName.get(candidate.name);
+				if (values === undefined) candidatesByName.set(candidate.name, (values = []));
+				values.push(candidate);
+			}
+		}
+		for (const [key, value] of Object.entries(node)) {
+			if (SKIP_KEYS.has(key)) continue;
+			collect(value, childOwner, false);
+		}
+	};
+	collect(ast);
+
+	const counted = new WeakSet();
+	const count = (node) => {
+		if (!node || typeof node !== 'object') return;
+		if (Array.isArray(node)) {
+			for (const child of node) count(child);
+			return;
+		}
+		if (counted.has(node)) return;
+		counted.add(node);
+		if (TRANSPARENT_TS_EXPRESSIONS.has(node.type)) {
+			count(node.expression);
+			return;
+		}
+		if (node.type?.startsWith('TS')) return;
+		if (node.type === 'Identifier' && !candidateIds.has(node)) {
+			let references = referencesByName.get(node.name);
+			if (references === undefined) referencesByName.set(node.name, (references = []));
+			references.push(node);
+		}
+		for (const [key, value] of Object.entries(node)) {
+			if (SKIP_KEYS.has(key)) continue;
+			count(value);
+		}
+	};
+	count(ast);
+	return { candidatesByName, ownerByNode, referencesByName };
+}
+
+/**
+ * A Hydrate fallback is only observable for a client-only/later mount. Initial
+ * SSR always renders the real children, so a directly authored fallback must
+ * not retain its component graph or execute its expression in the server
+ * bundle. Inline object spreads and unshared const object spreads can drop the
+ * same property safely; shared and dynamic spreads remain untouched because
+ * their other observations are not compiler-owned.
+ */
+export function prepareServerHydrateBoundaries(source, filename, parsedAst = null) {
+	if (!source.includes('Hydrate') || !source.includes('octane')) return null;
+	const analysis = analyzeHydrateBoundaries(source, filename, parsedAst);
+	if (analysis.boundaries.length === 0) return null;
+	for (const boundary of analysis.boundaries) {
+		boundary.filename = filename;
+		boundary.hookNames = analysis.imports.hookNames;
+		boundary.ast = analysis.ast;
+	}
+	const request = sameSourceRequest(filename);
+	const moduleMovePlan = createModuleMovePlanAst(analysis, request);
+	const independentWidgets = independentWidgetMetadata(analysis, filename, moduleMovePlan);
+	let independentIndex = 0;
+	for (const boundary of analysis.boundaries) {
+		if (!boundary.independent) continue;
+		boundary.independentManifest = independentWidgets[independentIndex++];
+		const moduleBindings = moduleMovePlan.bindingsByPath.get(boundary.path) ?? new Set();
+		boundary.independentCaptures = collectCaptures(
+			boundary.node.children,
+			analysis.imports.importBindings,
+			boundary.shadowedImports,
+			moduleBindings.size === 0 ? null : moduleBindings,
+		);
+	}
+	const constObjects = collectSingleUseConstObjects(analysis.ast);
+	const elementUpdates = new Map();
+	const objectUpdates = new Map();
+	const updateElement = (node) => {
+		let update = elementUpdates.get(node);
+		if (update === undefined) {
+			update = { permanentStatic: false, independent: null, removedAttributes: new Set() };
+			elementUpdates.set(node, update);
+		}
+		return update;
+	};
+	const updateObject = (object) => {
+		let removed = objectUpdates.get(object);
+		if (removed === undefined) objectUpdates.set(object, (removed = new Set()));
+		for (const property of object.properties ?? []) {
+			if (property.type !== 'SpreadElement' && nameOf(property.key) === 'fallback') {
+				removed.add(property);
+			}
+		}
+	};
+	for (const boundary of analysis.boundaries) {
+		if (boundary.independent) {
+			updateElement(boundary.node).independent = {
+				manifest: boundary.independentManifest,
+				captures: boundary.independentCaptures,
+			};
+		}
+		if (boundary.permanentStatic) {
+			updateElement(boundary.node).permanentStatic = true;
+		}
+		for (const attribute of boundary.node.openingElement?.attributes ?? []) {
+			if (jsxAttributeName(attribute) === 'fallback') {
+				updateElement(boundary.node).removedAttributes.add(attribute);
+				continue;
+			}
+			if (attribute.type !== 'JSXSpreadAttribute' && attribute.type !== 'SpreadAttribute') {
+				continue;
+			}
+			const argument = unwrapExpression(attribute.argument);
+			if (argument?.type === 'ObjectExpression') {
+				updateObject(argument);
+				continue;
+			}
+			if (argument?.type !== 'Identifier') continue;
+			const candidates = constObjects.candidatesByName.get(argument.name);
+			const references = constObjects.referencesByName.get(argument.name);
+			if (candidates?.length !== 1 || references?.length !== 1 || references[0] !== argument) {
+				continue;
+			}
+			const candidate = candidates[0];
+			const owner = constObjects.ownerByNode.get(argument) ?? null;
+			if (candidate.owner !== null && candidate.owner !== owner) continue;
+			updateObject(candidate.object);
+		}
+	}
+	if (elementUpdates.size === 0 && objectUpdates.size === 0) return null;
+	const ast = mapAstCowPost(analysis.ast, (original, node) => {
+		const elementUpdate = elementUpdates.get(original);
+		if (elementUpdate !== undefined) {
+			const opening = node.openingElement;
+			const attributes = (opening.attributes ?? []).filter(
+				(attribute) => !elementUpdate.removedAttributes.has(attribute),
+			);
+			if (elementUpdate.independent !== null) {
+				attributes.push(
+					jsxExpressionAttribute(
+						'__independent',
+						independentManifestExpression(
+							elementUpdate.independent.manifest,
+							elementUpdate.independent.captures,
+							opening,
+						),
+						opening,
+					),
+				);
+				// Extraction always compiles an independent widget as a template body.
+				// Keep its server children on that same path even in return-JSX parents,
+				// whose descriptor children would add a range the widget cannot adopt.
+				attributes.push(
+					jsxExpressionAttribute(
+						'children',
+						b.arrow([b.id(uniqueGeneratedName(source, '__octaneIndependentProps'))], {
+							type: 'JSXCodeBlock',
+							body: [],
+							render: b.jsx_fragment(node.children ?? []),
+							metadata: { path: [] },
+						}),
+						node,
+					),
+				);
+			}
+			return {
+				...node,
+				children: elementUpdate.independent !== null ? [] : node.children,
+				openingElement: {
+					...opening,
+					attributes,
+					name: elementUpdate.permanentStatic
+						? permanentStaticName(opening.name, opening.name)
+						: opening.name,
+				},
+				closingElement:
+					!elementUpdate.permanentStatic || node.closingElement === null
+						? node.closingElement
+						: {
+								...node.closingElement,
+								name: permanentStaticName(node.closingElement.name, node.closingElement.name),
+							},
+			};
+		}
+		const removedProperties = objectUpdates.get(original);
+		if (removedProperties !== undefined) {
+			return {
+				...node,
+				properties: (node.properties ?? []).filter((property) => !removedProperties.has(property)),
+			};
+		}
+		return undefined;
+	});
+	return {
+		ast,
+		boundaryPath: null,
+		independentWidgets,
+	};
+}
