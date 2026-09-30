@@ -745,6 +745,11 @@ function formatServerError(code, ...args) {
           "octane SSR: %s root streaming passes completed without producing a shell \u2014 a component kept throwing thenables outside use(). A resource reader should stop suspending once its data has settled.",
           args
         );
+      case 336:
+        return formatDevErrorMessage(
+          "`<textarea>` children must be text: strings, numbers, or arrays of them. One child was %s. A textarea's content is its default value, so it cannot contain elements; render them outside the textarea or pass a string.",
+          args
+        );
       default:
         return formatUnknownDevErrorMessage(code);
     }

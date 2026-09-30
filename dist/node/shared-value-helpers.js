@@ -31,10 +31,30 @@ function childrenIterator(children) {
   const iterator = typeof Symbol === "function" && children[Symbol.iterator] || children["@@iterator"];
   return typeof iterator === "function" ? iterator : null;
 }
+function textareaChildText(value, reject) {
+  if (value == null || typeof value === "boolean") return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "bigint") return "" + value;
+  let items;
+  if (Array.isArray(value)) items = value;
+  else {
+    const iterator = childrenIterator(value);
+    if (iterator === null) return reject(value);
+    items = { [Symbol.iterator]: () => iterator.call(value) };
+  }
+  let text = "";
+  for (const item of items) text += textareaChildText(item, reject);
+  return text;
+}
+function describeTextareaChild(value, isElement) {
+  return isElement(value) ? "an element" : typeof value === "object" ? "an object" : "a " + typeof value;
+}
 export {
   applyElementDefaultProps,
   childElementKey,
   childrenIterator,
+  describeTextareaChild,
   escapeMappedElementKey,
-  resolveLazyDefaultProps
+  resolveLazyDefaultProps,
+  textareaChildText
 };

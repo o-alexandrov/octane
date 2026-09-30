@@ -301,6 +301,7 @@ type ClientErrorArguments = {
     329: [];
     330: [];
     331: [];
+    336: [unknown];
 };
 export declare function formatClientError<Code extends keyof ClientErrorArguments>(code: Code, ...args: ClientErrorArguments[Code]): string;
 export {};

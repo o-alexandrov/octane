@@ -289,6 +289,7 @@ __export(runtime_exports, {
   textHole: () => textHole,
   textHoleUpdate: () => textHoleUpdate,
   textSlot: () => textSlot,
+  textareaText: () => textareaText,
   tryBlock: () => tryBlock,
   updateFreshClassAttr: () => updateFreshClassAttr,
   updateFreshClassName: () => updateFreshClassName,
@@ -7089,7 +7090,7 @@ function renderReturnedValue(block, out, reset) {
       }
     } else {
       const returnHydration = activeHydration();
-      if (returnHydration !== null && block.slots[0] === void 0 && block.startMarker !== null && block.endMarker !== null && block.startMarker !== block.endMarker && block.startMarker.nodeType === 8 && block.endMarker.nodeType === 8 && (getNextSibling(block.startMarker) === block.endMarker || returnHydration.isUnframedRootRange(block.startMarker, block.endMarker))) {
+      if (returnHydration !== null && block.slots[0] === void 0 && block.startMarker !== null && block.endMarker !== null && block.startMarker !== block.endMarker && block.startMarker.nodeType === 8 && block.endMarker.nodeType === 8 && (getNextSibling(block.startMarker) === block.endMarker || returnHydration.isUnframedRootRange(block.startMarker, block.endMarker) || isComponentDescriptor && returnHydration.holdsServerText(block))) {
         const borrowed = {
           __kind: "childSlot",
           start: block.startMarker,
@@ -11392,12 +11393,38 @@ function resolveLazyTemplate(lazy2) {
   return parsed;
 }
 let currentHydration = null;
+let HYDRATION_BUILT_CONTENT = null;
 function activeHydration() {
   const hydration = currentHydration;
   return hydration !== null && hydration.isActive() ? hydration : null;
 }
 function isRendererHydrationStyle(node) {
   return node.nodeType === 1 && node.localName === "style" && (STAGED_DOM?.view(node) ?? node).hasAttribute("data-octane");
+}
+function isFloatHeadResource(node) {
+  if (node.nodeType !== 1) return false;
+  const el = STAGED_DOM?.view(node) ?? node;
+  const tag = el.localName;
+  return (tag === "link" || tag === "style" || tag === "script") && (el.hasAttribute("data-precedence") || el.hasAttribute("data-oct-hint") || el.hasAttribute("data-oct-res"));
+}
+function skipFoldedHeadPrefix(container, node) {
+  const head = container.nodeType === 9 ? null : container.ownerDocument.head;
+  while (node !== null) {
+    if (node.nodeType === 10 || isRendererHydrationStyle(node) || isFloatHeadResource(node)) {
+      node = getNextSibling(node);
+      continue;
+    }
+    const el = head !== null && node.nodeType === 8 ? getNextSibling(node) : null;
+    const end = el === null ? null : getNextSibling(el);
+    if (end === null || end.nodeType !== 8) return node;
+    const key = (STAGED_DOM?.view(node) ?? node).data;
+    if (!key.startsWith("rnh-") || (STAGED_DOM?.view(end) ?? end).data !== "/" + key)
+      return node;
+    const next = getNextSibling(end);
+    (STAGED_DOM?.view(head) ?? head).append(node, el, end);
+    node = next;
+  }
+  return null;
 }
 class HydrationCapability {
   constructor(rootBlock, node, seeds) {
@@ -11511,6 +11538,38 @@ class HydrationCapability {
     removeRange(first, end);
     return false;
   }
+  /**
+   * Before a child slot's first hydrating render of a list, a fragment, a keyed
+   * element, or a portal, or of an element outside a range of its own. None of
+   * them serializes as bare text: a list frames each primitive item in a range
+   * of its own, and a portal leaves only a `<!---->` placeholder. Text at the
+   * cursor where the value begins, heading the slot's `adopted` range or alone
+   * before `end` in `parent`, is what the server rendered for a primitive, which
+   * the value cannot adopt. Report it as a structural mismatch and remove the
+   * server content up to `end`, so the caller builds the value as a client mount
+   * would. Returns whether it did. A lone element's range is claimHostRange's.
+   */
+  discardServerText(scope, slotKey, parent, end, value, list, adopted) {
+    const text = this.node;
+    if (text === null || text.nodeType !== 3 || !(list || value?.$$kind === import_runtime_tags.PORTAL_TAG || !adopted && isHostDescriptor(value)) || !adopted && (domNode(text).parentNode !== parent || getNextSibling(text) !== end))
+      return false;
+    if (PRESENTATION_HYDRATION?.revision !== void 0) presentationMiss();
+    if (!this.staleServerValues) {
+      noteRecoverableHydrationError(() => new Error((0, import_error_codes_client_generated.formatClientError)(51)));
+      if (__octaneDev) {
+        const loc = siteLoc(scope, slotKey) || componentSourceLoc(scope.block.body);
+        if (loc)
+          warnHydrationStructuralMismatch(
+            loc,
+            list ? "a renderable list range" : value.$$kind === import_runtime_tags.PORTAL_TAG ? "a portal" : `<${value.type}>`,
+            describeHydrationNode(text)
+          );
+      }
+    }
+    removeRange(text, end);
+    this.node = end;
+    return true;
+  }
   recordTextMismatch(node, loc, server) {
     if (this.staleServerValues) return;
     if (!__octaneDev && ROOT_ERROR_HANDLERS === null) return;
@@ -11530,6 +11589,35 @@ class HydrationCapability {
   }
   removeRange(start, end) {
     removeHydrationRange(start, end);
+  }
+  /**
+   * Runs before the first hydrating render of a text or empty value `str` in a
+   * child slot that adopted the server's `<!--[-->…<!--]-->` range. The value
+   * serializes as at most one text node there, which the slot adopts when it
+   * leads the range. Anything else in the range is server content the client
+   * cannot adopt, such as an element or component the server rendered for a
+   * value the client renders as text or nothing. Discard it and report the
+   * recovery, as claimHostRange does for a host descriptor.
+   */
+  discardUnadoptedText(scope, slotKey, state, str) {
+    const end = state.end;
+    const first = getNextSibling(state.start);
+    const kept = str !== "" && first.nodeType === 3;
+    const stale = kept ? getNextSibling(first) : first;
+    if (stale === end) return;
+    if (PRESENTATION_HYDRATION?.revision !== void 0) presentationMiss();
+    if (!this.staleServerValues) {
+      noteRecoverableHydrationError(() => new Error((0, import_error_codes_client_generated.formatClientError)(51)));
+      if (__octaneDev) {
+        const loc = siteLoc(scope, slotKey);
+        if (loc) {
+          const client = str === "" ? "nothing" : `text ${JSON.stringify(str)}`;
+          this.warnStructural(loc, kept ? `the end of ${client}` : client, this.describe(stale));
+        }
+      }
+    }
+    removeRange(stale, end);
+    if (!kept) this.node = end;
   }
   parseSeeds(raw) {
     return parseSeedJson(raw);
@@ -11625,6 +11713,14 @@ class HydrationCapability {
   }
   isUnframedRootRange(start, end) {
     return this.unframedRootRanges.get(start) === end;
+  }
+  /**
+   * Whether `block`'s server range holds only unclaimed text at the cursor:
+   * what the server rendered for a primitive.
+   */
+  holdsServerText(block) {
+    const text = this.node;
+    return text !== null && text.nodeType === 3 && getNextSibling(block.startMarker) === text && getNextSibling(text) === block.endMarker;
   }
   /** Record the first node outside a root-owned range exactly once. */
   claimRootRemainder(node) {
@@ -11814,6 +11910,18 @@ class HydrationCapability {
     this.node = null;
     this.rootRemainder = null;
   }
+  /**
+   * Whether the server framed `el`'s only child in a `<!--[-->…<!--]-->` range
+   * holding something other than one text node or nothing. htext unwraps a
+   * text-only frame; any other framed content belongs to a child slot.
+   */
+  framesSlotContent(el) {
+    const first = getFirstChild(el);
+    if (!this.isOpen(first)) return false;
+    let next = getNextSibling(first);
+    if (next !== null && next.nodeType === 3) next = getNextSibling(next);
+    return !this.isClose(next);
+  }
   htext(el, text, loc) {
     const first = getFirstChild(el);
     if (first !== null && first.nodeType === 3) {
@@ -11848,6 +11956,82 @@ class HydrationCapability {
     const created = (STAGED_DOM?.view(document) ?? document).createTextNode(text);
     (STAGED_DOM?.view(el) ?? el).appendChild(created);
     return created;
+  }
+  /**
+   * childTextHole's first hydrating render of an element, a component, or a
+   * list. The server frames such a value in a `<!--[-->…<!--]-->` range, which
+   * the hole's child slot adopts from the cursor. Anything else in the host is
+   * the text, or nothing, that the server rendered for a primitive value, which
+   * none of these values can adopt: discard it, report the recovery, and build
+   * the value as a client mount would. A textarea's text is its default value,
+   * which its value props own, so it stays. `render` is the hole's childSlot
+   * call, passed in so that hydration alone never retains the child-slot graph.
+   */
+  hydrateOnlyChild(scope, slotKey, el, render) {
+    let stale = getFirstChild(el);
+    if (this.isOpen(stale)) {
+      this.node = stale;
+      render();
+      return;
+    }
+    if (PRESENTATION_HYDRATION?.revision !== void 0) presentationMiss();
+    if (stale !== null && HYDRATION_BUILT_CONTENT?.has(stale) !== true) {
+      if (el.localName === "textarea") stale = getNextSibling(stale);
+      else if (!this.staleServerValues) {
+        noteRecoverableHydrationError(() => new Error((0, import_error_codes_client_generated.formatClientError)(51)), this.rootBlock);
+        if (__octaneDev)
+          warnHydrationStructuralMismatch(
+            siteLoc(scope, slotKey) || el.__oct_loc,
+            "a renderable range",
+            describeHydrationNode(stale)
+          );
+      }
+    }
+    while (stale !== null) {
+      const next = getNextSibling(stale);
+      (STAGED_DOM?.view(el) ?? el).removeChild(stale);
+      stale = next;
+    }
+    const last = (STAGED_DOM?.view(el) ?? el).lastChild;
+    try {
+      this.suspend(render);
+    } finally {
+      const first = last === null ? getFirstChild(el) : getNextSibling(last);
+      if (first !== null) (HYDRATION_BUILT_CONTENT ??= /* @__PURE__ */ new WeakSet()).add(first);
+    }
+  }
+  /**
+   * htext's counterpart for an only-child hole whose first hydrating value
+   * renders nothing (`null`, `undefined`, a boolean, or `''`). The server
+   * serializes that as no children, or as an empty `<!--[--><!--]-->` frame,
+   * which unwraps like htext's text-only frame. Anything else is server content
+   * the client renders no node for, so a later value would land beside it.
+   * Discard it and report the recovery as htext reports extra children.
+   * A textarea's text is its default value, which its value props own.
+   */
+  hempty(el, loc) {
+    const first = getFirstChild(el);
+    if (first === null || el.localName === "textarea") return;
+    const next = getNextSibling(first);
+    const framed = this.isOpen(first);
+    if (framed && this.isClose(next) && getNextSibling(next) === null) {
+      (STAGED_DOM?.view(first) ?? first).remove();
+      (STAGED_DOM?.view(next) ?? next).remove();
+      return;
+    }
+    if (PRESENTATION_HYDRATION?.revision !== void 0) presentationMiss();
+    if (!this.staleServerValues) {
+      noteRecoverableHydrationError(() => new Error((0, import_error_codes_client_generated.formatClientError)(62)), this.rootBlock);
+      if (__octaneDev) {
+        warnHydrationStructuralMismatch(
+          loc || el.__oct_loc,
+          "nothing",
+          describeHydrationNode(framed && next !== null ? next : first)
+        );
+      }
+    }
+    for (let n = getFirstChild(el); n !== null; n = getFirstChild(el))
+      (STAGED_DOM?.view(el) ?? el).removeChild(n);
   }
   htextSwap(posNode, text) {
     if (isEmptyTextSlot(posNode)) {
@@ -12216,6 +12400,43 @@ function htextSwap(posNode, value) {
   const parent = (STAGED_DOM?.view(posNode) ?? posNode).parentNode;
   (STAGED_DOM?.view(parent) ?? parent).replaceChild(t, posNode);
   return t;
+}
+function rejectTextareaChild(child2) {
+  throw new Error((0, import_error_codes_client_generated.formatClientError)(336, (0, import_shared_value_helpers.describeTextareaChild)(child2, isElementDescriptor)));
+}
+function textareaPartText(part, textHole2) {
+  return textHole2 ? coerceText(part) : (0, import_shared_value_helpers.textareaChildText)(part, rejectTextareaChild);
+}
+function joinTextareaParts(parts, textHoles, read) {
+  let text = "";
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    text += textareaPartText(
+      isSignalHandle(part) ? read(part) : part,
+      textHoles !== void 0 && textHoles.charCodeAt(i) === 116
+      // 't'
+    );
+  }
+  return text;
+}
+function textareaText(parts, textHoles) {
+  let handles;
+  for (const part of parts) if (isSignalHandle(part)) (handles ??= []).push(part);
+  if (handles === void 0) return joinTextareaParts(parts, textHoles, readSignalBinding);
+  const signals = handles;
+  return {
+    [import_types.SIGNAL_HANDLE]: true,
+    kind: "derived",
+    key: signals.map((handle) => handle.key).join("+"),
+    [import_types.SIGNAL_BINDING_READ]: () => joinTextareaParts(parts, textHoles, readSignalBinding),
+    get: () => joinTextareaParts(parts, textHoles, (handle) => handle.get()),
+    [import_types.SIGNAL_BINDING_SUBSCRIBE](notify, onRetire) {
+      const stops = signals.map((handle) => handle[import_types.SIGNAL_BINDING_SUBSCRIBE](notify, onRetire));
+      return () => {
+        for (const stop of stops) stop();
+      };
+    }
+  };
 }
 function bindingText(posNode, value, marker) {
   const text = coerceText(value);
@@ -14890,7 +15111,8 @@ function setHostPropSources(el, sources, prev, scope, hasNestedChildren = false,
       props.get("defaultValue")?.value,
       props.get("checked")?.value,
       props.get("defaultChecked")?.value,
-      props.get("multiple")?.value
+      props.get("multiple")?.value,
+      hasNestedChildren || props.has("children")
     );
   return resolved;
 }
@@ -16797,7 +17019,8 @@ function armControlledBase(el) {
       compositionEndTask: void 0,
       queued: false,
       formSeen: false,
-      formMultiple: false
+      formMultiple: false,
+      formChildren: false
     };
     (STAGED_DOM?.view(el) ?? el).$$ctrl = ctrl;
     delegateEvents(RESTORE_EVENT_LIST);
@@ -17260,7 +17483,7 @@ function setFormControlSources(el, sources) {
   }
   applyFormControlValues(el, tag, value, defaultValue, checked, defaultChecked, multiple);
 }
-function applyFormControlValues(el, tag, value, defaultValue, checked, defaultChecked, multiple) {
+function applyFormControlValues(el, tag, value, defaultValue, checked, defaultChecked, multiple, hasChildren = false) {
   const ctrl = armControlled(el);
   const first = !ctrl.formSeen;
   const previousMultiple = ctrl.formMultiple;
@@ -17290,10 +17513,12 @@ function applyFormControlValues(el, tag, value, defaultValue, checked, defaultCh
   }
   if (tag === "textarea") {
     const textarea = el;
+    const childrenOwned = ctrl.formChildren;
+    ctrl.formChildren = hasChildren;
     setValue(textarea, value);
     if (value == null) {
       if (defaultValue != null) setDefaultValue(textarea, defaultValue, first);
-      else if (!first && (STAGED_DOM?.view(textarea) ?? textarea).defaultValue !== "")
+      else if (!first && !childrenOwned && (STAGED_DOM?.view(textarea) ?? textarea).defaultValue !== "")
         (STAGED_DOM?.view(textarea) ?? textarea).defaultValue = "";
     }
     return;
@@ -19697,7 +19922,11 @@ function reconcileDeoptNode(prev, value, ownerBlock, ns) {
     }
     setDeoptDesc(el, value);
     if (!hasHostPropContent(value)) {
-      reconcileDeoptChildren(el, value.children, ownerBlock);
+      reconcileDeoptChildren(
+        el,
+        isHtmlTextareaType(value.type, elNs) ? (0, import_shared_value_helpers.textareaChildText)(value.children, rejectTextareaChild) : value.children,
+        ownerBlock
+      );
     }
     return el;
   }
@@ -20061,6 +20290,23 @@ function descNeedsBlocks(value) {
   if (value.$$kind === import_runtime_tags.PORTAL_TAG) return true;
   return false;
 }
+function isHtmlTextareaType(type, elNs) {
+  return elNs === void 0 && (type === "textarea" || type.length === 8 && type.toLowerCase() === "textarea");
+}
+function deoptHostChildren(block, el, d, elNs, adopt = false) {
+  if (!isHtmlTextareaType(d.type, elNs)) {
+    childSlot(block, 0, el, d.children, null, false, el);
+    return;
+  }
+  const text = adopt ? null : getFirstChild(el);
+  childTextHole(
+    block,
+    0,
+    el,
+    (0, import_shared_value_helpers.textareaChildText)(d.children, rejectTextareaChild),
+    text?.nodeType === 3 ? text : null
+  );
+}
 function hostElementBody(d, block) {
   let el = block.deoptNode;
   const hydration = activeHydration();
@@ -20073,7 +20319,7 @@ function hostElementBody(d, block) {
     const savedCursor = getNextSibling(hydration.node);
     if (!hasHostPropContent(d)) {
       hydration.node = getFirstChild(el);
-      childSlot(block, 0, el, d.children, null, false, el);
+      deoptHostChildren(block, el, d, elNs, true);
     }
     hydration.node = savedCursor;
     return;
@@ -20101,7 +20347,7 @@ function hostElementBody(d, block) {
     applyDeoptProps(el, d.props, block);
     setDeoptDesc(el, d);
     if (!hasHostPropContent(d)) {
-      hydration.suspend(() => childSlot(block, 0, el, d.children, null, false, el));
+      hydration.suspend(() => deoptHostChildren(block, el, d, elNs));
     }
     return;
   }
@@ -20141,7 +20387,7 @@ function hostElementBody(d, block) {
     patchDeoptProps(el, getDeoptDesc(el)?.props ?? null, d.props, block);
   }
   setDeoptDesc(el, d);
-  if (!hasHostPropContent(d)) childSlot(block, 0, el, d.children, null, false, el);
+  if (!hasHostPropContent(d)) deoptHostChildren(block, el, d, elNs);
 }
 function hostStringTagBody(d, block) {
   const tag = d.type;
@@ -20987,7 +21233,9 @@ function childSlot(parentScope, slotKey, domParent, value, anchor, ownEnd, ownsH
     }
   }
   let adoptedRange = false;
+  let rebuild = false;
   if (state === void 0) {
+    const framedList = preparedList !== null && compiledMapBody === void 0 && mappedFallback !== true;
     const transaction = ROOT_RENDER_TRANSACTION;
     if (transaction !== null && !transaction.aborted && !ROOT_RENDER_ROLLBACK && parentScope.mounted && !isCreatedInRootRender(transaction, parentBlock)) {
       journalBag();
@@ -21035,11 +21283,31 @@ function childSlot(parentScope, slotKey, domParent, value, anchor, ownEnd, ownsH
       end = null;
     } else {
       start = null;
+      if (hydration !== null && ownsHost === void 0)
+        rebuild = hydration.discardServerText(
+          parentScope,
+          slotKey,
+          domParent,
+          anchor ?? null,
+          value,
+          framedList,
+          false
+        );
       end = (STAGED_DOM?.view(document) ?? document).createComment("");
       (STAGED_DOM?.view(domParent) ?? domParent).insertBefore(end, anchor ?? null);
       if (hydration !== null && parentBlock === hydration.rootBlock)
         hydration.protectRootAnchor(end);
     }
+    if (adoptedRange)
+      rebuild = hydration.discardServerText(
+        parentScope,
+        slotKey,
+        domParent,
+        end,
+        value,
+        framedList,
+        true
+      );
     state = {
       __kind: "childSlot",
       start,
@@ -21114,6 +21382,21 @@ function childSlot(parentScope, slotKey, domParent, value, anchor, ownEnd, ownsH
     return;
   }
   if (preparedList !== null) {
+    if (rebuild) {
+      const slot = state;
+      hydration.suspend(
+        () => renderPreparedChildList(
+          slot,
+          parentBlock,
+          domParent,
+          preparedList,
+          null,
+          upgradeArmed,
+          upgradeChildren
+        )
+      );
+      return;
+    }
     renderPreparedChildList(
       state,
       parentBlock,
@@ -21454,7 +21737,7 @@ function childSlot(parentScope, slotKey, domParent, value, anchor, ownEnd, ownsH
       b.memoInChain = true;
     }
     state.block = b;
-    if (adoptedRange && comp === hostElementBody && !hydration.claimHostRange(
+    if (rebuild || adoptedRange && comp === hostElementBody && !hydration.claimHostRange(
       parentScope,
       slotKey,
       state.start,
@@ -21473,6 +21756,7 @@ function childSlot(parentScope, slotKey, domParent, value, anchor, ownEnd, ownsH
   if (value !== null && typeof value === "object") throw invalidChildError(value);
   if (state.block !== null || state.hostNode !== null) clearChildContent(state);
   const str = coerceChildText(value);
+  if (adoptedRange) hydration.discardUnadoptedText(parentScope, slotKey, state, str);
   if (str === "") {
     if (state.text !== null) {
       if (ROOT_RENDER_TRANSACTION !== null) clearChildContent(state);
@@ -21558,17 +21842,22 @@ function childTextHole(parentScope, slotKey, domParent, value, cachedNode) {
     throw new Error((0, import_error_codes_client_generated.formatClientError)(26, domParent.localName));
   }
   if (dangerouslySetInnerHTMLOwnsChild(domParent, value)) return null;
-  const vt = typeof value;
+  let vt = typeof value;
   const state = parentScope.slots[slotKey];
+  if (state === void 0 && (vt === "object" || vt === "function") && domParent.nodeType === 1 && domParent.localName === "textarea" && domParent.namespaceURI === HTML_NS && !isSignalHandle(value)) {
+    value = (0, import_shared_value_helpers.textareaChildText)(value, rejectTextareaChild);
+    vt = "string";
+  }
   if (ROOT_RENDER_TRANSACTION !== null && state === void 0 && parentScope.mounted) {
     journalBag();
     journalRootRange(domParent, null, null);
     journalRootProperty(parentScope.slots, slotKey, parentScope.slots[slotKey]);
   }
-  if (state === void 0 && vt !== "object" && vt !== "function") {
+  if (state === void 0 && (value === null || vt !== "object" && vt !== "function")) {
     const str = value == null || value === false || value === true ? "" : vt === "string" ? value : String(value);
     if (str === "") {
       if (cachedNode !== null) (STAGED_DOM?.view(cachedNode) ?? cachedNode).remove();
+      else activeHydration()?.hempty(domParent, siteLoc(parentScope, slotKey));
       return null;
     }
     if (cachedNode !== null) {
@@ -21576,16 +21865,25 @@ function childTextHole(parentScope, slotKey, domParent, value, cachedNode) {
       return cachedNode;
     }
     const hydration2 = activeHydration();
-    if (hydration2 !== null) return hydration2.htext(domParent, str, siteLoc(parentScope, slotKey));
-    const tn = (STAGED_DOM?.view(document) ?? document).createTextNode(str);
-    (STAGED_DOM?.view(domParent) ?? domParent).appendChild(tn);
-    return tn;
+    if (hydration2 === null) {
+      const tn = (STAGED_DOM?.view(document) ?? document).createTextNode(str);
+      (STAGED_DOM?.view(domParent) ?? domParent).appendChild(tn);
+      return tn;
+    }
+    if (!hydration2.framesSlotContent(domParent))
+      return hydration2.htext(domParent, str, siteLoc(parentScope, slotKey));
   }
   if (state === void 0 && cachedNode !== null)
     (STAGED_DOM?.view(cachedNode) ?? cachedNode).remove();
   const hydration = activeHydration();
-  if (hydration !== null && state === void 0) hydration.node = getFirstChild(domParent);
-  childSlot(parentScope, slotKey, domParent, value, null, false, domParent);
+  if (hydration !== null && state === void 0)
+    hydration.hydrateOnlyChild(
+      parentScope,
+      slotKey,
+      domParent,
+      () => childSlot(parentScope, slotKey, domParent, value, null, false, domParent)
+    );
+  else childSlot(parentScope, slotKey, domParent, value, null, false, domParent);
   const s = parentScope.slots[slotKey];
   return s.block === null && s.forSlot === null && s.hostNode === null ? s.text : null;
 }
@@ -28267,9 +28565,7 @@ function hydrateRootWithOutputHandler(container, bodyOrElement, propsOrOptions, 
     createdInRootRender(rootBlock);
     journalRootProperty(idState, "next", idState.next);
     idState.next = rootOptions?.identifierSeed ?? 0;
-    let firstNode = getFirstChild(container);
-    while (firstNode !== null && (firstNode.nodeType === 10 || isRendererHydrationStyle(firstNode)))
-      firstNode = getNextSibling(firstNode);
+    const firstNode = skipFoldedHeadPrefix(container, getFirstChild(container));
     const hydration = new HydrationCapability(rootBlock, firstNode, seeds);
     if (bindingLeases?.length) {
       const attempted = rootBlock;
@@ -29080,6 +29376,7 @@ function scriptResource(attrs) {
   textHole,
   textHoleUpdate,
   textSlot,
+  textareaText,
   tryBlock,
   updateFreshClassAttr,
   updateFreshClassName,

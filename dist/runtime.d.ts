@@ -1364,9 +1364,31 @@ declare class HydrationCapability {
      * renderBranchSlot's rebuild does. Returns whether the range was adoptable.
      */
     claimHostRange(scope: Scope, slotKey: number, start: Node, end: Node, type: string): boolean;
+    /**
+     * Before a child slot's first hydrating render of a list, a fragment, a keyed
+     * element, or a portal, or of an element outside a range of its own. None of
+     * them serializes as bare text: a list frames each primitive item in a range
+     * of its own, and a portal leaves only a `<!---->` placeholder. Text at the
+     * cursor where the value begins, heading the slot's `adopted` range or alone
+     * before `end` in `parent`, is what the server rendered for a primitive, which
+     * the value cannot adopt. Report it as a structural mismatch and remove the
+     * server content up to `end`, so the caller builds the value as a client mount
+     * would. Returns whether it did. A lone element's range is claimHostRange's.
+     */
+    discardServerText(scope: Scope, slotKey: number, parent: Node, end: Node | null, value: unknown, list: boolean, adopted: boolean): boolean;
     recordTextMismatch(node: Text, loc: string | undefined, server: string | null): void;
     flushTextWarnings(): void;
     removeRange(start: Node, end: Node): void;
+    /**
+     * Runs before the first hydrating render of a text or empty value `str` in a
+     * child slot that adopted the server's `<!--[-->…<!--]-->` range. The value
+     * serializes as at most one text node there, which the slot adopts when it
+     * leads the range. Anything else in the range is server content the client
+     * cannot adopt, such as an element or component the server rendered for a
+     * value the client renders as text or nothing. Discard it and report the
+     * recovery, as claimHostRange does for a host descriptor.
+     */
+    discardUnadoptedText(scope: Scope, slotKey: number, state: ChildSlot, str: string): void;
     parseSeeds(raw: string): unknown[] | null;
     isRejection(error: unknown): error is HydrationRejectionException;
     rejectionFromSeed(seed: unknown): HydrationRejectionException | null;
@@ -1380,6 +1402,11 @@ declare class HydrationCapability {
     /** Bound an unframed third-party component root so its returned host can adopt it. */
     wrapUnframedRoot(cursor: Node): readonly [Comment, Comment];
     isUnframedRootRange(start: Node, end: Node): boolean;
+    /**
+     * Whether `block`'s server range holds only unclaimed text at the cursor:
+     * what the server rendered for a primitive.
+     */
+    holdsServerText(block: Block): boolean;
     /** Record the first node outside a root-owned range exactly once. */
     claimRootRemainder(node: Node | null): void;
     private freshClone;
@@ -1411,7 +1438,34 @@ declare class HydrationCapability {
     private adopt;
     /** Remove server siblings left after the root's complete client shape was adopted. */
     finishRoot(): void;
+    /**
+     * Whether the server framed `el`'s only child in a `<!--[-->…<!--]-->` range
+     * holding something other than one text node or nothing. htext unwraps a
+     * text-only frame; any other framed content belongs to a child slot.
+     */
+    framesSlotContent(el: Node): boolean;
     htext(el: Node, text: string, loc?: string): Text;
+    /**
+     * childTextHole's first hydrating render of an element, a component, or a
+     * list. The server frames such a value in a `<!--[-->…<!--]-->` range, which
+     * the hole's child slot adopts from the cursor. Anything else in the host is
+     * the text, or nothing, that the server rendered for a primitive value, which
+     * none of these values can adopt: discard it, report the recovery, and build
+     * the value as a client mount would. A textarea's text is its default value,
+     * which its value props own, so it stays. `render` is the hole's childSlot
+     * call, passed in so that hydration alone never retains the child-slot graph.
+     */
+    hydrateOnlyChild(scope: Scope, slotKey: number, el: Node, render: () => void): void;
+    /**
+     * htext's counterpart for an only-child hole whose first hydrating value
+     * renders nothing (`null`, `undefined`, a boolean, or `''`). The server
+     * serializes that as no children, or as an empty `<!--[--><!--]-->` frame,
+     * which unwraps like htext's text-only frame. Anything else is server content
+     * the client renders no node for, so a later value would land beside it.
+     * Discard it and report the recovery as htext reports extra children.
+     * A textarea's text is its default value, which its value props own.
+     */
+    hempty(el: Node, loc?: string): void;
     htextSwap(posNode: Node | null, text: string): Text;
     sibling(node: Node, count: number): Node | null;
     allowAttribute(el: Element, name: string, next: string | null): boolean;
@@ -1470,6 +1524,16 @@ export declare function htext(el: Node, value: unknown, seeded?: 1 | undefined):
  * `htext` (which handles the only-child fast path).
  */
 export declare function htextSwap(posNode: Node | null, value: unknown): Text;
+/**
+ * @internal A <textarea>'s authored children, folded into the one string its
+ * template binds as the host's only Text node. Textarea content is RCDATA, so
+ * the compiler cannot give its holes `<!>` placeholders or let the server frame
+ * them (the parser would keep either as literal text). `textHoles` marks the
+ * `{x as string}` parts with a 't'. With a signal handle among the parts the
+ * result is one derived handle over them, so the ordinary direct text binding
+ * subscribes to every signal and rewrites the whole text when any changes.
+ */
+export declare function textareaText(parts: unknown[], textHoles?: string): unknown;
 /** @internal Text holes in authored binding views retain an addressable range, including when empty. */
 export declare function bindingText(posNode: Node | null, value: unknown, marker: string): Text;
 interface PresentationHydrationFrame {
@@ -2115,6 +2179,53 @@ export declare const Children: {
 export declare function componentSlot(parentScope: Scope, slotKey: number, domParent: Node, comp: ComponentBody | string, props: any, invocationSite?: string, anchor?: Node | null, singleRoot?: boolean | 2, inherit?: boolean, key?: any, hasKey?: boolean): void;
 /** Compiler-proven `@{}` component call site: the body has no value return. */
 export declare function componentSlotVoid(parentScope: Scope, slotKey: number, domParent: Node, comp: ComponentBody | string, props: any, invocationSite?: string, anchor?: Node | null, singleRoot?: boolean | 2, inherit?: boolean, key?: any, hasKey?: boolean): void;
+interface ChildSlot {
+    __kind: 'childSlot';
+    /**
+     * Lower-bound marker. Null on the client text/empty path — a single `Text`
+     * node is tracked directly via `text` and needs no start marker. Lazily
+     * created the first time the slot hosts a (possibly multi-node) component, so
+     * `clearChildContent` can sweep the component's range. Always present after
+     * hydration (adopted from the server's `<!--[-->`).
+     */
+    start: Comment | null;
+    /**
+     * Upper-bound marker / insertion anchor. Null in ANCHORLESS mode: a client
+     * mount whose first value is a LONE PURE-HOST descriptor mints NO markers at
+     * all — the element self-delimits (mirroring componentSlot's singleRoot
+     * regime), so a host descriptor returned at a root / return slot IS
+     * `container.firstChild` (React parity). A later render that flips the
+     * value's mode promotes the slot to the marked regime by minting the pair
+     * on demand around the host node (see childSlot). Non-null in every other
+     * regime (and always after hydration).
+     */
+    end: Comment | null;
+    /**
+     * OWNS-PARENT mode (marker-elision M2): the slot exclusively owns ALL
+     * children of this element (a de-opt host handed its entire content to one
+     * childSlot). No markers are ever minted — inserts append (null anchor) and
+     * clears remove every child of the element. Mutually exclusive with the
+     * marked regime; hydration never enters it (adoption wins at mount).
+     */
+    ownerHost: Element | null;
+    /**
+     * Hydration compaction: this slot's pair is borrowed from its sole-range
+     * parent. Teardown may clear between the comments but must never remove the
+     * comments themselves.
+     */
+    borrowed: boolean;
+    /** Compiler proof that this renderable hole is the body's entire output. */
+    compactable: boolean;
+    block: Block | null;
+    text: Text | null;
+    currentComp: ComponentBody | null;
+    currentIsBodyFn: boolean;
+    forSlot: ForSlot | null;
+    hostNode: Node | null;
+    portal: PortalSlot | null;
+    /** Cold capability path for a signal passed through an otherwise-unmarked prop. */
+    implicitSignal?: unknown;
+}
 export declare function positionalChildren(children: any[]): any[];
 export declare function hostComponent(scope: Scope, slot: number, tag: string, props: Record<string, any> | null, childrenBody?: ComponentBody | OctaneNode, anchor?: Node | null): Element;
 /**

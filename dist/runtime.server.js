@@ -88,8 +88,10 @@ import {
   applyElementDefaultProps,
   childElementKey,
   childrenIterator,
+  describeTextareaChild,
   escapeMappedElementKey,
-  resolveLazyDefaultProps as lazyResolvedProps
+  resolveLazyDefaultProps as lazyResolvedProps,
+  textareaChildText
 } from "./shared-value-helpers.js";
 import {
   devWarnStyleCoercion,
@@ -1376,6 +1378,22 @@ function ssrChildTextPre(v, scope) {
   const content = ssrChildText(v, scope);
   return content.charCodeAt(0) === 10 ? "\n" + content : content;
 }
+function rejectTextareaChild(child) {
+  throw new Error(formatServerError(336, describeTextareaChild(child, isElementDescriptor)));
+}
+function ssrTextareaText(parts, textHoles) {
+  let probing = false;
+  for (const part of parts) if (probingDangerHtmlChild(part)) probing = true;
+  if (probing) return "";
+  let text = "";
+  for (let i = 0; i < parts.length; i++) {
+    let part = parts[i];
+    if (isSignalHandle(part)) part = readSignalBinding(part);
+    text += textHoles !== void 0 && textHoles.charCodeAt(i) === 116 ? part == null || part === false ? "" : String(part) : textareaChildText(part, rejectTextareaChild);
+  }
+  const escaped = escapeHtml(text);
+  return escaped.charCodeAt(0) === 10 ? "\n" + escaped : escaped;
+}
 function ssrChildPre(v, scope) {
   const content = ssrChild(v, scope);
   return content.charCodeAt(0) === 10 ? "\n" + content : content;
@@ -1454,6 +1472,8 @@ function ssrHostElement(tag, props, children, scope, rawInner) {
       inner = semanticTag === "script" ? escapeEntireInlineScriptContent(raw) : semanticTag === "style" ? escapeEntireInlineStyleContent(raw) : raw;
     } else if (rawInner !== void 0) {
       inner = rawInner;
+    } else if (hasChildren && semanticTag === "textarea" && namespace === "html") {
+      inner = escapeHtml(textareaChildText(children, rejectTextareaChild));
     } else if (hasChildren) {
       const rawText = semanticTag === "script" || semanticTag === "style" ? scriptDescriptorText(children) : null;
       if (rawText !== null) {
@@ -2276,9 +2296,10 @@ function finalPresentSource(sources) {
   }
   return [false, void 0];
 }
-function ssrChildrenSources(sources, renderFallback, scope) {
+function ssrChildrenSources(sources, renderFallback, scope, textarea = false) {
   const child = finalPresentSource(sources);
-  return child[0] ? ssrChildText(child[1], scope) : renderFallback();
+  if (!child[0]) return renderFallback();
+  return textarea ? ssrTextareaText([child[1]]) : ssrChildText(child[1], scope);
 }
 function ssrSpreadContent(snapshot, scope) {
   if (snapshot === null) return "";
@@ -8099,6 +8120,7 @@ export {
   ssrText,
   ssrTextPre,
   ssrTextSlot,
+  ssrTextareaText,
   ssrTextareaValue,
   ssrTextareaValueSources,
   ssrTry,

@@ -47,7 +47,6 @@ import {
 	unwrapServerFunctionInitializer,
 } from './server-context.js';
 import { createStyleScopePass } from './style-scopes.js';
-import { decodeHTMLStrict } from 'entities';
 import { print as esrapPrint } from 'esrap';
 import esrapTsx from 'esrap/languages/tsx';
 import { buildFatSegments } from './fat-segments.js';
@@ -1055,6 +1054,90 @@ function rejectTextareaValueChildren(tag, node, ctx) {
 		'`<textarea>` must not have children when it uses `value` or `defaultValue` — ' +
 			`the prop owns the content. Move the text into the prop.${at}`,
 	);
+}
+
+const TEXTAREA_CHILD_KINDS = {
+	Element: 'an element',
+	TSRXExpression: 'a JSX expression',
+	IfStatement: 'an `@if` block',
+	ForOfStatement: 'an `@for` block or a mapped JSX list',
+	SwitchStatement: 'an `@switch` block',
+	TryStatement: 'an `@try` block',
+};
+
+// A `<textarea>`'s content is RCDATA: the HTML parser keeps markup and comments
+// inside it as literal text, so neither the client template nor the server can
+// place a `<!>` placeholder, a `<!-- -->` separator or a `<!--[-->` frame there.
+// Its children are therefore text on both sides: they fold into ONE text value
+// that the client binds as the host's only Text node (runtime `textareaText`)
+// and the server serializes markerless (`ssrTextareaText`). Returns the parts in
+// source order, or null when the ordinary only-child path already emits
+// markerless text on both sides (one static literal or one proven text hole).
+// Throws for a child that cannot be text, on both emit paths.
+function textareaTextParts(tag, ns, children, ctx) {
+	if (tag !== 'textarea' || (ns !== 'html' && ns !== 'opaque') || children.length === 0) {
+		return null;
+	}
+	const parts = [];
+	for (const child of children) {
+		if (child.type !== 'Text') {
+			const element = child.type === 'HeadHoist' ? child.element : child;
+			const kind =
+				element.type === 'JSXElement' || (element.type === 'Element' && !isComponentTag(element))
+					? `\`<${jsxTagName(element) || elementTagName(element)}>\``
+					: (TEXTAREA_CHILD_KINDS[child.type] ?? 'a non-text child');
+			const l = (element.loc ?? child.expression?.loc)?.start;
+			const at = l
+				? ` (${ctx.mapSourceName ? ctx.mapSourceName + ':' : ''}${l.line}:${l.column})`
+				: '';
+			throw new Error(
+				`\`<textarea>\` children must be text, but it contains ${kind}. A textarea's content ` +
+					'is its default value and the HTML parser keeps markup inside it as literal ' +
+					`text: move the markup outside the textarea, or pass a string expression.${at}`,
+			);
+		}
+		// Authored binding views address each hole by its own marker range.
+		if (
+			child._octaneBindingText ||
+			child._octaneBindingOpaque ||
+			child._octaneBindingValue ||
+			child._octaneBindingSlot
+		) {
+			return null;
+		}
+		const literal = staticTextLiteral(child.expression);
+		if (literal === '') continue;
+		const previous = parts.at(-1);
+		if (literal !== null && previous?.kind === 'static') {
+			parts[parts.length - 1] = { ...previous, value: previous.value + literal };
+		} else if (literal !== null) {
+			parts.push({ kind: 'static', value: literal, node: child });
+		} else {
+			const text =
+				isDirectSignalHandleExpression(child.expression) ||
+				isKnownTextChildExpression(child.expression, ctx.knownStringChildLocals);
+			parts.push({ kind: text ? 'text' : 'child', expr: child.expression, node: child });
+		}
+	}
+	// Static text alone is baked into the template and serialized as one merged
+	// run; a sole text hole mounts with htext and serializes unframed.
+	if (parts.every((part) => part.kind === 'static')) return null;
+	if (children.length === 1 && parts[0].kind === 'text') return null;
+	return parts;
+}
+
+// The runtime call's arguments: the parts array, then a 't' at each
+// `{x as string}` part (omitted when there is none).
+function textareaTextArgs(parts, lowerHole) {
+	const values = parts.map((part) =>
+		part.kind === 'static'
+			? b.literal(part.value, JSON.stringify(part.value))
+			: lowerHole(part.expr, part.kind === 'text', part.node),
+	);
+	const textHoles = parts.map((part) => (part.kind === 'text' ? 't' : '-')).join('');
+	return textHoles.includes('t')
+		? [b.array(values), b.literal(textHoles, JSON.stringify(textHoles))]
+		: [b.array(values)];
 }
 
 // React's raw-HTML contract is mutually exclusive with a non-nullish child.
@@ -14063,15 +14146,37 @@ function ssrEmitElement(node, ctx, name, inlinedSubs, parentNs, cssHash, compone
 	// still gets a `<!--[-->…<!--]-->` block). Must match the client's only-child
 	// markerless condition exactly so both sides agree for hydration: a single `Text`
 	// child that is neither a static literal (baked into HTML) nor proven text
-	// (emitted via `ssrText`).
+	// (emitted via `ssrText`). A spread or raw-HTML writer does not change the
+	// client's shape, so it must not change this one: inside RCDATA (<textarea>)
+	// a frame around a primitive would parse as literal text.
 	const onlyChild0 =
 		normChildren.length === 1 && normChildren[0].type === 'Text' ? normChildren[0] : null;
+	const textareaParts = textareaTextParts(tag, selfNs, normChildren, ctx);
 	let childrenExpr;
 	if (authoredStaticScriptContent !== undefined) {
 		const content = escapeInlineScriptContent(authoredStaticScriptContent);
 		childrenExpr = ssrHtmlTemplate(content === '' ? [] : [content], node, ctx);
+	} else if (textareaParts !== null) {
+		// The client binds these as one Text node (see textareaTextParts).
+		ctx.runtimeNeeded.add('ssrTextareaText');
+		childrenExpr = ssrCall(
+			'ssrTextareaText',
+			textareaTextArgs(textareaParts, (expression, text, part) =>
+				ssrSignalValue(
+					resolveStyleExpr(
+						text
+							? rewriteHookCalls(expression, ctx, name)
+							: rewriteJsxValues(rewriteHookCalls(expression, ctx, name), ctx),
+						cssHash,
+					),
+					ctx,
+					part,
+					true,
+				),
+			),
+			node,
+		);
 	} else if (
-		htmlSources.length === 0 &&
 		onlyChild0 !== null &&
 		!onlyChild0._octaneBindingOpaque &&
 		!onlyChild0._octaneBindingValue &&
@@ -14145,7 +14250,15 @@ function ssrEmitElement(node, ctx, name, inlinedSubs, parentNs, cssHash, compone
 		ctx.runtimeNeeded.add('ssrChildrenSources');
 		childrenExpr = ssrCall(
 			'ssrChildrenSources',
-			[b.array(effectiveChildrenPropSources), ssrThunk(childrenExpr, node), b.id('__s')],
+			[
+				b.array(effectiveChildrenPropSources),
+				ssrThunk(childrenExpr, node),
+				b.id('__s'),
+				// A textarea's children prop is text too (see textareaTextParts).
+				...(tag === 'textarea' && (selfNs === 'html' || selfNs === 'opaque')
+					? [b.literal(true, 'true')]
+					: []),
+			],
 			node,
 		);
 	}
@@ -15263,7 +15376,10 @@ function ssrEmitTsrxExpression(node, ctx, name, inlinedSubs, parentNs, cssHash, 
 				b.literal(false),
 				undefinedNode(),
 				undefinedNode(),
-				b.literal(componentInvocationSite(ctx, node)),
+				// Hash the authored JSX, as the client's lowerHostFragment does, not
+				// the synthetic wrapper: every signal instance below this renderer
+				// chains its key from this site.
+				b.literal(componentInvocationSite(ctx, expr)),
 			],
 			node,
 		);
@@ -21175,10 +21291,10 @@ function isStaticReturnedFragmentComponent(node, ctx) {
 // The renderer builds a keyed, `noscript`/document, or parser-repaired host as a
 // descriptor (isDescriptorBuiltHost), and a descriptor child must be a value: a
 // FoldedDirective or template-only component placeholder under it would be
-// dropped. Inside such a host (`inDescriptor`), directives and components lower
-// to value holes here in the owning component, as a `@{}` body and the server
-// lower them. Misreading a template host as a descriptor host costs only the
-// template fast path; the reverse drops children.
+// dropped. Inside such a host (`inDescriptor`), directives, components, and child
+// `@{}` blocks lower to value holes here in the owning component, as a `@{}` body
+// and the server lower them. Misreading a template host as a descriptor host costs
+// only the template fast path; the reverse drops children.
 function extractFragment(node, ctx, holeProps, parentNs = 'html', inDescriptor = false) {
 	const descriptor =
 		inDescriptor ||
@@ -21408,6 +21524,17 @@ function extractFragment(node, ctx, holeProps, parentNs = 'html', inDescriptor =
 			const hn = `h${holeProps.length}`;
 			holeProps.push(objectProp(hn, lowerJsxChild(child, ctx)));
 			newChildren.push(b.jsx_expression_container(memberProps(hn, child)));
+		} else if (descriptor && t === 'JSXCodeBlock') {
+			// lowerJsxChild lowers the block as it does under a `@{}` body's descriptor:
+			// a render-only block transparently, and a setup-bearing one through this
+			// component's fold. The renderer must never fold it, since that would move
+			// the block's setup away from the locals it closes over.
+			const value = lowerJsxChild(child, ctx);
+			if (value !== null) {
+				const hn = `h${holeProps.length}`;
+				holeProps.push(objectProp(hn, value));
+				newChildren.push(b.jsx_expression_container(memberProps(hn, child)));
+			}
 		} else if (t === 'JSXCodeBlock') {
 			const body = child.body || [];
 			if (body.length === 0) {
@@ -21951,20 +22078,31 @@ function rewriteTsrxBlocks(
  * A name the function introduces can shadow an enclosing lifetime-invariant
  * binding with one that changes between renders, so it must not inherit that
  * proof. `compileFunctionBody` recomputes the nested body's own invariants.
+ *
+ * Inside a module-level callback (`untracked`), nothing tracks the names the
+ * enclosing callbacks bind, so no env tuple can carry them. The whole nested
+ * compile, including the templates nested in it, then runs with no component
+ * context, which keeps every arm inline where it closes over those names.
  */
-function withNestedTemplateScope(fn, ctx, compile) {
+function withNestedTemplateScope(fn, ctx, compile, untracked = false) {
 	const prevLocals = ctx.currentComponentLocals;
 	const prevInvariantLocals = ctx.currentInvariantLocals;
 	const prevEventInvariantLocals = ctx.currentEventInvariantLocals;
+	const prevUntracked = ctx._untrackedScope;
 	const introduced = collectComponentLocals(fn);
-	const locals = new Set(prevLocals);
-	for (const name of introduced) locals.add(name);
-	ctx.currentComponentLocals = locals;
+	if (prevLocals == null && (untracked || prevUntracked === true)) {
+		ctx._untrackedScope = true;
+	} else {
+		const locals = new Set(prevLocals);
+		for (const name of introduced) locals.add(name);
+		ctx.currentComponentLocals = locals;
+	}
 	ctx.currentInvariantLocals = withoutShadowedNames(prevInvariantLocals, introduced);
 	ctx.currentEventInvariantLocals = withoutShadowedNames(prevEventInvariantLocals, introduced);
 	try {
 		return compile();
 	} finally {
+		ctx._untrackedScope = prevUntracked;
 		ctx.currentComponentLocals = prevLocals;
 		ctx.currentInvariantLocals = prevInvariantLocals;
 		ctx.currentEventInvariantLocals = prevEventInvariantLocals;
@@ -21994,7 +22132,7 @@ const SETUP_VALUE_DIRECTIVE_TYPES = new Set([
 // `@{ … }` block is also folded as a setup value, but it is a sub-template rather
 // than a set of arms — `rewriteTsrxBlocks` owns its expression-position handling,
 // and the unowned-directive diagnostic's advice does not apply to it — so it is
-// deliberately absent here.
+// deliberately absent here. With no owning body, lowerJsxChild compiles it in place.
 const VALUE_DIRECTIVE_ARM_TYPES = new Set([
 	'JSXIfExpression',
 	'JSXForExpression',
@@ -22352,12 +22490,14 @@ function rewriteJsxValues(node, ctx, eagerMapCallbackRoots = false, eagerMapCall
 			const name = n.id?.name ?? allocCompilerName(ctx, '__template');
 			// A nested body must not replace the enclosing component's warm plan.
 			const previousWarm = ctx._pendingWarm;
+			const compile = () =>
+				ctx.mode === 'server'
+					? ssrCompileBody(n, ctx, name, null, [], 'opaque')
+					: compileFunctionBody(n, ctx, name, 'opaque');
 			try {
-				const compiled = withNestedTemplateScope(n, ctx, () =>
-					ctx.mode === 'server'
-						? ssrCompileBody(n, ctx, name, null, [], 'opaque')
-						: compileFunctionBody(n, ctx, name, 'opaque'),
-				);
+				// A missing fold marks a module-level callback, whose names only this
+				// function's closure can reach.
+				const compiled = withNestedTemplateScope(n, ctx, compile, lower == null);
 				return functionExpressionFromDeclaration({ ...compiled, id: n.id ?? null }, n);
 			} finally {
 				ctx._pendingWarm = previousWarm;
@@ -22433,7 +22573,8 @@ function rewriteJsxValues(node, ctx, eagerMapCallbackRoots = false, eagerMapCall
 				// arms beside values they cannot reach. Drop the fold for this subtree so
 				// re-entries below (an attribute value re-enters rewriteJsxValues, with no
 				// function node left in view) cannot pick it back up, and the directive
-				// reaches the unowned diagnostic instead of folding into the wrong scope.
+				// reaches the unowned diagnostic instead of folding into the wrong scope. A
+				// `@{ … }` child block has no arms, so lowerJsxChild compiles it in place.
 				ctx._valueDirectiveLowering = null;
 			} else {
 				const introduced = collectComponentLocals(n);
@@ -22507,6 +22648,13 @@ function rewriteJsxValues(node, ctx, eagerMapCallbackRoots = false, eagerMapCall
 function lowerInspectableJsxChild(child, ctx) {
 	const fold = ctx._valueDirectiveLowering;
 	if (fold == null) return lowerJsxChild(child, ctx);
+	// A render-only @{} block is transparent grouping: lowerJsxChild unwraps it
+	// to its render root. Letting lowerSetupValueDirectives fold it would produce
+	// a component range on the server while the descriptor path emits the
+	// unwrapped children on the client, breaking hydration.
+	if (child && child.type === 'JSXCodeBlock' && (child.body?.length ?? 0) === 0) {
+		return lowerJsxChild(child, ctx);
+	}
 	const prepared = lowerSetupValueDirectives(child, fold);
 	const t = prepared && prepared.type;
 	if (
@@ -22545,6 +22693,19 @@ function lowerJsxChild(child, ctx) {
 		const fold = ctx._valueDirectiveLowering;
 		if (fold != null) return fold(child);
 		rejectUnownedValueDirective(child);
+	}
+	if (t === 'JSXCodeBlock') {
+		// A render-only block is transparent grouping, as under a template host.
+		if ((child.body?.length ?? 0) === 0) {
+			return child.render ? lowerJsxChild(child.render, ctx) : null;
+		}
+		// A setup-bearing or code-only block is its own render scope. The owning
+		// body's fold compiles it into a renderer that closes over that body, the
+		// value both targets build. With no owning body, as inside a module-level
+		// callback, it compiles in place as the `() => @{ … }` child that
+		// normalizeChildren makes of it, closing over the callback's params.
+		const fold = ctx._valueDirectiveLowering;
+		return fold != null ? fold(child) : rewriteJsxValues(childCodeBlockArrow(child), ctx);
 	}
 	if (t === 'JSXFragment' || t === 'Fragment') {
 		const els = [];
@@ -23894,6 +24055,9 @@ function emitHeadServer(headNodes, ctx) {
 function normalizeAuthoredJsxLiterals(ast) {
 	return mapAst(ast, (node) => {
 		if (node.type === 'JSXText') {
+			// Both parsers give `value` with its character references decoded, as
+			// JSX parsers do, so it is only cleaned up here: JSX's whitespace rule,
+			// applied to the decoded text as Babel applies it.
 			const lines = node.value.split(/\r\n|\n|\r/);
 			let last = 0;
 			for (let i = 0; i < lines.length; i++) if (/[^ \t]/.test(lines[i])) last = i;
@@ -23904,17 +24068,18 @@ function normalizeAuthoredJsxLiterals(ast) {
 				if (i !== lines.length - 1) line = line.replace(/ +$/, '');
 				if (line !== '') value += line + (i !== last ? ' ' : '');
 			}
-			if (value.includes('&')) value = decodeHTMLStrict(value);
-			return value === node.value ? node : { ...node, value, raw: value };
+			return value === node.value && value === node.raw ? node : { ...node, value, raw: value };
 		}
 		if (
 			node.type === 'JSXAttribute' &&
 			node.value?.type === 'Literal' &&
-			typeof node.value.value === 'string' &&
-			node.value.value.includes('&')
+			typeof node.value.value === 'string'
 		) {
-			const value = decodeHTMLStrict(node.value.value);
-			return { ...node, value: { ...node.value, value, raw: JSON.stringify(value) } };
+			// Both parsers give `value` decoded. Where that differs from the string
+			// as written, print it from `value`, not from `raw`.
+			const { raw, value } = node.value;
+			if (typeof raw === 'string' && raw.slice(1, -1) === value) return null;
+			return { ...node, value: { ...node.value, raw: JSON.stringify(value) } };
 		}
 		if (
 			node.type === 'JSXStyleElement' &&
@@ -26308,7 +26473,10 @@ function planJsx(
 			// Const-seeded straight into the bag factory args — no mount statement.
 			if (cc.isChild && !noTemplate) {
 				bag.constField(`_chv$${cc.id}`, 'null');
-				bag.constField(`_chp$${cc.id}`, 'undefined');
+				// An only-child hole's first render must reach childTextHole even for
+				// `undefined`: while hydrating, that call reconciles the host's server
+				// children, which no other binding owns.
+				bag.constField(`_chp$${cc.id}`, cc.onlyChildText ? 'unset' : 'undefined');
 			}
 		},
 	});
@@ -26353,11 +26521,12 @@ function planJsx(
 			);
 		}
 		// Const-seeded fields keep their registry strings until the factory call.
-		// A mixed-style scalar starts at its private owning scope so its first
-		// deferred write still runs for null/undefined. The same identity lets its
-		// setter distinguish a fresh mount from a preserved suspended retry.
+		// An `unset` field starts at its private owning scope, which no rendered
+		// value equals, so its first write still runs for null/undefined. For a
+		// mixed-style scalar, the same identity lets its setter distinguish a fresh
+		// mount from a preserved suspended retry.
 		const constArgNode = (expr) =>
-			expr === 'null' ? b.literal(null) : expr === 'style-unset' ? b.id('__s') : b.id(expr);
+			expr === 'null' ? b.literal(null) : expr === 'unset' ? b.id('__s') : b.id(expr);
 		const bagFieldValue = (f) =>
 			f.hostVar !== null
 				? b.id(f.hostVar)
@@ -27860,7 +28029,7 @@ function emitDeferredMount(bind, elVar, bag) {
 			: bind.kind === 'style' || bind.kind === 'styleProperties'
 				? `_sty$${bind.id}`
 				: `_prev$${bind.id}`,
-		bind.kind === 'styleProperty' || bind.kind === 'styleProperties' ? 'style-unset' : 'undefined',
+		bind.kind === 'styleProperty' || bind.kind === 'styleProperties' ? 'unset' : 'undefined',
 	);
 	if (bind.kind === 'styleProperties') {
 		if (bind.spread) bag.constField(`_styFull$${bind.id}`, 'undefined');
@@ -30515,6 +30684,9 @@ function emitElementHtml(
 	}
 
 	let children = normalizeChildren(sourceChildren, childNs === 'svg', ctx, tag === 'noscript');
+	// Before metadata lifting, so a `<title>` inside a textarea is rejected here
+	// exactly as the server rejects it.
+	const textareaParts = textareaTextParts(tag, hostNs, children, ctx);
 	// NESTED document metadata / Float resources are zero-DOM children: lift
 	// them to the enclosing plan's head list (mounted out-of-band by
 	// emitHeadClient — scope-owned metadata, global resources), mirroring the
@@ -30530,8 +30702,51 @@ function emitElementHtml(
 		}
 		if (hasNestedHoist) children = children.filter((n) => n.type !== 'HeadHoist');
 	}
-	// Special case: a single Text child (only-child text fast path).
-	if (
+	if (textareaParts !== null) {
+		// Every child folds into one text binding (see textareaTextParts). It is a
+		// direct signal binding when any hole may carry a handle: the runtime then
+		// returns one derived handle over the parts.
+		let signalCapable = false;
+		for (const part of textareaParts) {
+			if (part.kind === 'static') continue;
+			if (canCarryDirectSignalHandle(part.expr)) signalCapable = true;
+			else if (canCarryDirectSignalHandle(part.expr, false, true)) ctx.signalBindingsUsed = true;
+			if (isDirectSignalHandleExpression(part.expr)) ctx.signalBindingsEager = true;
+		}
+		if (signalCapable) ctx.signalBindingsUsed = true;
+		const expr = inheritOriginLoc(
+			b.call(
+				requireRuntimeForContext(ctx, 'textareaText'),
+				...textareaTextArgs(textareaParts, (expression, text) =>
+					text
+						? resolveStyleExpr(expression, cssHash)
+						: tsrxExprNode(
+								resolveStyleExpr(rewriteChildHoleValue(expression, ctx), cssHash),
+								ctx,
+								componentName,
+								inlinedSubs,
+								childNs,
+								cssHash,
+							),
+				),
+			),
+			node,
+		);
+		// A customized built-in's constructor may inspect children while cloned.
+		const seededText = !directPropNames.has('is');
+		bindings.push({
+			id: bindings.length,
+			kind: 'textOnlyChild',
+			expr,
+			path,
+			seededText,
+			...(signalCapable
+				? { signalDirect: true, signalSite: directSignalSite(ctx, node, 'binding') }
+				: {}),
+		});
+		if (seededText) appendTemplatePart(html, ' ', 'text');
+	} else if (
+		// Special case: a single Text child (only-child text fast path).
 		children.length === 1 &&
 		children[0].type === 'Text' &&
 		!children[0]._octaneBindingText &&

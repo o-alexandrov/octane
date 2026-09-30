@@ -1074,6 +1074,11 @@ function formatClientError(code, ...args) {
         return (0, import_error_message.formatDevErrorMessage)("This DOM binding view requires the general adopter.", args);
       case 331:
         return (0, import_error_message.formatDevErrorMessage)("Invalid independent Hydrate manifest inputs.", args);
+      case 336:
+        return (0, import_error_message.formatDevErrorMessage)(
+          "`<textarea>` children must be text: strings, numbers, or arrays of them. One child was %s. A textarea's content is its default value, so it cannot contain elements; render them outside the textarea or pass a string.",
+          args
+        );
       default:
         return (0, import_error_message.formatUnknownDevErrorMessage)(code);
     }

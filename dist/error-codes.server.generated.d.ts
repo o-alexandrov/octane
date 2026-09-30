@@ -233,6 +233,7 @@ type ServerErrorArguments = {
     333: [unknown];
     334: [unknown];
     335: [unknown];
+    336: [unknown];
 };
 export declare function formatServerError<Code extends keyof ServerErrorArguments>(code: Code, ...args: ServerErrorArguments[Code]): string;
 export {};

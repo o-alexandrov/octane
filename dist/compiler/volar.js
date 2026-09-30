@@ -11459,7 +11459,7 @@ function apply_mutations(node, mutations) {
   );
 }
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/utils/builders.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/utils/builders.js
 var builders_exports = {};
 __export(builders_exports, {
   array: () => array,
@@ -11571,18 +11571,18 @@ __export(builders_exports, {
   yield: () => yield_builder
 });
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/utils/patterns.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/utils/patterns.js
 var regex_not_whitespace = /[^ \t\r\n]/;
 var regex_whitespaces_strict = /[ \t\n\r\f]+/g;
 var regex_newline_characters = /\n/g;
 var regex_is_valid_identifier = /^[a-zA-Z_$][a-zA-Z_$0-9]*$/;
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/utils/sanitize_template_string.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/utils/sanitize_template_string.js
 function sanitize_template_string(str) {
   return (str ?? "").replace(/(`|\${|\\)/g, "\\$1");
 }
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/utils/builders.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/utils/builders.js
 function set_location(node, loc_info, is_deep_copy = false) {
   if (loc_info) {
     node.start = loc_info.start;
@@ -12401,7 +12401,70 @@ var continue_statement = {
   metadata: { path: [] }
 };
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/utils/ast.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/comment-utils.js
+function is_ts_pragma(comment) {
+  if (comment.type !== "Line") return false;
+  const pragmas = ["@ts-ignore", "@ts-expect-error", "@ts-nocheck", "@ts-check"];
+  return pragmas.some((pragma) => comment.value.trimStart().startsWith(pragma));
+}
+function is_triple_slash_directive(comment) {
+  if (comment.type !== "Line") return false;
+  const value = comment.value.trim();
+  return /^\/\s*<(reference|amd-module|amd-dependency)/.test(value);
+}
+function is_jsdoc_comment(comment) {
+  return comment.type === "Block" && comment.value.startsWith("*");
+}
+function is_jsdoc_ts_annotation(comment) {
+  if (!is_jsdoc_comment(comment)) return false;
+  const tsAnnotations = [
+    "@type",
+    "@typedef",
+    "@param",
+    "@returns",
+    "@template",
+    "@extends",
+    "@implements",
+    "@satisfies",
+    "@overload",
+    "@import"
+  ];
+  return tsAnnotations.some((annotation) => comment.value.includes(annotation));
+}
+function is_jsx_pragma(comment) {
+  return /@jsx(ImportSource|Runtime|Frag)?\b/.test(comment.value);
+}
+function should_preserve_comment(comment) {
+  return is_ts_pragma(comment) || is_triple_slash_directive(comment) || is_jsdoc_ts_annotation(comment) || is_jsx_pragma(comment);
+}
+function should_preserve_jsx_tooling_comment(comment) {
+  return should_preserve_comment(comment) || is_jsdoc_comment(comment) || comment.type === "Line" && comment.value.trimStart().startsWith("@");
+}
+function is_jsx_child_tooling_comment(comment) {
+  return should_preserve_jsx_tooling_comment(comment) || comment.type === "Block" && /^[\s*]*@ts-(?:expect-error|ignore)\b/.test(comment.value);
+}
+function is_file_level_pragma(comment) {
+  return is_jsx_pragma(comment) || is_triple_slash_directive(comment) || comment.type === "Line" && /^\s*@ts-(?:no)?check\b/.test(comment.value);
+}
+function get_hashbang(source) {
+  if (!source.startsWith("#!")) return null;
+  return /^#![^\n\r\u2028\u2029]*/.exec(source)?.[0] ?? null;
+}
+function format_comment(comment) {
+  if (comment.type === "Line") {
+    if (comment.value.trimStart().startsWith("/")) {
+      return `/// ${comment.value.trimStart().slice(1)}`;
+    }
+    return `// ${comment.value.trim()}`;
+  } else {
+    if (comment.value.startsWith("*")) {
+      return `/** ${comment.value.trim().slice(1)} */`;
+    }
+    return `/* ${comment.value.trim()} */`;
+  }
+}
+
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/utils/ast.js
 function is_ast_node(value) {
   return !!value && typeof value === "object" && "type" in value;
 }
@@ -12431,6 +12494,39 @@ function node_children(node) {
     node.children
   );
   return Array.isArray(children) ? children.filter(is_ast_node) : [];
+}
+function is_layout_whitespace(node) {
+  const text = (
+    /** @type {{ type?: unknown, raw?: unknown } | null | undefined} */
+    node
+  );
+  const raw = text?.raw;
+  return text?.type === "JSXText" && typeof raw === "string" && /^[ \t\r\n]*$/.test(raw) && (raw === "" || /[\r\n]/.test(raw));
+}
+function is_tooling_comment_container(node) {
+  const expression = (
+    /** @type {any} */
+    node?.expression
+  );
+  return node?.type === "JSXExpressionContainer" && expression?.type === "JSXEmptyExpression" && (expression.innerComments ?? []).some(is_jsx_child_tooling_comment);
+}
+function render_children(node) {
+  const children = node_children(node);
+  const kept = children.filter(
+    (child, index) => !is_layout_whitespace(child) || is_tooling_comment_container(children[index - 1]) || is_tooling_comment_container(children[index + 1])
+  );
+  const is_plain_empty_container = (child) => child?.type === "JSXExpressionContainer" && /** @type {any} */
+  child.expression.type === "JSXEmptyExpression" && !is_tooling_comment_container(child);
+  const result = [];
+  for (const [index, child] of kept.entries()) {
+    if (!is_plain_empty_container(child)) {
+      result.push(child);
+      continue;
+    }
+    const next = kept.slice(index + 1).find((sibling2) => !is_plain_empty_container(sibling2));
+    if (result.at(-1)?.type === "JSXText" && next?.type === "JSXText") result.push(child);
+  }
+  return result;
 }
 function has_location(node) {
   if (node == null) return false;
@@ -12552,7 +12648,7 @@ function extract_identifiers(pattern) {
   return unwrap_pattern(pattern, []).filter((node) => node.type === "Identifier");
 }
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/parse/index.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/parse/index.js
 var BINDING_TYPES = {
   BIND_NONE: 0,
   // Not a binding
@@ -12583,7 +12679,7 @@ function isWhitespaceTextNode(node) {
     return false;
   }
   if (node.type === "JSXText") {
-    return /^\s*$/.test(node.value);
+    return /^\s*$/.test(node.raw);
   }
   return false;
 }
@@ -12724,21 +12820,25 @@ function get_comment_handlers(source, comments, index = 0) {
     }
     return end;
   }
-  function getNextNonSpaceNonCommentCharacter(start) {
+  function getNextNonSpaceNonCommentCharacterIndex(start) {
     for (let i2 = start; i2 < source.length; i2++) {
       if (source.startsWith("/*", i2)) {
         const end = source.indexOf("*/", i2 + 2);
-        if (end === -1) return null;
+        if (end === -1) return -1;
         i2 = end + 1;
       } else if (source.startsWith("//", i2)) {
         const newline2 = source.indexOf("\n", i2);
-        if (newline2 === -1) return null;
+        if (newline2 === -1) return -1;
         i2 = newline2;
       } else if (!/\s/.test(source[i2])) {
-        return source[i2];
+        return i2;
       }
     }
-    return null;
+    return -1;
+  }
+  function getNextNonSpaceNonCommentCharacter(start) {
+    const index2 = getNextNonSpaceNonCommentCharacterIndex(start);
+    return index2 === -1 ? null : source[index2];
   }
   function isBlankBetween(start, end, parens) {
     for (let i2 = start; i2 < end; i2++) {
@@ -12769,7 +12869,23 @@ function get_comment_handlers(source, comments, index = 0) {
     "ContinueStatement",
     "DebuggerStatement"
   ]);
+  function getKeywordOnlyStatementEnd(node) {
+    const statement = (
+      /** @type {any} */
+      node
+    );
+    const keyword = statement.type === "ContinueStatement" && !statement.label && "continue" || statement.type === "BreakStatement" && !statement.label && "break" || statement.type === "DebuggerStatement" && "debugger" || statement.type === "ReturnStatement" && !statement.argument && "return";
+    return keyword ? node.start + keyword.length : -1;
+  }
   function takeCommentsBeforeFinalSemicolon(node, path) {
+    const keywordEnd = getKeywordOnlyStatementEnd(node);
+    if (keywordEnd >= 0) {
+      path = [
+        ...path,
+        /** @type {AST.Node} */
+        node
+      ];
+    }
     let index2 = path.length - 1;
     while (index2 >= 0 && !statementsEndingBeforeSemicolon.has(path[index2].type) && !/Statement$|Declaration$|^Program$|^(Call|New|Import)Expression$|^JSX/.test(path[index2].type)) {
       index2--;
@@ -12778,39 +12894,76 @@ function get_comment_handlers(source, comments, index = 0) {
       /** @type {(AST.Node & AST.NodeWithLocation) | undefined} */
       path[index2]
     );
-    if (!comments[0] || !statement || !statementsEndingBeforeSemicolon.has(statement.type) || statement.end <= comments[0].end || source[statement.end - 1] !== ";" || // The comment must follow the node on its line
-    !/^[ \t)]*$/.test(source.slice(node.end, comments[0].start))) {
+    const nodeEnd = keywordEnd < 0 ? node.end : keywordEnd;
+    if (!comments[0] || !statement || !statementsEndingBeforeSemicolon.has(statement.type) || statement.end <= comments[0].end || // The comment must follow the node, after the parentheses that the node
+    // ends in and the comments that other nodes took
+    !isBlankBetween(nodeEnd, comments[0].start, true)) {
       return false;
     }
-    if (!isBlankBetween(comments[0].end, statement.end - 1, false)) {
-      const value = getParenthesizedStatementValue(statement);
-      if (!value || value.end !== node.end || value !== node && !path.includes(value) || !isBlankBetween(comments[0].end, statement.end - 1, true)) {
+    const declarations = (
+      /** @type {any} */
+      statement.declarations
+    );
+    const declarator2 = (
+      /** @type {(AST.Node & AST.NodeWithLocation) | undefined} */
+      declarations?.slice(0, -1).find(
+        (declarator3) => declarator3.start < comments[0].start && comments[0].end <= declarator3.end
+      )
+    );
+    const semicolon2 = declarator2 ? declarator2.end : source[statement.end - 1] === ";" ? statement.end - 1 : statement.end;
+    const inParens = !isBlankBetween(comments[0].end, semicolon2, false);
+    if (source.slice(nodeEnd, comments[0].start).includes("\n") && (!inParens || declarator2)) {
+      return false;
+    }
+    let target = declarator2 ?? statement;
+    let first = 0;
+    if (inParens) {
+      if (!isBlankBetween(comments[0].end, semicolon2, true)) {
         return false;
       }
+      const followsValue = (comment) => getParenthesizedStatementValues(statement, comment).some(
+        (value) => value.end === node.end && (value === node || path.includes(value))
+      );
+      if (!followsValue(comments[0])) {
+        while (comments[first].type === "Block" && comments[first + 1] && /^[ \t]*$/.test(source.slice(comments[first].end, comments[first + 1].start))) {
+          first++;
+        }
+        if (first === 0 || comments[first].type !== "Line" || !followsValue(comments[first])) {
+          return false;
+        }
+      }
+      const argument = (
+        /** @type {AST.Node & AST.NodeWithLocation} */
+        /** @type {any} */
+        statement.argument
+      );
+      if ((statement.type === "ReturnStatement" || statement.type === "ThrowStatement") && isBinaryish(argument) && getTypeCastEnd(argument) === -1) {
+        target = argument;
+      }
     }
-    let target = statement;
+    let outermost = statement;
     for (let i2 = index2 - 1; i2 >= 0; i2--) {
       const ancestor = (
         /** @type {AST.Node & AST.NodeWithLocation} */
         path[i2]
       );
       if (ancestor.type === "Program" || ancestor.end !== statement.end) break;
-      target = ancestor;
+      outermost = ancestor;
     }
-    const targetNode = (
-      /** @type {AST.NodeWithMaybeComments} */
-      target
-    );
-    const trailing = targetNode.trailingComments ||= [];
-    let previousEnd = node.end;
-    while (comments[0] && comments[0].end < statement.end && !source.slice(previousEnd, comments[0].start).includes("\n")) {
-      previousEnd = comments[0].end;
-      trailing.push(
+    let previousEnd = first !== 0 ? comments[first - 1].end : nodeEnd;
+    while (comments[first] && comments[first].end <= semicolon2 && (!source.slice(previousEnd, comments[first].start).includes("\n") || !declarator2 && !isBlankBetween(comments[first].end, semicolon2, false))) {
+      const comment = (
         /** @type {AST.CommentWithLocation} */
-        comments.shift()
+        comments.splice(first, 1)[0]
       );
+      previousEnd = comment.end;
+      const takes = (
+        /** @type {AST.NodeWithMaybeComments} */
+        target === statement || isBlankBetween(comment.end, semicolon2, false) ? outermost : target
+      );
+      (takes.trailingComments ||= []).push(comment);
     }
-    return true;
+    return first === 0;
   }
   const valuesPrintedWithoutParens = /* @__PURE__ */ new Set([
     "Identifier",
@@ -12828,7 +12981,7 @@ function get_comment_handlers(source, comments, index = 0) {
     "AwaitExpression",
     "TSNonNullExpression"
   ]);
-  function getParenthesizedStatementValue(statement) {
+  function getParenthesizedStatementValues(statement, comment) {
     const node = (
       /** @type {any} */
       statement
@@ -12839,13 +12992,343 @@ function get_comment_handlers(source, comments, index = 0) {
     } else if (node.type === "ExpressionStatement") {
       candidates.push(node.expression, node.expression.right);
     } else if (node.type === "VariableDeclaration") {
-      candidates.push(node.declarations.at(-1)?.init);
+      candidates.push(
+        node.declarations.find(
+          (declarator2) => declarator2.start < comment.start && comment.end <= declarator2.end
+        )?.init
+      );
     } else if (node.type === "ExportDefaultDeclaration") {
       candidates.push(node.declaration);
     }
-    return candidates.find(
-      (candidate) => candidate?.metadata?.parenthesized && valuesPrintedWithoutParens.has(candidate.type)
-    ) ?? null;
+    const values = [];
+    for (const value of candidates) {
+      let candidate = value;
+      let arrow2 = null;
+      while (candidate?.type === "ArrowFunctionExpression") {
+        arrow2 = candidate;
+        candidate = /** @type {AST.Node & AST.NodeWithLocation} */
+        candidate.body;
+      }
+      const isArrowBody = arrow2 !== null;
+      const inBodyParens = arrow2 !== null && candidate?.type === "ConditionalExpression" && !commentsBreakLine(comment, arrow2.end);
+      if (candidate?.metadata?.parenthesized && (isArrowBody ? !keepsCommentsInArrowBodyParens(candidate) || candidate.type === "ConditionalExpression" && !inBodyParens : valuesPrintedWithoutParens.has(candidate.type))) {
+        values.push(candidate);
+      } else if (value?.metadata?.parenthesized && movesCommentAfterParens(node, value, comment)) {
+        values.push(value);
+      }
+      if (!inBodyParens) {
+        values.push(...getValueEnds(candidate));
+      }
+    }
+    return values;
+  }
+  function commentsBreakLine(comment, end) {
+    for (let index2 = comments.indexOf(comment), previousEnd = comment.start; comments[index2] && comments[index2].end <= end && isBlankBetween(previousEnd, comments[index2].start, true); previousEnd = comments[index2++].end) {
+      if (comments[index2].type === "Line" || isOwnLineComment(comments[index2])) {
+        return true;
+      }
+    }
+    return false;
+  }
+  function isBinaryish(node) {
+    return node?.type === "BinaryExpression" || node?.type === "LogicalExpression";
+  }
+  function getValueEnds(value) {
+    const ends = [];
+    if (!isBinaryish(value) && value?.type !== "ConditionalExpression") {
+      return ends;
+    }
+    if (value.metadata?.parenthesized) {
+      ends.push(
+        /** @type {AST.Node & AST.NodeWithLocation} */
+        value
+      );
+    }
+    let operand = value;
+    let jsxMode = false;
+    while (getTypeCastEnd(operand) === -1) {
+      let end;
+      if (isBinaryish(operand)) {
+        end = /** @type {AST.Node & AST.NodeWithLocation} */
+        operand.right;
+        if (end.type.startsWith("JSX")) break;
+      } else if (operand.type === "ConditionalExpression") {
+        end = operand.alternate;
+        jsxMode ||= conditionalChainHasTemplate(operand);
+        if (jsxMode && end.type !== "ConditionalExpression" && !(end.type === "Literal" && end.value === null) && !(end.type === "Identifier" && end.name === "undefined")) {
+          break;
+        }
+      } else {
+        break;
+      }
+      ends.push(end);
+      operand = end;
+    }
+    return ends;
+  }
+  function conditionalChainHasTemplate(node) {
+    const conditionals = [node];
+    for (const conditional2 of conditionals) {
+      for (const child of [conditional2.test, conditional2.consequent, conditional2.alternate]) {
+        if (child.type.startsWith("JSX")) {
+          return true;
+        }
+        if (child.type === "ConditionalExpression") {
+          conditionals.push(child);
+        }
+      }
+    }
+    return false;
+  }
+  function takeCommentsBeforeOperandParens(node, path) {
+    const comment = comments[0];
+    let child = (
+      /** @type {AST.Node} */
+      node
+    );
+    let index2 = path.length - 1;
+    const parent = (
+      /** @type {AST.Node} */
+      path[index2]
+    );
+    if (parent?.type === "ConditionalExpression" && parent.alternate === child) {
+      return takeCommentsBeforeFinalSemicolon(node, path);
+    }
+    if (!comment || !isBinaryish(parent) || parent.right !== child || // An element prints its comments inside its own parentheses
+    child.type.startsWith("JSX") || getNextNonSpaceNonCommentCharacter(comment.end) !== ")") {
+      return false;
+    }
+    for (; index2 >= 1; index2--) {
+      const operand = (
+        /** @type {AST.Node & AST.NodeWithLocation} */
+        path[index2]
+      );
+      if (!isBinaryish(operand) || operand.right !== child) {
+        break;
+      }
+      const binary2 = (
+        /** @type {AST.Node} */
+        path[index2 - 1]
+      );
+      if (isBinaryish(binary2) && binary2.left === operand || getTypeCastEnd(operand) !== -1) {
+        addTrailingComment(
+          operand,
+          /** @type {AST.CommentWithLocation} */
+          comments.shift()
+        );
+        return true;
+      }
+      child = operand;
+    }
+    return takeCommentsBeforeFinalSemicolon(node, path);
+  }
+  function takeCommentsInArrowBodyParens(node, path) {
+    const body = (
+      /** @type {AST.Node & AST.NodeWithLocation} */
+      node
+    );
+    let index2 = path.length - 1;
+    const last = (
+      /** @type {AST.ArrowFunctionExpression & AST.NodeWithLocation} */
+      path[index2]
+    );
+    if (last?.type !== "ArrowFunctionExpression" || last.body !== body || source.slice(body.end, comments[0].start).includes("\n") || !body.metadata?.parenthesized || keepsCommentsInArrowBodyParens(body) || body.type === "ArrowFunctionExpression") {
+      return false;
+    }
+    while (index2 > 0 && isArrowChainLink(
+      /** @type {AST.Node} */
+      path[index2 - 1],
+      /** @type {AST.Node & AST.NodeWithLocation} */
+      path[index2]
+    )) {
+      index2--;
+    }
+    const first = (
+      /** @type {AST.ArrowFunctionExpression & AST.NodeWithLocation} */
+      path[index2]
+    );
+    if (!isBlankBetween(comments[0].end, first.end, true)) {
+      return false;
+    }
+    return takeCommentsAfterArrowFunctionBody(
+      first,
+      last,
+      /** @type {AST.Node} */
+      path[index2 - 1],
+      body.end,
+      first.end
+    );
+  }
+  function takeCommentsAfterArrowChain(node, path) {
+    const first = (
+      /** @type {AST.ArrowFunctionExpression & AST.NodeWithLocation} */
+      node
+    );
+    const call2 = (
+      /** @type {AST.Node} */
+      path.at(-1)
+    );
+    if (first.type !== "ArrowFunctionExpression" || !isArrowChainLink(
+      first,
+      /** @type {any} */
+      first.body
+    ) || !((call2.type === "CallExpression" || call2.type === "NewExpression") && call2.callee === first) || comments[0].start < first.end || source.slice(first.end, comments[0].start).includes("\n") || getNextNonSpaceNonCommentCharacter(comments[0].end) !== ")") {
+      return false;
+    }
+    let last = (
+      /** @type {AST.ArrowFunctionExpression & AST.NodeWithLocation} */
+      first.body
+    );
+    while (isArrowChainLink(
+      last,
+      /** @type {any} */
+      last.body
+    )) {
+      last = /** @type {any} */
+      last.body;
+    }
+    if (getArrowChainBodyPlace(
+      /** @type {AST.Node} */
+      last.body
+    ) !== "below") {
+      return false;
+    }
+    return takeCommentsAfterArrowFunctionBody(
+      first,
+      last,
+      call2,
+      first.end,
+      getNextNonSpaceNonCommentCharacterIndex(comments[0].end)
+    );
+  }
+  function isArrowChainLink(parent, child) {
+    return parent.type === "ArrowFunctionExpression" && parent.body === child && child.type === "ArrowFunctionExpression" && getTypeCastEnd(child) === -1;
+  }
+  function isIgnoredNode(node) {
+    return Boolean(
+      node.metadata?.prettierIgnore || node.leadingComments?.some(
+        (comment) => isPrettierIgnoreComment(
+          /** @type {AST.CommentWithLocation} */
+          comment
+        )
+      )
+    );
+  }
+  function getArrowChainBodyPlace(body) {
+    const template2 = body.type === "TemplateLiteral" ? body : body.type === "TaggedTemplateExpression" ? body.quasi : null;
+    if (body.type === "ArrayExpression" || body.type === "ObjectExpression" || body.type === "ArrowFunctionExpression" || body.type === "SequenceExpression" || body.type === "ConditionalExpression" || body.type.startsWith("JSX") || template2?.quasis.some((quasi2) => quasi2.value.raw.includes("\n"))) {
+      return "line";
+    }
+    return body.type === "TaggedTemplateExpression" || template2 && body.leadingComments?.length ? null : "below";
+  }
+  function takeCommentsAfterArrowFunctionBody(first, last, parent, from, end) {
+    const node = (
+      /** @type {any} */
+      parent
+    );
+    const isCalled = node?.type === "CallExpression" && node.callee === first || node?.type === "TaggedTemplateExpression" && node.tag === first;
+    if (!isCalled && !(node?.type === "NewExpression" && node.callee === first) && !(node?.type === "MemberExpression" && node.object === first) && !((node?.type === "TSNonNullExpression" || node?.type === "TSAsExpression" || node?.type === "TSSatisfiesExpression") && node.expression === first) && !((node?.type === "BinaryExpression" || node?.type === "LogicalExpression") && node.left === first) && !(node?.type === "ConditionalExpression" && node.test === first)) {
+      return false;
+    }
+    for (let arrow2 = first; ; arrow2 = /** @type {any} */
+    arrow2.body) {
+      if (isIgnoredNode(arrow2) || isIgnoredNode(
+        /** @type {AST.Node} */
+        arrow2.body
+      )) {
+        return false;
+      }
+      if (arrow2 === last) {
+        break;
+      }
+    }
+    const place = node.type === "CallExpression" && first !== last ? getArrowChainBodyPlace(
+      /** @type {AST.Node} */
+      last.body
+    ) : "line";
+    if (place === null) {
+      return false;
+    }
+    let count = 0;
+    for (let previousEnd = from; comments[count] && comments[count].end <= end && !source.slice(previousEnd, comments[count].start).includes("\n"); count++) {
+      previousEnd = comments[count].end;
+      if (!isCalled && comments[count].type === "Line") {
+        return false;
+      }
+    }
+    const argument = (
+      /** @type {AST.Node | undefined} */
+      node.arguments?.[0]
+    );
+    let target = first;
+    let leads = false;
+    if (node.type === "NewExpression" && argument) {
+      target = argument;
+      leads = true;
+    } else if (place === "below") {
+      target = argument ?? last;
+      leads = Boolean(argument);
+    }
+    for (const comment of comments.splice(0, count)) {
+      if (leads) {
+        if (node.type === "CallExpression") {
+          comment.ownLine = true;
+        }
+        addLeadingComment(target, comment);
+      } else {
+        addTrailingComment(target, comment);
+      }
+    }
+    return true;
+  }
+  function movesCommentAfterParens(statement, value, comment) {
+    if (statement.type === "ExpressionStatement" && statement.expression === value) {
+      return !value.type.startsWith("JSX") || !isOwnLineComment(comment);
+    }
+    if (value.type !== "SequenceExpression" && value.type !== "AssignmentExpression") {
+      return false;
+    }
+    if (statement.type === "ThrowStatement" || statement.type === "ExportDefaultDeclaration") {
+      return true;
+    }
+    const isAssignmentRight = statement.type === "ExpressionStatement" && statement.expression.type === "AssignmentExpression" && statement.expression.right === value;
+    return value.type === "AssignmentExpression" ? isAssignmentRight : (comment.type === "Line" || isOwnLineComment(comment)) && (isAssignmentRight || statement.type === "VariableDeclaration");
+  }
+  function keepsCommentsInArrowBodyParens(node) {
+    return node.type.startsWith("JSX") || node.type === "ConditionalExpression" || node.type === "SequenceExpression" || node.type === "AssignmentExpression";
+  }
+  function getTypeCastEnd(node) {
+    const parenStart = node.metadata?.paren_start;
+    if (typeof parenStart !== "number") return -1;
+    let parens = 0;
+    let closing = 0;
+    for (let i2 = parenStart; i2 < node.start; i2++) {
+      const comment = commentsByStart.get(i2);
+      if (comment) {
+        i2 = comment.end - 1;
+      } else if (source[i2] === "(") {
+        parens++;
+        let before2 = i2;
+        while (before2 > 0 && /\s/.test(source[before2 - 1])) before2--;
+        const cast = commentsByEnd.get(before2);
+        if (closing === 0 && cast && isTypeCastComment(cast)) {
+          closing = parens;
+        }
+      }
+    }
+    if (closing === 0) return -1;
+    closing = parens - closing + 1;
+    for (let i2 = node.end; i2 < source.length; i2++) {
+      const comment = commentsByStart.get(i2);
+      if (comment) {
+        i2 = comment.end - 1;
+      } else if (source[i2] === ")") {
+        if (--closing === 0) return i2;
+      } else if (!/\s/.test(source[i2])) {
+        break;
+      }
+    }
+    return -1;
   }
   function isFunctionNode(node) {
     return node?.type === "FunctionDeclaration" || node?.type === "FunctionExpression" || node?.type === "ArrowFunctionExpression";
@@ -12855,21 +13338,23 @@ function get_comment_handlers(source, comments, index = 0) {
       /** @type {any} */
       fn
     );
+    const params = getSignatureParameters(node) ?? [];
     const end = (
-      /** @type {AST.NodeWithLocation} */
-      (node.returnType ?? node.body).start
+      /** @type {AST.NodeWithLocation | undefined} */
+      (getReturnType(node) ?? node.body)?.start ?? /** @type {AST.NodeWithLocation} */
+      node.end
     );
     const lastParam = (
       /** @type {AST.NodeWithLocation | undefined} */
-      node.params.at(-1)
+      params.at(-1)
     );
     const firstParam = (
       /** @type {AST.NodeWithLocation | undefined} */
-      node.params[0]
+      params[0]
     );
     const from = (
       /** @type {AST.NodeWithLocation | undefined} */
-      (node.typeParameters ?? node.id)?.end
+      (node.typeParameters ?? node.id ?? node.key)?.end
     );
     const open = findOutsideComments(
       "(",
@@ -12880,6 +13365,36 @@ function get_comment_handlers(source, comments, index = 0) {
     if (open >= (firstParam?.start ?? end)) return null;
     const close = findOutsideComments(")", lastParam?.end ?? open + 1, end);
     return close < end ? { open, close } : null;
+  }
+  function getTypeParameterKeyword(node, parent) {
+    if (parent?.type === "TSMappedType") return "in";
+    return node.constraint ? "extends" : node.default ? "=" : null;
+  }
+  function takeTypeParameterNameComments(node, parent) {
+    const keyword = getTypeParameterKeyword(node, parent);
+    const first = (
+      /** @type {AST.NodeWithLocation | undefined} */
+      node.constraint ?? node.default
+    );
+    const end = first?.start ?? node.end;
+    let hasLineComment = false;
+    while (comments[0] && comments[0].end <= end) {
+      const comment = comments[0];
+      if (keyword && !trailsTypeParameterPart(comment, keyword, end, hasLineComment)) break;
+      hasLineComment ||= comment.type === "Line";
+      pushInnerComment(
+        node,
+        /** @type {AST.CommentWithLocation} */
+        comments.shift()
+      );
+    }
+  }
+  function trailsTypeParameterPart(comment, keyword, end, hasLineComment) {
+    const isAfterKeyword = findOutsideComments(keyword, comment.end, end) >= end;
+    if (isPrettierIgnoreComment(comment) && (isAfterKeyword || isOwnLineComment(comment))) {
+      return false;
+    }
+    return isOwnLineComment(comment) ? !hasLineComment && (comment.type === "Line" || isEndOfLineComment(comment)) : isEndOfLineComment(comment) || !isAfterKeyword;
   }
   function endsStatementHeader(node, parent) {
     const statement = (
@@ -12921,6 +13436,11 @@ function get_comment_handlers(source, comments, index = 0) {
   }
   function isNativeTemplateElement(node) {
     return (node?.type === "JSXElement" || node?.type === "JSXStyleElement") && node.metadata?.native_tsrx === true;
+  }
+  function isCommentInEmptyContainer(comment, node) {
+    return node?.type === "JSXExpressionContainer" && node.expression.type === "JSXEmptyExpression" && comment.start >= /** @type {AST.NodeWithLocation} */
+    node.start && comment.end <= /** @type {AST.NodeWithLocation} */
+    node.end;
   }
   function isEmptyTemplateNode(node) {
     return isNativeTemplateNode(node) && node.children.length === 0;
@@ -12980,9 +13500,13 @@ function get_comment_handlers(source, comments, index = 0) {
     }
     return false;
   }
+  function isTypeParameterName(node, parent) {
+    return parent?.type === "TSTypeParameter" && parent.name === node;
+  }
   function getAttachableChildren(node, children = []) {
     for (const key2 in node) {
       if (key2 === "metadata" || key2 === "loc" || /[cC]omments$/.test(key2)) continue;
+      if (key2 === "name" && node.type === "TSTypeParameter") continue;
       const value = (
         /** @type {Record<string, unknown>} */
         /** @type {unknown} */
@@ -12990,7 +13514,7 @@ function get_comment_handlers(source, comments, index = 0) {
       );
       for (const child of Array.isArray(value) ? value : [value]) {
         if (child && typeof child === "object" && typeof child.type === "string" && typeof child.start === "number" && typeof child.end === "number" && child.type !== "TemplateElement" && child.type !== "EmptyStatement") {
-          if (child.type === "ChainExpression") {
+          if (child.type === "ChainExpression" || child.type === "TSTypeAnnotation" && node.type === "TSPropertySignature") {
             getAttachableChildren(child, children);
           } else {
             children.push(child);
@@ -13040,35 +13564,88 @@ function get_comment_handlers(source, comments, index = 0) {
       /** @type {AST.Node & AST.NodeWithLocation} */
       enclosing
     );
-    if (!(node.start <= comment.start && comment.end <= node.end)) {
+    if (!(getCommentStart(node) <= comment.start && comment.end <= node.end)) {
       return null;
     }
-    let preceding = null;
-    let following = null;
-    for (const child of getAttachableChildren(node)) {
-      if (child.end <= comment.start) {
-        if (!preceding || child.end > preceding.end) preceding = child;
-      } else if (child.start >= comment.end) {
-        if (!following || child.start < following.start) following = child;
+    const { children, precedingIndexes } = getSortedAttachableChildren(node);
+    let low = 0;
+    let high = children.length;
+    while (low < high) {
+      const middle = low + high >> 1;
+      if (getCommentStart(children[middle]) < comment.end) {
+        low = middle + 1;
       } else {
-        return null;
+        high = middle;
       }
     }
-    return { preceding, following };
+    const preceding = low > 0 ? children[precedingIndexes[low - 1]] : null;
+    if (preceding && preceding.end > comment.start) {
+      return null;
+    }
+    return { preceding, following: children[low] ?? null };
+  }
+  const sortedChildrenCache = /* @__PURE__ */ new WeakMap();
+  function getSortedAttachableChildren(node) {
+    let sorted = sortedChildrenCache.get(node);
+    if (!sorted) {
+      const children = getAttachableChildren(node).sort(
+        (a, b) => getCommentStart(a) - getCommentStart(b)
+      );
+      const precedingIndexes = [];
+      children.forEach((child, index2) => {
+        const last = precedingIndexes[index2 - 1];
+        precedingIndexes.push(last !== void 0 && children[last].end >= child.end ? last : index2);
+      });
+      sorted = { children, precedingIndexes };
+      sortedChildrenCache.set(node, sorted);
+    }
+    return sorted;
   }
   function getCommentStart(node) {
     const { start } = (
       /** @type {AST.NodeWithLocation} */
       node
     );
-    const [decorator] = (
+    const decorated = (
       /** @type {any} */
-      node.declaration?.decorators ?? []
+      node.declaration ?? node
     );
+    const [decorator] = (node.type === /** @type {string} */
+    "TSParameterProperty" ? (
+      /** @type {any} */
+      node.parameter
+    ) : decorated)?.decorators ?? [];
     return decorator && decorator.start < start ? decorator.start : start;
   }
   function isClassLike(node) {
     return node?.type === "ClassDeclaration" || node?.type === "ClassExpression" || node?.type === "TSInterfaceDeclaration";
+  }
+  function isPropertyLike(node) {
+    const type = (
+      /** @type {string | undefined} */
+      node?.type
+    );
+    return type === "PropertyDefinition" || type === "MethodDefinition" || type === "AccessorProperty" || type === "TSAbstractPropertyDefinition" || type === "TSAbstractMethodDefinition" || type === "TSAbstractAccessorProperty" || type === "TSDeclareMethod" || type === "TSParameterProperty";
+  }
+  function isObjectProperty(node) {
+    const property = (
+      /** @type {any} */
+      node
+    );
+    return node?.type === "Property" && !(property.method && property.kind === "init" || property.kind === "get" || property.kind === "set");
+  }
+  function isComplexAssignedValue(value) {
+    return (value.type === "ObjectExpression" || value.type === "ArrayExpression" || value.type === "TemplateLiteral" || value.type === "TaggedTemplateExpression" || value.type === "TSTypeLiteral") && getTypeCastEnd(value) < 0;
+  }
+  function addLeadingCommentToPossibleUnionType(node, comment) {
+    addLeadingComment(
+      node.type === "TSUnionType" && comment.type === "Block" && !source.slice(comment.start, comment.end).includes("\n") && !isPrettierIgnoreComment(comment) && /^[ \t]*$/.test(source.slice(comment.end, node.start)) ? getUnionCommentTarget(
+        /** @type {AST.TSUnionType} */
+        node,
+        comment
+      ) : node,
+      comment
+    );
   }
   function addLeadingComment(node, comment) {
     const withComments = (
@@ -13111,23 +13688,46 @@ function get_comment_handlers(source, comments, index = 0) {
     }
     return node;
   }
+  function getUnionCommentTarget(union, comment) {
+    let node = union;
+    while (node.type === "TSParenthesizedType" || (node.type === "TSUnionType" || node.type === "TSIntersectionType") && node.types.length === 1) {
+      node = node.type === "TSParenthesizedType" ? node.typeAnnotation : node.types[0];
+    }
+    return node !== union && node.type === "TSUnionType" && /^[\s|&(]*$/.test(source.slice(comment.end, node.types[0].start)) ? node.types[0] : (
+      /** @type {AST.Node} */
+      union.types[0]
+    );
+  }
   function isHandledEnclosingNode(node) {
     const type = (
       /** @type {any} */
       node?.statementType ?? node?.type
     );
-    return type === "IfStatement" || type === "WhileStatement" || type === "WithStatement" || type === "TryStatement" || type === "CatchClause" || type === "ConditionalExpression" || type === "TSConditionalType" || type === "MemberExpression" || type === "BinaryExpression" || type === "LogicalExpression" || type === "TSUnionType" || isClassLike(
+    return type === "IfStatement" || type === "WhileStatement" || type === "WithStatement" || type === "TryStatement" || type === "CatchClause" || type === "ConditionalExpression" || type === "TSConditionalType" || type === "MemberExpression" || type === "BinaryExpression" || type === "LogicalExpression" || type === "TSUnionType" || type === "AssignmentPattern" || type === "TSMappedType" || type === "TSTypeParameter" || type === "VariableDeclarator" || type === "ReturnStatement" || type === "AssignmentExpression" || type === "TSTypeAliasDeclaration" || type === "ImportAttribute" || type === "ForStatement" || isObjectProperty(node) || getSignatureParameters(node) !== null || isClassLike(
       /** @type {AST.Node} */
       node
-    );
+    ) || isPropertyLike(node) || // A parameter property's decorators hang off its parameter
+    !!/** @type {any} */
+    node?.decorators?.length;
+  }
+  const elementValueTypes = /* @__PURE__ */ new Set([
+    "JSXElement",
+    "JSXFragment",
+    "JSXIfExpression",
+    "JSXForExpression",
+    "JSXSwitchExpression",
+    "JSXTryExpression"
+  ]);
+  function isArrowWithElementBody(node) {
+    return node.type === "ArrowFunctionExpression" && elementValueTypes.has(node.body.type);
   }
   function keepsCommentsAfterChildren(node) {
-    return node.type.startsWith("JSX") || isNativeTemplateNode(node) || isFunctionNode(node) || isClassLike(
+    return node.type.startsWith("JSX") && node.type !== "JSXSpreadAttribute" && node.type !== "JSXSpreadChild" && node.type !== "JSXExpressionContainer" || isNativeTemplateNode(node) || isFunctionNode(node) && !isArrowWithElementBody(node) || isClassLike(
       /** @type {AST.Node} */
       node
-    ) || node.type === "Program" || node.type === "BlockStatement" || node.type === "StaticBlock" || node.type === "TSModuleBlock" || node.type === "ClassBody" || node.type === "TSInterfaceBody" || node.type === "SwitchStatement" || node.type === "SwitchCase" || node.type === "TSTypeLiteral" || node.type === "TSEnumDeclaration" || node.type === "ObjectExpression" || node.type === "ObjectPattern" || node.type === "ArrayExpression" || node.type === "ArrayPattern" || node.type === "TemplateLiteral" || node.type === "StyleSheet";
+    ) || node.type === "Program" || node.type === "BlockStatement" || node.type === "StaticBlock" || node.type === "TSModuleBlock" || node.type === "ClassBody" || node.type === "TSInterfaceBody" || node.type === "SwitchStatement" || node.type === "SwitchCase" || node.type === "TSTypeLiteral" || node.type === "TSEnumBody" || node.type === "ObjectExpression" || node.type === "ObjectPattern" || node.type === "ArrayExpression" || node.type === "ArrayPattern" || node.type === "TemplateLiteral" || node.type === "StyleSheet";
   }
-  function handleComment(comment, enclosing, preceding, following) {
+  function handleComment(comment, enclosing, preceding, following, ancestor) {
     if (isTypeCastComment(comment) && getNextNonSpaceNonCommentCharacter(comment.end) === "(") {
       return false;
     }
@@ -13138,6 +13738,13 @@ function get_comment_handlers(source, comments, index = 0) {
       enclosing
     );
     const type = node.statementType ?? node.type;
+    if (getSignatureParameters(enclosing)?.length === 0) {
+      const parens = getParameterParens(enclosing);
+      if (parens && comment.start > parens.open && comment.end <= parens.close) {
+        pushInnerComment(enclosing, comment);
+        return true;
+      }
+    }
     if ((type === "IfStatement" || type === "WhileStatement" || type === "WithStatement") && preceding && following && getNextNonSpaceNonCommentCharacter(comment.end) === ")") {
       addTrailingComment(preceding, comment);
       return true;
@@ -13214,8 +13821,38 @@ function get_comment_handlers(source, comments, index = 0) {
         return true;
       }
     }
+    const isParameterPropertyParameter = ancestor?.type === /** @type {string} */
+    "TSParameterProperty" && /** @type {any} */
+    ancestor.parameter === enclosing;
+    if (preceding?.type === "Decorator" && (isPropertyLike(enclosing) || isParameterPropertyParameter) && (comment.type === "Line" || ownLine)) {
+      addTrailingComment(preceding, comment);
+      return true;
+    }
+    const enclosingStart = (
+      /** @type {AST.NodeWithLocation} */
+      enclosing.start
+    );
+    if (preceding?.type === "Decorator" && isParameterPropertyParameter && enclosing.type === "Identifier" && comment.end <= enclosingStart) {
+      if (!ownLine && !endOfLine && isBlankBetween(comment.end, enclosingStart, false)) {
+        addLeadingComment(enclosing, comment);
+      } else {
+        addTrailingComment(preceding, comment);
+      }
+      return true;
+    }
     if (ownLine && node.type === "MemberExpression" && following?.type === "Identifier") {
       addLeadingComment(node, comment);
+      return true;
+    }
+    if (ownLine && node.type === "AssignmentPattern") {
+      addLeadingComment(
+        ancestor?.type === /** @type {string} */
+        "TSParameterProperty" ? (
+          /** @type {AST.Node} */
+          ancestor
+        ) : enclosing,
+        comment
+      );
       return true;
     }
     if (ownLine && isPrettierIgnoreComment(comment)) {
@@ -13238,23 +13875,174 @@ function get_comment_handlers(source, comments, index = 0) {
     }
     if (!endOfLine && following?.type === "TSUnionType" && comment.type === "Block" && !source.slice(comment.start, comment.end).includes("\n") && !isPrettierIgnoreComment(comment) && /^[ \t]*$/.test(source.slice(comment.end, following.start))) {
       addLeadingComment(
-        /** @type {AST.TSUnionType} */
-        following.types[0],
+        getUnionCommentTarget(
+          /** @type {AST.TSUnionType} */
+          following,
+          comment
+        ),
         comment
       );
       return true;
     }
-    if (endOfLine && preceding && (node.type === "BinaryExpression" || node.type === "LogicalExpression" || node.type === "ConditionalExpression" || node.type === "TSConditionalType" || node.type === "TSUnionType")) {
+    if (!ownLine && preceding && !following && (preceding.type === "SequenceExpression" || preceding.type === "AssignmentExpression") && (node.type === "ArrowFunctionExpression" ? node.body === preceding : node.type === "VariableDeclarator" ? node.init === preceding : node.type === "ReturnStatement" ? node.argument === preceding : node.type === "AssignmentExpression" && node.right === preceding) && // Before the `)` of those parentheses. A comment before the `;` of a
+    // `return` without them lies outside the statement for Prettier,
+    // which ends it before the `;` (see `takeCommentsBeforeFinalSemicolon`)
+    getNextNonSpaceNonCommentCharacter(comment.end) === ")") {
+      addTrailingComment(
+        preceding.type === "SequenceExpression" ? (
+          /** @type {AST.Node} */
+          preceding.expressions.at(-1)
+        ) : preceding.right,
+        comment
+      );
+      return true;
+    }
+    if (ownLine && node.type === "TSMappedType" && preceding && getNextNonSpaceNonCommentCharacter(comment.end) === "]") {
+      addTrailingComment(preceding, comment);
+      return true;
+    }
+    if (node.type === "TSTypeParameter" && preceding && following && preceding === node.constraint) {
+      const hasLineComment = !!/** @type {AST.NodeWithMaybeComments} */
+      preceding.trailingComments?.some(
+        (trailing) => trailing.type === "Line"
+      );
+      const defaultStart = (
+        /** @type {AST.NodeWithLocation} */
+        following.start
+      );
+      if (!trailsTypeParameterPart(comment, "=", defaultStart, hasLineComment)) {
+        return false;
+      }
+      addTrailingComment(preceding, comment);
+      return true;
+    }
+    if (endOfLine && isObjectProperty(enclosing)) {
+      addLeadingComment(enclosing, comment);
+      return true;
+    }
+    if ((type === "VariableDeclarator" || type === "AssignmentExpression" || type === "TSTypeAliasDeclaration") && following) {
+      const value = (
+        /** @type {AST.Node & AST.NodeWithLocation} */
+        following
+      );
+      const isAlias = type === "TSTypeAliasDeclaration";
+      if (isAlias && endOfLine && comment.type === "Line" && preceding && (following === node.typeAnnotation || following === node.typeParameters)) {
+        addLeadingComment(node.typeAnnotation, comment);
+        return true;
+      }
+      if (endOfLine && (comment.type === "Block" || isComplexAssignedValue(value)) || isAlias && following === node.typeAnnotation && !ownLine && comment.start >= findOutsideComments("=", (node.typeParameters ?? node.id).end, value.start)) {
+        addLeadingCommentToPossibleUnionType(value, comment);
+        return true;
+      }
+    }
+    if (endOfLine && preceding && following && following === getReturnType(enclosing)) {
+      addTrailingComment(preceding, comment);
+      return true;
+    }
+    if (endOfLine && preceding && (node.type === "BinaryExpression" || node.type === "LogicalExpression" || node.type === "ConditionalExpression" || node.type === "TSConditionalType" || node.type === "TSUnionType" || node.type === "AssignmentPattern" || node.type === "TSMappedType" || following && (type === "VariableDeclarator" || type === "AssignmentExpression" || type === "TSTypeAliasDeclaration" || type === "ImportAttribute" || type === "PropertyDefinition" || type === "AccessorProperty" || type === "TSAbstractPropertyDefinition" || type === "TSAbstractAccessorProperty" || type === "ForStatement" && following !== node.body))) {
       addTrailingComment(preceding, comment);
       return true;
     }
     return false;
   }
+  function getSignatureParameters(node) {
+    const signature = (
+      /** @type {any} */
+      node
+    );
+    return isFunctionNode(node) || node?.type === "TSDeclareFunction" ? signature.params : isTypeSignatureNode(node) ? signature.parameters : null;
+  }
+  function getReturnType(node) {
+    const signature = (
+      /** @type {any} */
+      node
+    );
+    return signature?.returnType ?? (isTypeSignatureNode(node) ? signature.typeAnnotation : null) ?? null;
+  }
+  function isTypeSignatureNode(node) {
+    return node?.type === "TSFunctionType" || node?.type === "TSConstructorType" || node?.type === "TSCallSignatureDeclaration" || node?.type === "TSConstructSignatureDeclaration" || node?.type === "TSMethodSignature";
+  }
+  function breakTies(node, parent, following) {
+    const first = (
+      /** @type {AST.CommentWithLocation} */
+      comments[0]
+    );
+    const isRemaining = (comment) => !isOwnLineComment(comment) && !isEndOfLineComment(comment);
+    const type = (
+      /** @type {any} */
+      parent.statementType ?? parent.type
+    );
+    if (!following || type === "IfStatement" || type.startsWith("JSX") || !isRemaining(first)) {
+      return "none";
+    }
+    const nextIndex2 = getNextNonSpaceNonCommentCharacterIndex(first.end);
+    const next = source[nextIndex2];
+    const call2 = (
+      /** @type {any} */
+      parent
+    );
+    if (next === ")" && (node.type === "FunctionExpression" || node.type === "ArrowFunctionExpression") && (parent.type === "CallExpression" && call2.callee === node || parent.type === "TaggedTemplateExpression" && call2.tag === node)) {
+      addTrailingComment(
+        node,
+        /** @type {AST.CommentWithLocation} */
+        comments.shift()
+      );
+      return "trail";
+    }
+    if (
+      // Prettier gives a comment before a `)` to the node before it too, but
+      // prints it after the parentheses, where its next pass may give it to
+      // the node after them: `(a /* c */)(x)`
+      next === ")" || // A JSDoc type cast keeps to its parentheses (see `handleComment`)
+      isTypeCastComment(first) && next === "(" || // `handleCommentAfterArrowParams`
+      parent.type === "ArrowFunctionExpression" && source.startsWith("=>", nextIndex2)
+    ) {
+      return "none";
+    }
+    const property = (
+      /** @type {any} */
+      parent
+    );
+    if (next === "(" && (parent.type === "FunctionDeclaration" || parent.type === "FunctionExpression" || parent.type === "MethodDefinition" || parent.type === "Property" && property.key === node && node.type === "Identifier" && getNextNonSpaceNonCommentCharacter(
+      /** @type {AST.NodeWithLocation} */
+      node.end
+    ) !== ":")) {
+      addTrailingComment(
+        node,
+        /** @type {AST.CommentWithLocation} */
+        comments.shift()
+      );
+      return "trail";
+    }
+    let count = 1;
+    while (comments[count] && isRemaining(comments[count])) {
+      const neighbors = getCommentNeighbors(comments[count], parent);
+      if (neighbors?.preceding !== node || neighbors.following !== following) break;
+      count++;
+    }
+    let gapEnd = (
+      /** @type {AST.NodeWithLocation} */
+      following.start
+    );
+    let firstLeading = count;
+    while (firstLeading > 0 && /^[\s(]*$/.test(source.slice(comments[firstLeading - 1].end, gapEnd))) {
+      firstLeading--;
+      gapEnd = comments[firstLeading].start;
+    }
+    for (let i2 = 0; i2 < firstLeading; i2++) {
+      addTrailingComment(
+        node,
+        /** @type {AST.CommentWithLocation} */
+        comments.shift()
+      );
+    }
+    return firstLeading < count ? "lead" : "trail";
+  }
   return {
     /**
      * @type {Parse.Options['onComment']}
      */
-    onComment: (block2, value, start, end, start_loc, end_loc, metadata) => {
+    onComment: (block2, value, start, end, start_loc, end_loc) => {
       if (block2 && /\n/.test(value)) {
         let a = start;
         while (a > 0 && source[a - 1] !== "\n") a -= 1;
@@ -13271,8 +14059,7 @@ function get_comment_handlers(source, comments, index = 0) {
         loc: {
           start: start_loc,
           end: end_loc
-        },
-        context: metadata ?? null
+        }
       });
     },
     /**
@@ -13280,13 +14067,12 @@ function get_comment_handlers(source, comments, index = 0) {
      */
     add_comments: (ast) => {
       if (comments.length === 0) return;
-      comments = comments.filter((comment) => comment.start >= index).map(({ type, value, start, end, loc, context }) => ({
+      comments = comments.filter((comment) => comment.start >= index).map(({ type, value, start, end, loc }) => ({
         type,
         value,
         start,
         end,
-        loc,
-        context
+        loc
       }));
       for (const comment of comments) {
         commentsByStart.set(comment.start, comment);
@@ -13294,10 +14080,12 @@ function get_comment_handlers(source, comments, index = 0) {
       }
       walk(ast, null, {
         _(node, { next, path, visit }) {
-          const metadata = (
-            /** @type {AST.Node} */
-            node?.metadata
+          const type = (
+            /** @type {string} */
+            node.type
           );
+          if (type === "Line" || type === "Block") return;
+          if (isTypeParameterName(node, path.at(-1))) return;
           function isCommentInsideAttributeExpression() {
             for (let i2 = path.length - 1; i2 >= 0; i2--) {
               const ancestor = path[i2];
@@ -13310,7 +14098,7 @@ function get_comment_handlers(source, comments, index = 0) {
           function isCommentInsideUnvisitedAttribute(comment) {
             for (let i2 = path.length - 1; i2 >= 0; i2--) {
               const ancestor = path[i2];
-              if (ancestor.type === "JSXAttribute") {
+              if (ancestor.type === "JSXAttribute" || ancestor.type === "JSXSpreadAttribute") {
                 return false;
               }
               if (isNativeTemplateElement(ancestor)) {
@@ -13322,14 +14110,6 @@ function get_comment_handlers(source, comments, index = 0) {
               }
             }
             return false;
-          }
-          function getEmptyElementInnerCommentTarget(comment) {
-            const element2 = path.findLast((ancestor) => isNativeTemplateNode(ancestor));
-            const openingEnd = element2?.type === "JSXFragment" ? element2.openingFragment?.end : element2?.openingElement?.end;
-            if (!element2 || !isEmptyTemplateNode(element2) || openingEnd === void 0 || !(comment.start >= openingEnd && comment.end <= element2.end)) {
-              return null;
-            }
-            return element2;
           }
           if (node.type === "StyleSheet") {
             const styleElement = path.findLast(
@@ -13345,25 +14125,11 @@ function get_comment_handlers(source, comments, index = 0) {
             return;
           }
           const emptyParent = path.at(-1);
-          if (node.type === "EmptyStatement" && isListEntry(node, emptyParent)) {
+          if (node.type === "EmptyStatement" && isListEntry(node, emptyParent) || node.type === "TemplateElement") {
             return;
           }
-          if (metadata && metadata.commentContainerId !== void 0) {
-            const isEmptyElement = isEmptyTemplateNode(node);
-            if (!isEmptyElement) {
-              while (comments[0] && comments[0].context && comments[0].context.containerId === metadata.commentContainerId && comments[0].context.beforeMeaningfulChild) {
-                const commentStart = comments[0].start;
-                const isInsideChildElement = node_children(node).some(
-                  (child) => child && child.start !== void 0 && child.end !== void 0 && commentStart >= child.start && commentStart < child.end
-                );
-                if (isInsideChildElement) break;
-                const elementComment = (
-                  /** @type {AST.CommentWithLocation} */
-                  comments.shift()
-                );
-                (metadata.elementLeadingComments ||= []).push(elementComment);
-              }
-            }
+          if (emptyParent?.type === "Property" && emptyParent.shorthand && emptyParent.key === node && emptyParent.value.type === "AssignmentPattern") {
+            return;
           }
           while (comments[0] && comments[0].start < getCommentStart(node)) {
             if (isCommentInsideUnvisitedAttribute(
@@ -13371,18 +14137,6 @@ function get_comment_handlers(source, comments, index = 0) {
               comments[0]
             )) {
               break;
-            }
-            const maybeInner = getEmptyElementInnerCommentTarget(
-              /** @type {AST.CommentWithLocation} */
-              comments[0]
-            );
-            if (maybeInner) {
-              pushInnerComment(
-                maybeInner,
-                /** @type {AST.CommentWithLocation} */
-                comments.shift()
-              );
-              continue;
             }
             const comment = (
               /** @type {AST.CommentWithLocation} */
@@ -13414,7 +14168,7 @@ function get_comment_handlers(source, comments, index = 0) {
             );
             if (isHandledEnclosingNode(enclosing) || skipParenthesizedTypes(node)?.type === "TSUnionType") {
               const neighbors = getCommentNeighbors(comment, enclosing);
-              if (neighbors?.following === node && handleComment(comment, enclosing, neighbors.preceding, node)) {
+              if (neighbors?.following === node && handleComment(comment, enclosing, neighbors.preceding, node, path.at(-2))) {
                 continue;
               }
             }
@@ -13422,16 +14176,14 @@ function get_comment_handlers(source, comments, index = 0) {
               (node.leadingComments ||= []).push(comment);
               continue;
             }
-            const ancestorElements = path.filter(has_location).filter(isNativeTemplateNode).sort((a, b) => a.loc.start.line - b.loc.start.line);
-            const targetAncestor = ancestorElements.find(
-              (ancestor) => comment.loc.start.line < ancestor.loc.start.line
-            );
-            if (targetAncestor) {
-              const targetMetadata = getNodeMetadata(targetAncestor);
-              (targetMetadata.elementLeadingComments ||= []).push(comment);
-              continue;
-            }
             (node.leadingComments ||= []).push(comment);
+          }
+          if (node.type === "TSTypeParameter") {
+            takeTypeParameterNameComments(
+              /** @type {AST.TSTypeParameter & AST.NodeWithLocation} */
+              node,
+              path.at(-1)
+            );
           }
           const element = (
             /** @type {AST.TSRXElementNode} */
@@ -13474,25 +14226,25 @@ function get_comment_handlers(source, comments, index = 0) {
           if (comments[0]) {
             if (node.type === "Program" && hasOnlyEmptyStatements(node.body)) {
               while (comments.length) {
-                const comment = (
+                const comment2 = (
                   /** @type {AST.CommentWithLocation} */
                   comments.shift()
                 );
-                (node.innerComments ||= []).push(comment);
+                (node.innerComments ||= []).push(comment2);
               }
               if (node.innerComments && node.innerComments.length > 0) {
                 return;
               }
             }
-            if ((node.type === "BlockStatement" || node.type === "StaticBlock" || node.type === "TSModuleBlock") && hasOnlyEmptyStatements(node.body) || (node.type === "TSInterfaceBody" || node.type === "ClassBody") && node.body.length === 0 || node.type === "SwitchStatement" && node.cases.length === 0 || (node.type === "TSTypeLiteral" || node.type === "TSEnumDeclaration") && node.members.length === 0) {
+            if ((node.type === "BlockStatement" || node.type === "StaticBlock" || node.type === "TSModuleBlock") && hasOnlyEmptyStatements(node.body) || (node.type === "TSInterfaceBody" || node.type === "ClassBody") && node.body.length === 0 || (node.type === "SwitchStatement" || node.type === "JSXSwitchExpression") && node.cases.length === 0 || (node.type === "TSTypeLiteral" || node.type === "TSEnumBody") && node.members.length === 0) {
               while (comments[0] && comments[0].start < /** @type {AST.NodeWithLocation} */
               node.end && comments[0].end < /** @type {AST.NodeWithLocation} */
               node.end) {
-                const comment = (
+                const comment2 = (
                   /** @type {AST.CommentWithLocation} */
                   comments.shift()
                 );
-                (node.innerComments ||= []).push(comment);
+                (node.innerComments ||= []).push(comment2);
               }
               if (node.innerComments && node.innerComments.length > 0) {
                 return;
@@ -13534,7 +14286,7 @@ function get_comment_handlers(source, comments, index = 0) {
                 return;
               }
             }
-            if (node.type === "JSXOpeningFragment") {
+            if (node.type === "JSXOpeningFragment" || node.type === "JSXClosingFragment") {
               while (comments[0] && comments[0].start > /** @type {AST.NodeWithLocation} */
               node.start && comments[0].end < /** @type {AST.NodeWithLocation} */
               node.end) {
@@ -13548,15 +14300,30 @@ function get_comment_handlers(source, comments, index = 0) {
                 return;
               }
             }
+            if ((node.type === "JSXOpeningElement" && !node.selfClosing || node.type === "JSXOpeningFragment") && comments[0].start >= /** @type {AST.NodeWithLocation} */
+            node.end) {
+              return;
+            }
+            const jsxParent = (
+              /** @type {AST.Node | undefined} */
+              path.at(-1)
+            );
+            const comment = comments[0];
+            if ((jsxParent?.type === "JSXElement" || jsxParent?.type === "JSXFragment") && /** @type {AST.Node[]} */
+            jsxParent.children.some(
+              (sibling2) => isCommentInEmptyContainer(comment, sibling2)
+            )) {
+              return;
+            }
             if (node.type === "JSXEmptyExpression") {
               while (comments[0] && comments[0].start >= /** @type {AST.NodeWithLocation} */
               node.start && comments[0].end <= /** @type {AST.NodeWithLocation} */
               node.end) {
-                const comment = (
+                const comment2 = (
                   /** @type {AST.CommentWithLocation} */
                   comments.shift()
                 );
-                (node.innerComments ||= []).push(comment);
+                (node.innerComments ||= []).push(comment2);
               }
               if (node.innerComments && node.innerComments.length > 0) {
                 return;
@@ -13566,11 +14333,11 @@ function get_comment_handlers(source, comments, index = 0) {
               while (comments[0] && comments[0].start < /** @type {AST.NodeWithLocation} */
               node.end && comments[0].end < /** @type {AST.NodeWithLocation} */
               node.end) {
-                const comment = (
+                const comment2 = (
                   /** @type {AST.CommentWithLocation} */
                   comments.shift()
                 );
-                pushInnerComment(node, comment);
+                pushInnerComment(node, comment2);
               }
               if (hasInnerComments(node)) {
                 return;
@@ -13591,12 +14358,12 @@ function get_comment_handlers(source, comments, index = 0) {
               }
             }
             if (!keepsCommentsAfterChildren(node)) {
-              const nodeEnd = (
+              const nodeEnd2 = (
                 /** @type {AST.NodeWithLocation} */
                 node.end
               );
-              const semicolon2 = statementsEndingBeforeSemicolon.has(node.type) && source[nodeEnd - 1] === ";" ? nodeEnd - 1 : -1;
-              while (comments[0] && comments[0].end <= nodeEnd) {
+              const semicolon2 = statementsEndingBeforeSemicolon.has(node.type) && source[nodeEnd2 - 1] === ";" ? nodeEnd2 - 1 : -1;
+              while (comments[0] && comments[0].end <= nodeEnd2) {
                 if (semicolon2 >= 0 && isBlankBetween(comments[0].end, semicolon2, false)) break;
                 const neighbors = getCommentNeighbors(comments[0], node);
                 if (!neighbors?.preceding || neighbors.following) break;
@@ -13610,30 +14377,94 @@ function get_comment_handlers(source, comments, index = 0) {
                 return;
               }
             }
+            const nodeEnd = (
+              /** @type {AST.NodeWithLocation} */
+              node.end
+            );
+            let castNode = (
+              /** @type {AST.Node & AST.NodeWithLocation} */
+              node
+            );
+            let castEnd = getTypeCastEnd(castNode);
+            for (let i2 = path.length - 1; castEnd < 0 && i2 >= 0 && /** @type {AST.NodeWithLocation} */
+            path[i2].end === nodeEnd; i2--) {
+              castNode = /** @type {AST.Node & AST.NodeWithLocation} */
+              path[i2];
+              castEnd = getTypeCastEnd(castNode);
+            }
+            while (comments[0] && comments[0].start >= nodeEnd && comments[0].end <= castEnd) {
+              addTrailingComment(
+                castNode,
+                /** @type {AST.CommentWithLocation} */
+                comments.shift()
+              );
+            }
+            if (comments.length === 0) {
+              return;
+            }
             const parent = (
               /** @type {AST.Node & AST.NodeWithLocation} */
               path.at(-1)
             );
-            if (isHandledEnclosingNode(parent)) {
-              while (comments[0]) {
-                const neighbors = getCommentNeighbors(comments[0], parent);
-                if (neighbors?.preceding !== node || !handleComment(comments[0], parent, node, neighbors.following)) {
-                  break;
+            if (parent?.type === "TemplateLiteral") {
+              const index2 = parent.expressions.indexOf(
+                /** @type {any} */
+                node
+              );
+              if (index2 >= 0) {
+                const nextQuasi = (
+                  /** @type {AST.NodeWithLocation} */
+                  parent.quasis[index2 + 1]
+                );
+                const nextType = path.at(-2)?.type === "TSLiteralType" ? parent.expressions[index2 + 1] : null;
+                while (comments[0] && comments[0].end <= nextQuasi.start && !(nextType && isOwnLineComment(comments[0]))) {
+                  addTrailingComment(
+                    /** @type {AST.Node} */
+                    node,
+                    /** @type {AST.CommentWithLocation} */
+                    comments.shift()
+                  );
                 }
-                comments.shift();
-              }
-              if (comments.length === 0) {
-                return;
+                if (comments.length === 0) {
+                  return;
+                }
               }
             }
-            if (
-              /** @type {AST.NodeWithLocation} */
-              node.end <= comments[0].start && takeCommentsBeforeFinalSemicolon(
+            while (comments[0]) {
+              const neighbors = getCommentNeighbors(comments[0], parent);
+              if (neighbors?.preceding !== node) {
+                break;
+              }
+              const operand = (
                 /** @type {AST.NodeWithLocation} */
-                node,
-                path
-              )
-            ) {
+                node
+              );
+              if (!neighbors.following && (takeCommentsBeforeOperandParens(operand, path) || takeCommentsInArrowBodyParens(operand, path)) || takeCommentsAfterArrowChain(operand, path)) {
+                continue;
+              }
+              if (isHandledEnclosingNode(parent) && handleComment(comments[0], parent, node, neighbors.following, path.at(-2))) {
+                comments.shift();
+                continue;
+              }
+              const ties = breakTies(node, parent, neighbors.following);
+              if (ties === "lead") {
+                return;
+              }
+              if (ties === "none") {
+                break;
+              }
+            }
+            if (comments.length === 0) {
+              return;
+            }
+            if ((nodeEnd <= comments[0].start || getKeywordOnlyStatementEnd(
+              /** @type {AST.NodeWithLocation} */
+              node
+            ) >= 0) && takeCommentsBeforeFinalSemicolon(
+              /** @type {AST.NodeWithLocation} */
+              node,
+              path
+            )) {
               return;
             }
             const ifStatement = (
@@ -13641,30 +14472,30 @@ function get_comment_handlers(source, comments, index = 0) {
               parent
             );
             if (ifStatement && (ifStatement.statementType ?? ifStatement.type) === "IfStatement" && ifStatement.alternate && ifStatement.consequent === node) {
-              const nodeEnd = (
+              const nodeEnd2 = (
                 /** @type {AST.NodeWithLocation} */
                 node.end
               );
               const elseStart = findOutsideComments(
                 "else",
-                nodeEnd,
+                nodeEnd2,
                 /** @type {AST.NodeWithLocation} */
                 ifStatement.alternate.start
               );
               while (comments[0] && comments[0].end <= elseStart) {
-                const comment = (
+                const comment2 = (
                   /** @type {AST.CommentWithLocation} */
                   comments.shift()
                 );
-                if (node.type !== "BlockStatement" && !source.slice(nodeEnd, comment.end).includes("\n")) {
-                  (node.trailingComments ||= []).push(comment);
+                if (node.type !== "BlockStatement" && !source.slice(nodeEnd2, comment2.end).includes("\n")) {
+                  (node.trailingComments ||= []).push(comment2);
                 } else {
-                  pushInnerComment(ifStatement, comment);
+                  pushInnerComment(ifStatement, comment2);
                 }
               }
               return;
             }
-            if (parent === void 0 || node.end !== parent.end) {
+            if (parent === void 0 || node.end !== parent.end || parent.type === "Program") {
               let is_last_in_array = false;
               let node_array = null;
               let isParam = false;
@@ -13696,16 +14527,15 @@ function get_comment_handlers(source, comments, index = 0) {
                   node_array = parent.params;
                 } else if (parent.type === "TSTupleType") {
                   node_array = parent.elementTypes;
-                } else if (parent.type === "TSEnumDeclaration") {
-                  if (node !== parent.id) {
-                    node_array = parent.members;
-                  }
-                } else if (isFunctionNode(parent)) {
-                  if (parent.params.includes(
-                    /** @type {any} */
-                    node
-                  )) {
-                    node_array = parent.params;
+                } else if (parent.type === "TSEnumBody") {
+                  node_array = parent.members;
+                } else if (getSignatureParameters(parent)) {
+                  const params = (
+                    /** @type {AST.Node[]} */
+                    getSignatureParameters(parent)
+                  );
+                  if (params.includes(node)) {
+                    node_array = params;
                     isParam = true;
                   }
                 } else if (parent.type === "JSXOpeningElement" && parent.attributes.includes(
@@ -13785,15 +14615,6 @@ function get_comment_handlers(source, comments, index = 0) {
                     if (trailingCommentBoundary !== void 0 && potentialComment.start >= trailingCommentBoundary) {
                       break;
                     }
-                    const maybeInner = getEmptyElementInnerCommentTarget(potentialComment);
-                    if (maybeInner) {
-                      pushInnerComment(
-                        maybeInner,
-                        /** @type {AST.CommentWithLocation} */
-                        comments.shift()
-                      );
-                      continue;
-                    }
                     const nextChar = getNextNonSpaceNonCommentCharacter(potentialComment.end);
                     if (nextChar === ")" || nextChar === "," && getNextNonSpaceNonCommentCharacter(
                       findOutsideComments(",", potentialComment.end, source.length) + 1
@@ -13808,20 +14629,11 @@ function get_comment_handlers(source, comments, index = 0) {
                   }
                 } else {
                   while (comments.length) {
-                    const comment = comments[0];
-                    if (trailingCommentBoundary !== void 0 && comment.start >= trailingCommentBoundary) {
+                    const comment2 = comments[0];
+                    if (trailingCommentBoundary !== void 0 && comment2.start >= trailingCommentBoundary) {
                       break;
                     }
-                    const maybeInner = getEmptyElementInnerCommentTarget(comment);
-                    if (maybeInner) {
-                      pushInnerComment(
-                        maybeInner,
-                        /** @type {AST.CommentWithLocation} */
-                        comments.shift()
-                      );
-                      continue;
-                    }
-                    (node.trailingComments ||= []).push(comment);
+                    (node.trailingComments ||= []).push(comment2);
                     comments.shift();
                   }
                 }
@@ -13829,18 +14641,6 @@ function get_comment_handlers(source, comments, index = 0) {
                 /** @type {AST.NodeWithLocation} */
                 node.end <= comments[0].start
               ) {
-                const maybeInner = getEmptyElementInnerCommentTarget(
-                  /** @type {AST.CommentWithLocation} */
-                  comments[0]
-                );
-                if (maybeInner) {
-                  pushInnerComment(
-                    maybeInner,
-                    /** @type {AST.CommentWithLocation} */
-                    comments.shift()
-                  );
-                  return;
-                }
                 const isAfterStatementHeader = slice.includes(")") && endsStatementHeader(node, parent) && getNextNonSpaceNonCommentCharacter(comments[0].end) !== ")";
                 const isAfterParent = !!parent && parent.end <= comments[0].start;
                 const opensNamedSpecifiers = parent?.type === "ImportDeclaration" && node.type !== "ImportSpecifier" && nextSibling?.type === "ImportSpecifier";
@@ -13872,7 +14672,7 @@ function get_comment_handlers(source, comments, index = 0) {
                   }
                   return;
                 }
-                const isCommaList = isParam || isArgument || parent?.type === "ArrayExpression" || parent?.type === "ObjectExpression" || parent?.type === "ObjectPattern" || parent?.type === "TSEnumDeclaration" || parent?.type === "TSTypeParameterInstantiation" || parent?.type === "TSTypeParameterDeclaration" || parent?.type === "TSTupleType" || parent?.type === "ImportDeclaration" || parent?.type === "ExportNamedDeclaration";
+                const isCommaList = isParam || isArgument || parent?.type === "ArrayExpression" || parent?.type === "ObjectExpression" || parent?.type === "ObjectPattern" || parent?.type === "TSEnumBody" || parent?.type === "TSTypeParameterInstantiation" || parent?.type === "TSTypeParameterDeclaration" || parent?.type === "TSTupleType" || parent?.type === "ImportDeclaration" || parent?.type === "ExportNamedDeclaration";
                 if (isCommaList && next_index > 0 && !is_last_in_array && nextSibling) {
                   const nextStart = (
                     /** @type {AST.NodeWithLocation} */
@@ -13894,7 +14694,7 @@ function get_comment_handlers(source, comments, index = 0) {
                     if (nextSibling && nextSibling.loc) {
                       const commentEndLine = comments[0].loc?.end?.line;
                       const nextSiblingStartLine = nextSibling.loc?.start?.line;
-                      if (commentEndLine === nextSiblingStartLine) {
+                      if (commentEndLine === nextSiblingStartLine || isTypeCastComment(comments[0]) && getNextNonSpaceNonCommentCharacter(comments[0].end) === "(") {
                         return;
                       }
                     }
@@ -14228,14 +15028,14 @@ var SHA2_32B = class extends HashMD {
     super(64, outputLen, 8, false);
   }
   get() {
-    const { A, B, C, D, E, F, G, H } = this;
-    return [A, B, C, D, E, F, G, H];
+    const { A, B, C: C2, D, E, F, G, H } = this;
+    return [A, B, C2, D, E, F, G, H];
   }
   // prettier-ignore
-  set(A, B, C, D, E, F, G, H) {
+  set(A, B, C2, D, E, F, G, H) {
     this.A = A | 0;
     this.B = B | 0;
-    this.C = C | 0;
+    this.C = C2 | 0;
     this.D = D | 0;
     this.E = E | 0;
     this.F = F | 0;
@@ -14252,30 +15052,30 @@ var SHA2_32B = class extends HashMD {
       const s1 = rotr(W2, 17) ^ rotr(W2, 19) ^ W2 >>> 10;
       SHA256_W[i2] = s1 + SHA256_W[i2 - 7] + s0 + SHA256_W[i2 - 16] | 0;
     }
-    let { A, B, C, D, E, F, G, H } = this;
+    let { A, B, C: C2, D, E, F, G, H } = this;
     for (let i2 = 0; i2 < 64; i2++) {
       const sigma1 = rotr(E, 6) ^ rotr(E, 11) ^ rotr(E, 25);
       const T1 = H + sigma1 + Chi(E, F, G) + SHA256_K[i2] + SHA256_W[i2] | 0;
       const sigma0 = rotr(A, 2) ^ rotr(A, 13) ^ rotr(A, 22);
-      const T2 = sigma0 + Maj(A, B, C) | 0;
+      const T2 = sigma0 + Maj(A, B, C2) | 0;
       H = G;
       G = F;
       F = E;
       E = D + T1 | 0;
-      D = C;
-      C = B;
+      D = C2;
+      C2 = B;
       B = A;
       A = T1 + T2 | 0;
     }
     A = A + this.A | 0;
     B = B + this.B | 0;
-    C = C + this.C | 0;
+    C2 = C2 + this.C | 0;
     D = D + this.D | 0;
     E = E + this.E | 0;
     F = F + this.F | 0;
     G = G + this.G | 0;
     H = H + this.H | 0;
-    this.set(A, B, C, D, E, F, G, H);
+    this.set(A, B, C2, D, E, F, G, H);
   }
   roundClean() {
     clean(SHA256_W);
@@ -14306,13 +15106,1187 @@ var sha256 = /* @__PURE__ */ createHasher(
   /* @__PURE__ */ oidNist(1)
 );
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/utils/hashing.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/utils/hashing.js
 var regex_return_characters = /\r/g;
 function strong_hash(str) {
   return bytesToHex(sha256(utf8ToBytes(str.replace(regex_return_characters, "")))).slice(0, 8);
 }
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/parse/style.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/diagnostics.js
+var DIAGNOSTIC_CODES = {
+  /** An element has no closing tag before the end of its template. */
+  UNCLOSED_TAG: "TSRX1001",
+  /** A closing tag doesn't match the element it closes. */
+  MISMATCHED_CLOSING_TAG: "TSRX1002",
+  /** A closing tag with no element open. */
+  UNEXPECTED_CLOSING_TAG: "TSRX1003",
+  /** A `</script` in a `<script>` body that isn't its closing tag, where HTML would end the script. */
+  SCRIPT_END_TAG_IN_BODY: "TSRX1004",
+  /** A namespaced element name (`<foo:bar>`). */
+  NAMESPACED_ELEMENT: "TSRX1005",
+  /** A spread as an attribute's value (`a={...b}`). */
+  ATTRIBUTE_VALUE_SPREAD: "TSRX1006",
+  /** A `;` at the end of an expression container (`{a;}`). */
+  TEMPLATE_EXPRESSION_TRAILING_SEMICOLON: "TSRX1007",
+  /** A directive without its `{ … }` body. */
+  DIRECTIVE_BODY_EXPECTED: "TSRX1008",
+  /** A directive's next branch written without its `@` (`else`, `empty`, `pending`, `catch`). */
+  DIRECTIVE_BRANCH_EXPECTED: "TSRX1009",
+  /** An `@try` with neither `@catch` nor `@pending`. */
+  TRY_HANDLER_MISSING: "TSRX1010",
+  /** An `@for`'s `index` or `key` clause is incomplete or out of order. */
+  FOR_CLAUSE: "TSRX1011",
+  /** A `return` in a template. */
+  TEMPLATE_RETURN_STATEMENT: "TSRX2001",
+  /** A `return` in an `@if` body. */
+  IF_RETURN_STATEMENT: "TSRX2002",
+  /** A `break` in an `@if` body. */
+  IF_BREAK_STATEMENT: "TSRX2003",
+  /** A `continue` in an `@if` body. */
+  IF_CONTINUE_STATEMENT: "TSRX2004",
+  /** A `return` in an `@for` body. */
+  FOR_RETURN_STATEMENT: "TSRX2005",
+  /** A `break` in an `@for` body. */
+  FOR_BREAK_STATEMENT: "TSRX2006",
+  /** A `continue` in an `@for` body. */
+  FOR_CONTINUE_STATEMENT: "TSRX2007",
+  /** A `break` in an `@case` body. */
+  SWITCH_CASE_BREAK_STATEMENT: "TSRX2008",
+  /** A `return` in an `@case` body. */
+  SWITCH_CASE_RETURN_STATEMENT: "TSRX2009",
+  /** Template output nothing renders: not returned, assigned, or part of the output. */
+  FORGOTTEN_STATEMENT_CONTAINER: "TSRX2010",
+  /** A `@{ … }` body with more than one output node. */
+  CODE_BLOCK_SINGLE_OUTPUT: "TSRX2011",
+  /** A statement after a `@{ … }` body's output. */
+  CODE_BLOCK_STATEMENT_AFTER_OUTPUT: "TSRX2012",
+  /** A JSX spread child (`{...items}`), which parses but no target supports. */
+  JSX_SPREAD_CHILD: "TSRX2013",
+  /** A dynamic tag expression (`<{expr}>`) other than an identifier, a member access, or a string literal. */
+  DYNAMIC_TAG_EXPRESSION: "TSRX2014",
+  /** An `@for` over something other than `for…of`. */
+  FOR_OF_ONLY: "TSRX2015",
+  /** An element with more than one `ref` attribute. */
+  MULTIPLE_REFS: "TSRX2016",
+  /** An element nested where HTML doesn't allow it (`<p>` in `<p>`). */
+  INVALID_HTML_NESTING: "TSRX2017",
+  /** A JavaScript `try…finally` in a template. */
+  TEMPLATE_TRY_FINALLY: "TSRX2018",
+  /** A `try` in a template with neither a `pending` nor a `catch` block. */
+  TEMPLATE_TRY_HANDLER: "TSRX2019",
+  /** An `@pending` block on a target without it. */
+  TARGET_PENDING_UNSUPPORTED: "TSRX2020",
+  /** An `await` where the target can't await (in a callback, or in its components). */
+  TARGET_AWAIT_UNSUPPORTED: "TSRX2021",
+  /** A `yield` in a part of the template that runs in a callback. */
+  TARGET_YIELD_UNSUPPORTED: "TSRX2022",
+  /** A `super` in a part of the template that's lowered into a generator function. */
+  TARGET_SUPER_UNSUPPORTED: "TSRX2023",
+  /** A `for await…of` in a template on a target without it. */
+  TARGET_FOR_AWAIT_UNSUPPORTED: "TSRX2024",
+  /** A top-level `await` in a TSRX function without a module-level `"use server"`. */
+  TOP_LEVEL_AWAIT_USE_SERVER: "TSRX2025",
+  /** An `@catch` reset parameter on a target whose error boundary has none. */
+  TARGET_CATCH_RESET_UNSUPPORTED: "TSRX2026",
+  /** `<style apply>` carries no expression value. */
+  STYLE_APPLY_VALUE: "TSRX3001",
+  /** An `apply` entry is not an identifier, member, or array of those, or does not resolve to a style block. */
+  STYLE_APPLY_TARGET: "TSRX3002",
+  /** An `apply` target is declared after the applying block in source order. */
+  STYLE_APPLY_BEFORE_DECLARATION: "TSRX3003",
+  /** Two `apply` attributes on one `<style>` block. */
+  STYLE_APPLY_DUPLICATE: "TSRX3004",
+  /** `apply` on a `<head>` style or a resource (`href`) style. */
+  STYLE_APPLY_UNSUPPORTED_HOST: "TSRX3005",
+  /** An assigned style block authors a `.$class` class selector. */
+  STYLE_RESERVED_CLASS_KEY: "TSRX3006",
+  /** A standalone `<style>` block at module scope. */
+  STYLE_STANDALONE_AT_MODULE_SCOPE: "TSRX3007",
+  /** A standalone `<style>` block with CSS text outside any `@{ … }` or control-flow body. */
+  STYLE_STANDALONE_OUTSIDE_TEMPLATE: "TSRX3008",
+  /** A standalone `<style>` block in a statement slot: the lone output of a `@{ … }` or control-flow body, or a statement. */
+  STYLE_STANDALONE_NEEDS_FRAGMENT: "TSRX3009",
+  /** A `<style>` attribute other than `ref` and `apply`. */
+  STYLE_UNKNOWN_ATTRIBUTE: "TSRX3010",
+  /** `:global` used where the scoping rules do not allow it. */
+  CSS_GLOBAL_PLACEMENT: "TSRX3011",
+  /** An `@import` rule in a `<style>` block, whose rules would not be scoped. */
+  CSS_IMPORT: "TSRX3012",
+  /** CSS in a `<style>` block that doesn't parse. */
+  CSS_SYNTAX: "TSRX3013",
+  /** A recognized `import.meta.env.platform.*` flag is used without a selected platform. */
+  PLATFORM_REQUIRED: "TSRX4001",
+  /** A name that starts with the prefix the compiler reserves for its own identifiers. */
+  RESERVED_IDENTIFIER_PREFIX: "TSRX4002",
+  /** JavaScript syntax the parser rejects that TypeScript accepts (an escaped `import.meta`). */
+  JAVASCRIPT_SYNTAX: "TSRX4003"
+};
+function with_values(code, message) {
+  return Object.assign(
+    (...values) => ({ code, message: message(...values) }),
+    {
+      code
+    }
+  );
+}
+var C = DIAGNOSTIC_CODES;
+var TSRX_ERRORS = {
+  // TSRX1xxx
+  UNCLOSED_TAG: with_values(
+    C.UNCLOSED_TAG,
+    (tag) => `Unclosed tag '<${tag}>'. Expected '</${tag}>' before end of template.`
+  ),
+  MISMATCHED_CLOSING_TAG: with_values(
+    C.MISMATCHED_CLOSING_TAG,
+    (opening, closing) => `Expected closing tag to match opening tag. Expected '</${opening}>' but found '</${closing}>'`
+  ),
+  UNEXPECTED_CLOSING_TAG: { code: C.UNEXPECTED_CLOSING_TAG, message: "Unexpected closing tag" },
+  /** `written` is the `</script` as written, in any case. */
+  SCRIPT_END_TAG_IN_BODY: with_values(
+    C.SCRIPT_END_TAG_IN_BODY,
+    (written) => `'${written}' can end a script in HTML, so a '<script>' body can't contain it. Write '<\\/${written.slice(2)}' instead.`
+  ),
+  NAMESPACED_ELEMENT: with_values(
+    C.NAMESPACED_ELEMENT,
+    (tag) => `Namespaced elements are not supported in TSRX templates: <${tag}>.`
+  ),
+  ATTRIBUTE_VALUE_SPREAD: {
+    code: C.ATTRIBUTE_VALUE_SPREAD,
+    message: "Attribute values cannot be spread. Use a spread attribute (`{...props}`) instead."
+  },
+  TEMPLATE_EXPRESSION_TRAILING_SEMICOLON: {
+    code: C.TEMPLATE_EXPRESSION_TRAILING_SEMICOLON,
+    message: "TSRX expression containers do not use semicolons. Remove this semicolon."
+  },
+  DIRECTIVE_BODY_EXPECTED: {
+    code: C.DIRECTIVE_BODY_EXPECTED,
+    message: "Expected `{` after JSX control-flow directive."
+  },
+  /** `branch` is the branch written without its `@`, and `directive` the directive it belongs to. */
+  DIRECTIVE_BRANCH_EXPECTED: with_values(
+    C.DIRECTIVE_BRANCH_EXPECTED,
+    (branch, directive) => `Expected \`@${branch}\` after \`@${directive}\` block.`
+  ),
+  TRY_HANDLER_MISSING: {
+    code: C.TRY_HANDLER_MISSING,
+    message: "Missing `@catch` or `@pending` after `@try` block."
+  },
+  FOR_INDEX_NAME_EXPECTED: {
+    code: C.FOR_CLAUSE,
+    message: 'Expected identifier after "index" keyword'
+  },
+  FOR_INDEX_AFTER_KEY: {
+    code: C.FOR_CLAUSE,
+    message: '"index" must come before "key" in for-of loop'
+  },
+  // TSRX2xxx
+  TEMPLATE_RETURN_STATEMENT: {
+    code: C.TEMPLATE_RETURN_STATEMENT,
+    message: "Return statements are not allowed inside TSRX templates. Move the return before the TSRX return value, or use conditional rendering instead."
+  },
+  IF_RETURN_STATEMENT: {
+    code: C.IF_RETURN_STATEMENT,
+    message: "Return statements are not allowed inside TSRX template @if blocks. Move the return before the template output or render conditionally instead."
+  },
+  IF_BREAK_STATEMENT: {
+    code: C.IF_BREAK_STATEMENT,
+    message: "Break statements are not allowed inside TSRX template @if blocks."
+  },
+  IF_CONTINUE_STATEMENT: {
+    code: C.IF_CONTINUE_STATEMENT,
+    message: "Continue statements are not allowed inside TSRX template @if blocks. Filter before rendering or use conditional output instead."
+  },
+  FOR_RETURN_STATEMENT: {
+    code: C.FOR_RETURN_STATEMENT,
+    message: "Return statements are not allowed inside TSRX template for...of loops. Filter the iterable before rendering or use an @empty fallback for empty lists."
+  },
+  FOR_BREAK_STATEMENT: {
+    code: C.FOR_BREAK_STATEMENT,
+    message: "Break statements are not allowed inside TSRX template for...of loops."
+  },
+  FOR_CONTINUE_STATEMENT: {
+    code: C.FOR_CONTINUE_STATEMENT,
+    message: "Continue statements are not allowed inside TSRX template for...of loops. Filter the iterable before rendering."
+  },
+  SWITCH_CASE_BREAK_STATEMENT: {
+    code: C.SWITCH_CASE_BREAK_STATEMENT,
+    message: "`break` is invalid inside `@switch` cases."
+  },
+  SWITCH_CASE_RETURN_STATEMENT: {
+    code: C.SWITCH_CASE_RETURN_STATEMENT,
+    message: "`return` is invalid inside `@switch` cases."
+  },
+  FORGOTTEN_STATEMENT_CONTAINER: {
+    code: C.FORGOTTEN_STATEMENT_CONTAINER,
+    message: "This TSRX template output is unused. Return it, assign it to a value that is rendered, or make it part of the rendered output of a function '@{...}' body."
+  },
+  CODE_BLOCK_SINGLE_OUTPUT: {
+    code: C.CODE_BLOCK_SINGLE_OUTPUT,
+    message: "A code block renders a single node; wrap multiple nodes or text in a fragment '<>\u2026</>'."
+  },
+  CODE_BLOCK_STATEMENT_AFTER_OUTPUT: {
+    code: C.CODE_BLOCK_STATEMENT_AFTER_OUTPUT,
+    message: "Code must be at the top of '@{ }'; statements cannot follow the rendered output."
+  },
+  JSX_SPREAD_CHILD: {
+    code: C.JSX_SPREAD_CHILD,
+    message: "JSX spread children (`{...items}`) are not supported. Render the array as an expression child instead: `{items}`."
+  },
+  DYNAMIC_TAG_EXPRESSION: {
+    code: C.DYNAMIC_TAG_EXPRESSION,
+    message: "A dynamic tag expression must be an identifier, a member access such as `props.as` or `registry[name]`, or a string literal. Compute anything else before the element: `const Tag = c ? Child : Fallback;`, then `<{Tag} />`."
+  },
+  FOR_OF_ONLY: {
+    code: C.FOR_OF_ONLY,
+    message: "TSRX `@for` currently supports `for...of` loops in template output."
+  },
+  FOR_STATEMENT: {
+    code: C.FOR_OF_ONLY,
+    message: "For loops are not supported in TSRX templates. Use for...of instead."
+  },
+  FOR_IN_STATEMENT: {
+    code: C.FOR_OF_ONLY,
+    message: "For...in loops are not supported in TSRX templates. Use for...of instead."
+  },
+  WHILE_STATEMENT: {
+    code: C.FOR_OF_ONLY,
+    message: "While loops are not supported in TSRX templates. Move the while loop into a function."
+  },
+  DO_WHILE_STATEMENT: {
+    code: C.FOR_OF_ONLY,
+    message: "Do...while loops are not supported in TSRX templates. Move the do...while loop into a function."
+  },
+  MULTIPLE_REFS: {
+    code: C.MULTIPLE_REFS,
+    message: "Element has multiple `ref={...}` attributes; an element may have at most one. Use a single array-valued ref such as `ref={[a, b]}` where the target framework supports multiple refs."
+  },
+  INVALID_HTML_NESTING: with_values(
+    C.INVALID_HTML_NESTING,
+    (tag, parent) => `Invalid HTML nesting: <${tag}> cannot be a descendant of <${parent}>.`
+  ),
+  /** `target` is the target's name. */
+  TEMPLATE_TRY_FINALLY: with_values(
+    C.TEMPLATE_TRY_FINALLY,
+    (target) => `${target} TSRX does not support JavaScript \`try/finally\` in TSRX templates. \`finally\` is not part of TSRX control flow; move the try/finally into a function if you need cleanup logic.`
+  ),
+  TEMPLATE_TRY_HANDLER: {
+    code: C.TEMPLATE_TRY_HANDLER,
+    message: "TSRX try statements must have a `pending` or `catch` block."
+  },
+  /** `target` is the target's name. */
+  TARGET_AWAIT_UNSUPPORTED: with_values(
+    C.TARGET_AWAIT_UNSUPPORTED,
+    (target) => `${target} TSRX does not support \`await\` here: this part of the template renders through a callback the target calls, so its result cannot be awaited. Await the value in the component body, or move it into an async child component.`
+  ),
+  /** `target` is the target's name. */
+  TARGET_YIELD_UNSUPPORTED: with_values(
+    C.TARGET_YIELD_UNSUPPORTED,
+    (target) => `${target} TSRX does not support \`yield\` here: this part of the template runs in a callback, which cannot yield from the enclosing generator. Yield the value in the function body first.`
+  ),
+  /** `target` is the target's name. */
+  TARGET_SUPER_UNSUPPORTED: with_values(
+    C.TARGET_SUPER_UNSUPPORTED,
+    (target) => `${target} TSRX does not support \`super\` here: this part of the template also yields, so it is lowered into a generator function, where \`super\` is unavailable. Read the value into a variable in the method body first.`
+  ),
+  /** `target` is the target's name. */
+  TARGET_FOR_AWAIT_UNSUPPORTED: with_values(
+    C.TARGET_FOR_AWAIT_UNSUPPORTED,
+    (target) => `${target} TSRX does not support \`for await...of\` in TSRX templates.`
+  ),
+  TOP_LEVEL_AWAIT_USE_SERVER: {
+    code: C.TOP_LEVEL_AWAIT_USE_SERVER,
+    message: 'Top-level `await` in TSRX functions requires a module-level `"use server"` directive.'
+  },
+  // TSRX3xxx
+  STYLE_APPLY_VALUE: {
+    code: C.STYLE_APPLY_VALUE,
+    message: "The 'apply' attribute of a <style> block requires an expression value: apply={theme} or apply={[a, b]}."
+  },
+  STYLE_APPLY_TARGET: with_values(
+    C.STYLE_APPLY_TARGET,
+    (name) => `'${name}' is not a style block. An 'apply' target must be a variable, import, or member holding an assigned <style> block.`
+  ),
+  STYLE_APPLY_BEFORE_DECLARATION: with_values(
+    C.STYLE_APPLY_BEFORE_DECLARATION,
+    (name) => `'${name}' is applied before its declaration. Declare the style block before the block that applies it.`
+  ),
+  STYLE_APPLY_DUPLICATE: {
+    code: C.STYLE_APPLY_DUPLICATE,
+    message: "A <style> block accepts a single 'apply' attribute; pass several themes as an array: apply={[a, b]}."
+  },
+  STYLE_APPLY_UNSUPPORTED_HOST: {
+    code: C.STYLE_APPLY_UNSUPPORTED_HOST,
+    message: "The 'apply' attribute is only supported on scoped <style> blocks, not on <head> styles or resource styles."
+  },
+  STYLE_RESERVED_CLASS_KEY: {
+    code: C.STYLE_RESERVED_CLASS_KEY,
+    message: "'$class' is reserved on assigned <style> blocks for the block's scope hash; rename the '.$class' selector."
+  },
+  STYLE_STANDALONE_AT_MODULE_SCOPE: {
+    code: C.STYLE_STANDALONE_AT_MODULE_SCOPE,
+    message: "A standalone <style> block is only allowed inside a template scope. At module scope assign it: const theme = <style>\u2026</style>."
+  },
+  STYLE_STANDALONE_OUTSIDE_TEMPLATE: {
+    code: C.STYLE_STANDALONE_OUTSIDE_TEMPLATE,
+    message: "A standalone <style> block with CSS text is TSRX template syntax and needs an enclosing @{ \u2026 } body or an @if/@for/@switch/@try body. In plain TSX give <style> an expression child instead: <style>{css}</style>. To declare a reusable block here, assign it: const theme = <style>\u2026</style>."
+  },
+  STYLE_STANDALONE_NEEDS_FRAGMENT: {
+    code: C.STYLE_STANDALONE_NEEDS_FRAGMENT,
+    message: "A standalone <style> block must be a child of an element or a fragment. Wrap it with the output it styles in a fragment: <><style>\u2026</style><div>\u2026</div></>."
+  },
+  STYLE_UNKNOWN_ATTRIBUTE: with_values(
+    C.STYLE_UNKNOWN_ATTRIBUTE,
+    (name) => `Unknown <style> attribute '${name}'. Scoped style blocks accept 'ref' and 'apply'.`
+  ),
+  CSS_GLOBAL_IN_PSEUDOCLASS: {
+    code: C.CSS_GLOBAL_PLACEMENT,
+    message: "A :global selector cannot be inside a pseudoclass."
+  },
+  CSS_GLOBAL_IN_MIDDLE: {
+    code: C.CSS_GLOBAL_PLACEMENT,
+    message: ":global(...) can be at the start or end of a selector sequence, but not in the middle."
+  },
+  CSS_IMPORT: {
+    code: C.CSS_IMPORT,
+    message: "@import is not supported in <style> blocks: the imported rules would not be scoped. Share scoped styles with an assigned block (const theme = <style>\u2026</style>) and apply={theme}. For global CSS, use :global in the block, or import the stylesheet in JavaScript: import './global.css'."
+  },
+  // TSRX4xxx
+  PLATFORM_REQUIRED: {
+    code: C.PLATFORM_REQUIRED,
+    message: 'Platform flag usage requires a configured TSRX platform. Set `tsrx.platform` in tsconfig.json and pass the same `platform` to the build integration ("web", "ios", or "android").'
+  },
+  RESERVED_IDENTIFIER_PREFIX: with_values(
+    C.RESERVED_IDENTIFIER_PREFIX,
+    (name, prefix) => `Cannot declare a variable named "${name}" as identifiers starting with "${prefix}" are reserved`
+  ),
+  // acorn-typescript's wording, for `with { type: 'json', type: 'json' }`: an
+  // ECMAScript early error that TypeScript doesn't report.
+  DUPLICATED_ATTRIBUTE_KEY: { code: C.JAVASCRIPT_SYNTAX, message: "Duplicated key in attributes" }
+};
+var TS_ERRORS = {
+  // Tokens and names
+  /** `token` is the token expected, such as `}`. */
+  TOKEN_EXPECTED: with_values("TS1005", (token) => `'${token}' expected.`),
+  IDENTIFIER_EXPECTED: { code: "TS1003", message: "Identifier expected." },
+  RESERVED_WORD_AS_IDENTIFIER: with_values(
+    "TS1359",
+    (word) => `Identifier expected. '${word}' is a reserved word that cannot be used here.`
+  ),
+  IDENTIFIER_OR_STRING_EXPECTED: {
+    code: "TS1478",
+    message: "Identifier or string literal expected."
+  },
+  DECLARATION_EXPECTED: { code: "TS1146", message: "Declaration expected." },
+  DECLARATION_OR_STATEMENT_EXPECTED: {
+    code: "TS1128",
+    message: "Declaration or statement expected."
+  },
+  LINE_BREAK_NOT_PERMITTED: { code: "TS1142", message: "Line break not permitted here." },
+  KEYWORD_ESCAPE: { code: "TS1260", message: "Keywords cannot contain escape characters." },
+  // A private name outside any class (see `parsePrivateIdent` in `plugin.js`)
+  PRIVATE_IDENTIFIER_OUTSIDE_CLASS: {
+    code: "TS18016",
+    message: "Private identifiers are not allowed outside class bodies."
+  },
+  // The modifiers of a declaration, as TypeScript's checker words them
+  // (`checkGrammarModifiers`)
+  MODIFIER_ALREADY_SEEN: with_values(
+    "TS1030",
+    (modifier) => `'${modifier}' modifier already seen.`
+  ),
+  MODIFIER_MUST_PRECEDE: with_values(
+    "TS1029",
+    (modifier, other) => `'${modifier}' modifier must precede '${other}' modifier.`
+  ),
+  MODIFIER_CANNOT_BE_USED_WITH: with_values(
+    "TS1243",
+    (modifier, other) => `'${modifier}' modifier cannot be used with '${other}' modifier.`
+  ),
+  MODIFIER_IN_AMBIENT_CONTEXT: with_values(
+    "TS1040",
+    (modifier) => `'${modifier}' modifier cannot be used in an ambient context.`
+  ),
+  MODIFIER_CANNOT_BE_USED_HERE: with_values(
+    "TS1042",
+    (modifier) => `'${modifier}' modifier cannot be used here.`
+  ),
+  MODIFIER_ON_MODULE_ELEMENT: with_values(
+    "TS1044",
+    (modifier) => `'${modifier}' modifier cannot appear on a module or namespace element.`
+  ),
+  MODIFIER_ON_USING: with_values(
+    "TS1491",
+    (modifier) => `'${modifier}' modifier cannot appear on a 'using' declaration.`
+  ),
+  MODIFIER_ON_AWAIT_USING: with_values(
+    "TS1495",
+    (modifier) => `'${modifier}' modifier cannot appear on an 'await using' declaration.`
+  ),
+  MODIFIERS_CANNOT_APPEAR_HERE: { code: "TS1184", message: "Modifiers cannot appear here." },
+  ACCESSIBILITY_MODIFIER_ALREADY_SEEN: {
+    code: "TS1028",
+    message: "Accessibility modifier already seen."
+  },
+  READONLY_MODIFIER_NOT_ALLOWED: {
+    code: "TS1024",
+    message: "'readonly' modifier can only appear on a property declaration or index signature."
+  },
+  ACCESSOR_MODIFIER_NOT_ALLOWED: {
+    code: "TS1275",
+    message: "'accessor' modifier can only appear on a property declaration."
+  },
+  ABSTRACT_MODIFIER_NOT_ALLOWED: {
+    code: "TS1242",
+    message: "'abstract' modifier can only appear on a class, method, or property declaration."
+  },
+  DECLARE_MODIFIER_IN_AMBIENT_CONTEXT: {
+    code: "TS1038",
+    message: "A 'declare' modifier cannot be used in an already ambient context."
+  },
+  MODIFIER_ON_IMPORT: with_values(
+    "TS1079",
+    (modifier) => `A '${modifier}' modifier cannot be used with an import declaration.`
+  ),
+  EXPORT_MODIFIER_ON_AUGMENTATION: {
+    code: "TS2668",
+    message: "'export' modifier cannot be applied to ambient modules and module augmentations since they are always visible."
+  },
+  READONLY_TYPE_MODIFIER: {
+    code: "TS1354",
+    message: "'readonly' type modifier is only permitted on array and tuple literal types."
+  },
+  // An import or export inside a block, which acorn reports as `'import' and
+  // 'export' may only appear at the top level`, as TypeScript words it for each
+  // kind of import or export
+  NESTED_IMPORT: {
+    code: "TS1232",
+    message: "An import declaration can only be used at the top level of a namespace or module."
+  },
+  NESTED_EXPORT: {
+    code: "TS1233",
+    message: "An export declaration can only be used at the top level of a namespace or module."
+  },
+  NESTED_EXPORT_ASSIGNMENT: {
+    code: "TS1231",
+    message: "An export assignment must be at the top level of a file or module declaration."
+  },
+  NESTED_DEFAULT_EXPORT: {
+    code: "TS1258",
+    message: "A default export must be at the top level of a file or module declaration."
+  },
+  NESTED_NAMESPACE: {
+    code: "TS1235",
+    message: "A namespace declaration is only allowed at the top level of a namespace or module."
+  },
+  NESTED_GLOBAL_EXPORT: {
+    code: "TS1316",
+    message: "Global module exports may only appear at top level."
+  },
+  // `await` outside an async function, where only a namespace makes it parse
+  AWAIT_EXPRESSION_NOT_ALLOWED: {
+    code: "TS1308",
+    message: "'await' expressions are only allowed within async functions and at the top levels of modules."
+  },
+  FOR_AWAIT_NOT_ALLOWED: {
+    code: "TS1103",
+    message: "'for await' loops are only allowed within async functions and at the top levels of modules."
+  },
+  AWAIT_USING_NOT_ALLOWED: {
+    code: "TS2852",
+    message: "'await using' statements are only allowed within async functions and at the top levels of modules."
+  },
+  // TypeScript reports a deferred default import (TS18058) or named imports
+  // (TS18059); TSRX words both as one message
+  IMPORT_DEFER_NAMESPACE: {
+    code: "TS18059",
+    message: "`import defer` only supports a namespace import from a string literal."
+  },
+  // Declarations
+  VARIABLE_DECLARATION_LIST_EMPTY: {
+    code: "TS1123",
+    message: "Variable declaration list cannot be empty."
+  },
+  /** `kind` is `const`, `using`, or `await using`. */
+  DECLARATION_NOT_INITIALIZED: with_values(
+    "TS1155",
+    (kind) => `'${kind}' declarations must be initialized.`
+  ),
+  FOR_IN_USING: {
+    code: "TS1493",
+    message: "The left-hand side of a 'for...in' statement cannot be a 'using' declaration."
+  },
+  FOR_IN_AWAIT_USING: {
+    code: "TS1494",
+    message: "The left-hand side of a 'for...in' statement cannot be an 'await using' declaration."
+  },
+  // A `let`, `const` or `using` declaration's name declared again in the same
+  // scope (see `declareName` in `plugin.js`)
+  BLOCK_SCOPED_VARIABLE_REDECLARED: with_values(
+    "TS2451",
+    (name) => `Cannot redeclare block-scoped variable '${name}'.`
+  ),
+  // A `var` in a block below one that declares its name with `let`, `const`, or
+  // `using` (see `declareName` in `plugin.js`). TypeScript gives the name for
+  // both values.
+  OUTER_SCOPED_VARIABLE_INITIALIZED: with_values(
+    "TS2481",
+    (name, declaration2) => `Cannot initialize outer scoped variable '${name}' in the same scope as block scoped declaration '${declaration2}'.`
+  ),
+  // A `let`, `const`, or `using` declaration of a `catch` clause's parameter in
+  // its block
+  CATCH_PARAMETER_REDECLARED: with_values(
+    "TS2492",
+    (name) => `Cannot redeclare identifier '${name}' in catch clause.`
+  ),
+  // An enum and another declaration of its name but an enum or a namespace
+  ENUM_REDECLARED: {
+    code: "TS2567",
+    message: "Enum declarations can only merge with namespace or other enum declarations."
+  },
+  // TSRX's wording of a name redeclared in a module's or function's scope
+  DECLARED_IN_SCOPE: with_values(
+    "TS2300",
+    (name) => `'${name}' has already been declared in the current scope`
+  ),
+  // Parameters
+  SIGNATURE_PARAMETER_INITIALIZER: {
+    code: "TS2371",
+    message: "A parameter initializer is only allowed in a function or constructor implementation."
+  },
+  PATTERN_PARAMETER_PROPERTY: {
+    code: "TS1187",
+    message: "A parameter property may not be declared using a binding pattern."
+  },
+  REST_PARAMETER_PROPERTY: {
+    code: "TS1317",
+    message: "A parameter property cannot be declared using a rest parameter."
+  },
+  PARAMETER_PROPERTY_OUTSIDE_CONSTRUCTOR: {
+    code: "TS2369",
+    message: "A parameter property is only allowed in a constructor implementation."
+  },
+  REST_PARAMETER_INITIALIZER: {
+    code: "TS1048",
+    message: "A rest parameter cannot have an initializer."
+  },
+  REST_ELEMENT_INITIALIZER: {
+    code: "TS1186",
+    message: "A rest element cannot have an initializer."
+  },
+  OPTIONAL_REST_PARAMETER: { code: "TS1047", message: "A rest parameter cannot be optional." },
+  OPTIONAL_BINDING_PATTERN_PARAMETER: {
+    code: "TS2463",
+    message: "A binding pattern parameter cannot be optional in an implementation signature."
+  },
+  // acorn's wording, for the code TSRX reads in acorn's place
+  UNEXPECTED_TOKEN: { code: "TS1012", message: "Unexpected token" },
+  REST_ELEMENT_TRAILING_COMMA: {
+    code: "TS1013",
+    message: "Comma is not permitted after the rest element"
+  },
+  ARGUMENT_NAME_CLASH: { code: "TS2300", message: "Argument name clash" },
+  KEYWORD_ESCAPE_SEQUENCE: with_values(
+    "TS1260",
+    (keyword) => `Escape sequence in keyword ${keyword}`
+  ),
+  AWAIT_USING_OUTSIDE_ASYNC: {
+    code: "TS2852",
+    message: "Await using cannot appear outside of async function"
+  },
+  FOR_OF_LET: {
+    code: "TS1134",
+    message: "The left-hand side of a for-of loop may not start with 'let'."
+  },
+  FOR_IN_INITIALIZER: {
+    code: "TS1189",
+    message: "for-in loop variable declaration may not have an initializer"
+  },
+  FOR_OF_INITIALIZER: {
+    code: "TS1190",
+    message: "for-of loop variable declaration may not have an initializer"
+  },
+  MISSING_CATCH_OR_FINALLY: { code: "TS1472", message: "Missing catch or finally clause" },
+  MULTIPLE_DEFAULT_CLAUSES: { code: "TS1113", message: "Multiple default clauses" },
+  USE_STRICT_NON_SIMPLE_PARAMETERS: {
+    code: "TS1347",
+    message: "Illegal 'use strict' directive in function with non-simple parameter list"
+  },
+  // acorn-typescript's wording, for the code TSRX reads in acorn-typescript's
+  // place
+  UNTERMINATED_JSX_CONTENTS: { code: "TS17008", message: "Unterminated JSX contents" },
+  JSX_UNESCAPED_GREATER_THAN: {
+    code: "TS1382",
+    message: 'Unexpected token `>`. Did you mean `&gt;` or `{">"}`?'
+  },
+  JSX_UNESCAPED_CLOSING_BRACE: {
+    code: "TS1381",
+    message: 'Unexpected token `}`. Did you mean `&rbrace;` or `{"}"}`?'
+  },
+  // TSRX's shorter wording of acorn-typescript's `JSX value should be either
+  // an expression or a quoted JSX text`
+  JSX_ATTRIBUTE_VALUE: {
+    code: "TS1145",
+    message: "value should be either an expression or a quoted text"
+  },
+  ONLY_STRING_ATTRIBUTE_VALUE: {
+    code: "TS2858",
+    message: "Only string is supported as an attribute value"
+  },
+  TYPE_IMPORT_ARGUMENT: {
+    code: "TS1141",
+    message: "Argument in a type import must be a string literal."
+  },
+  UNEXPECTED_LEADING_DECORATOR: {
+    code: "TS1206",
+    message: "Leading decorators must be attached to a class declaration."
+  },
+  TYPE_CAST_IN_PARAMETER: {
+    code: "TS1005",
+    message: "Unexpected type cast in parameter position."
+  },
+  UNEXPECTED_TYPE_ANNOTATION: { code: "TS1005", message: "Did not expect a type annotation here." },
+  /** `type` is the type of the node read as the parameter. */
+  SIGNATURE_PARAMETER_NAME: with_values(
+    "TS2371",
+    (type) => `Name in a signature must be an Identifier, ObjectPattern or ArrayPattern, instead got ${type}.`
+  ),
+  RESERVED_ARROW_TYPE_PARAMETER: {
+    code: "TS7060",
+    message: "This syntax is reserved in files with the .mts or .cts extension. Add a trailing comma, as in `<T,>() => ...`."
+  }
+};
+var UPSTREAM_ERRORS = {
+  // A redeclared variable, import, type alias, or private name. Where
+  // TypeScript reports another code, the parser reports it instead: TS2451,
+  // TS2481, TS2492, or TS2567 (see `declareName` in `plugin.js`).
+  // acorn: declareName, parseClass; acorn-typescript: declareName
+  REDECLARED: {
+    pattern: /^(?:Identifier|type) '#?[^']+' has already been declared\.?$/,
+    code: "TS2300"
+  },
+  // acorn: parseTopLevel
+  EXPORT_NOT_DEFINED: { pattern: /^Export '[^']+' is not defined$/, code: "TS2304" },
+  // acorn: toAssignable, checkLValSimple
+  OPTIONAL_CHAIN_ASSIGNMENT: {
+    pattern: /^Optional chaining cannot appear in left-hand side$/,
+    code: "TS2779"
+  },
+  // acorn: parseImportMeta
+  IMPORT_META_PROPERTY: {
+    pattern: /^The only valid meta property for import is 'import\.meta'$/,
+    code: "TS17012"
+  },
+  // acorn: parseNew
+  NEW_TARGET_OUTSIDE_FUNCTION: {
+    pattern: /^'new\.target' can only be used in functions and class static block$/,
+    code: "TS17013"
+  },
+  // acorn: parseExprAtom
+  SUPER_OUTSIDE_METHOD: { pattern: /^'super' keyword outside a method$/, code: "TS2660" },
+  // acorn: parseExprAtom
+  SUPER_CALL_OUTSIDE_CONSTRUCTOR: {
+    pattern: /^super\(\) call outside constructor of a subclass$/,
+    code: "TS2337"
+  },
+  // acorn: checkUnreserved
+  LET_RESERVED: { pattern: /^The keyword 'let' is reserved$/, code: "TS1212" },
+  // `let` as a binding name or an assignment target, which acorn reports after
+  // `LET_RESERVED` at the same position, so only that one is recorded.
+  // acorn: checkLValSimple
+  LET_BINDING: {
+    pattern: /^(?:(?:Binding|Assigning to) let in strict mode|let is disallowed as a lexically bound name)$/,
+    code: "TS2480"
+  },
+  // acorn-typescript: callParseClassMemberWithIsStatic
+  ABSTRACT_METHOD_IN_CLASS: {
+    pattern: /^Abstract methods can only appear within an abstract class\.$/,
+    code: "TS1244"
+  },
+  // acorn-typescript: parseVarStatement, parseClassField
+  AMBIENT_INITIALIZER: {
+    pattern: /^Initializers are not allowed in ambient contexts\.$/,
+    code: "TS1039"
+  },
+  // acorn-typescript: tsParseModifiers
+  DUPLICATE_MODIFIER: { pattern: /^Duplicate modifier: '\w+'\.$/, code: "TS1030" },
+  // acorn-typescript: tsParseModifiers
+  TYPE_MEMBER_MODIFIER: {
+    pattern: /^'\w+' modifier cannot appear on a type member\.$/,
+    code: "TS1070"
+  },
+  // acorn-typescript: tsParseModifiers
+  TYPE_PARAMETER_MODIFIER: {
+    pattern: /^'\w+' modifier cannot appear on a type parameter\.$/,
+    code: "TS1273"
+  },
+  // acorn-typescript: tsParseModifiers
+  VARIANCE_MODIFIER: {
+    pattern: /^'\w+' modifier can only appear on a type parameter of a class, interface or type alias\.$/,
+    code: "TS1274"
+  },
+  // acorn-typescript: parseClassField
+  PRIVATE_ELEMENT_ACCESSIBILITY: {
+    pattern: /^Private elements cannot have an accessibility modifier \('\w+'\)\.$/,
+    code: "TS18010"
+  },
+  // acorn-typescript: parseClassField
+  PRIVATE_ELEMENT_ABSTRACT: {
+    pattern: /^Private elements cannot have the 'abstract' modifier\.$/,
+    code: "TS18019"
+  },
+  // acorn-typescript: parseClass
+  DECORATED_CONSTRUCTOR: {
+    pattern: /^Decorators can't be used with a constructor\. Did you mean '@dec class \{ \.\.\. \}'\?$/,
+    code: "TS1206"
+  }
+};
+var UPSTREAM_LOOKUP_ROWS = [
+  // acorn: unexpected, toAssignable
+  TS_ERRORS.UNEXPECTED_TOKEN,
+  // acorn: parseBindingList, checkPatternErrors, parseParenAndDistinguishExpression, parseProperty
+  TS_ERRORS.REST_ELEMENT_TRAILING_COMMA,
+  // acorn: checkPatternErrors, toAssignable
+  [/^Assigning to rvalue$/, "TS2364"],
+  // acorn: checkPatternErrors
+  [/^Parenthesized pattern$/, "TS1005"],
+  // acorn: checkExpressionErrors
+  [/^Shorthand property assignments are valid only in destructuring patterns$/, "TS1312"],
+  // acorn: checkExpressionErrors, checkPropClash
+  [/^Redefinition of __proto__ property$/, "TS1117"],
+  // acorn: checkYieldAwaitInDefaultParams
+  [/^Yield expression cannot be a default value$/, "TS2523"],
+  // acorn: checkYieldAwaitInDefaultParams
+  [/^Await expression cannot be a default value$/, "TS2524"],
+  // acorn: parseTopLevel
+  UPSTREAM_ERRORS.EXPORT_NOT_DEFINED,
+  // acorn: parseStatement
+  [
+    /^Using declaration cannot appear in the top level when source type is `script` or in the bare case statement$/,
+    "TSRX4003"
+  ],
+  // acorn: parseStatement
+  [/^Using declaration is not allowed in single-statement positions$/, "TS1156"],
+  // acorn: parseStatement, parseForStatement
+  TS_ERRORS.AWAIT_USING_OUTSIDE_ASYNC,
+  // acorn: parseBreakContinueStatement
+  [/^Unsyntactic break$/, "TS1105"],
+  // acorn: parseBreakContinueStatement
+  [/^Unsyntactic continue$/, "TS1104"],
+  // acorn: parseForStatement
+  TS_ERRORS.FOR_OF_LET,
+  // acorn: parseForAfterInit
+  [/^Using declaration is not allowed in for-in loops$/, "TS1493"],
+  // acorn: parseReturnStatement
+  [/^'return' outside of function$/, "TS1108"],
+  // acorn: parseSwitchStatement
+  TS_ERRORS.MULTIPLE_DEFAULT_CLAUSES,
+  // acorn: parseThrowStatement
+  [/^Illegal newline after throw$/, "TS1142"],
+  // acorn: parseTryStatement
+  TS_ERRORS.MISSING_CATCH_OR_FINALLY,
+  // acorn: parseWithStatement
+  [/^'with' in strict mode$/, "TS1101"],
+  // acorn: parseLabeledStatement
+  [/^Label '[^']+' is already declared$/, "TS1114"],
+  // acorn: parseForIn
+  TS_ERRORS.FOR_IN_INITIALIZER,
+  // acorn: parseForIn
+  TS_ERRORS.FOR_OF_INITIALIZER,
+  // acorn: parseVar
+  [/^Missing initializer in (?:const|using|await using) declaration$/, "TS1155"],
+  // acorn: parseVar
+  [/^Complex binding patterns require an initialization value$/, "TS1182"],
+  // acorn: parseClass
+  [/^Duplicate constructor in the same class$/, "TS2392"],
+  // acorn: declareName, parseClass; acorn-typescript: declareName
+  UPSTREAM_ERRORS.REDECLARED,
+  // acorn: parseClassElement
+  [/^Constructor can't have get\/set modifier$/, "TS1341"],
+  // acorn: parseClassElementName
+  [/^Classes can't have an element named '#constructor'$/, "TS18012"],
+  // acorn: parseClassMethod
+  [/^Constructor can't be a generator$/, "TS1368"],
+  // acorn: parseClassMethod
+  [/^Constructor can't be an async method$/, "TS1089"],
+  // acorn: parseClassMethod
+  [/^Classes may not have a static property named prototype$/, "TS2699"],
+  // acorn: parseClassMethod, parseGetterSetter
+  [/^getter should have no params$/, "TS1054"],
+  // acorn: parseClassMethod, parseGetterSetter
+  [/^setter should have exactly one param$/, "TS1049"],
+  // acorn: parseClassMethod, parseGetterSetter
+  [/^Setter cannot use rest params$/, "TS1053"],
+  // acorn: parseClassField
+  [/^Classes can't have a field named 'constructor'$/, "TS18006"],
+  // acorn: parseClassField
+  [/^Classes can't have a static field named 'prototype'$/, "TS2699"],
+  // acorn: exitClassBody (a class uses a private name it doesn't declare). The
+  // parser reports acorn's error for one outside any class, from
+  // `parsePrivateIdent`, as TypeScript's TS18016 instead.
+  [/^Private field '#.+' must be declared in an enclosing class$/, "TS1111"],
+  // acorn: parseExport
+  [/^A string literal cannot be used as an exported binding without `from`\.$/, "TSRX4003"],
+  // acorn: checkExport
+  [/^Duplicate export '[^']+'$/, "TS2300"],
+  // acorn: parseModuleExportName
+  [/^An export name cannot include a lone surrogate\.$/, "TSRX4003"],
+  // acorn: toAssignable, parseSubscript, checkUnreserved
+  [/^Cannot use 'await' as identifier inside an async function$/, "TS1359"],
+  // acorn: toAssignable
+  [/^Object pattern can't contain getter or setter$/, "TS1136"],
+  // acorn: toAssignable
+  [/^Rest elements cannot have a default value$/, "TS1186"],
+  // acorn: toAssignable
+  [/^Only '=' operator can be used for specifying default value\.$/, "TS2364"],
+  // acorn: toAssignable, checkLValSimple
+  UPSTREAM_ERRORS.OPTIONAL_CHAIN_ASSIGNMENT,
+  // acorn: checkLValSimple
+  [/^Binding (?:eval|arguments) in strict mode$/, "TS1100"],
+  // acorn: checkLValSimple
+  [/^Assigning to (?:eval|arguments) in strict mode$/, "TS1100"],
+  // acorn: checkLValSimple
+  UPSTREAM_ERRORS.LET_BINDING,
+  // acorn: checkLValSimple
+  TS_ERRORS.ARGUMENT_NAME_CLASH,
+  // acorn: checkLValSimple
+  [/^Binding member expression$/, "TS1005"],
+  // acorn: checkLValSimple
+  [/^Binding rvalue$/, "TS2364"],
+  // acorn: checkPropClash
+  [/^Redefinition of property$/, "TS1117"],
+  // acorn: parseExprOp
+  [
+    /^Logical expressions and coalesce expressions cannot be mixed\. Wrap either by parentheses$/,
+    "TS5076"
+  ],
+  // acorn: buildBinary
+  [/^Private identifier can only be left side of binary expression$/, "TS1451"],
+  // acorn: parseMaybeUnary
+  [/^Deleting local variable in strict mode$/, "TS1102"],
+  // acorn: parseMaybeUnary
+  [/^Private fields can not be deleted$/, "TS18011"],
+  // acorn: parseSubscript
+  [/^Optional chaining cannot appear in the callee of new expressions$/, "TS1209"],
+  // acorn: parseSubscript
+  [/^Optional chaining cannot appear in the tag of tagged template expressions$/, "TS1358"],
+  // acorn: parseExprAtom
+  UPSTREAM_ERRORS.SUPER_OUTSIDE_METHOD,
+  // acorn: parseExprAtom
+  UPSTREAM_ERRORS.SUPER_CALL_OUTSIDE_CONSTRUCTOR,
+  // acorn: parseExprImport, parseNew, next
+  TS_ERRORS.KEYWORD_ESCAPE_SEQUENCE,
+  // acorn: parseImportMeta
+  UPSTREAM_ERRORS.IMPORT_META_PROPERTY,
+  // acorn: parseImportMeta
+  [/^'import\.meta' must not contain escaped characters$/, "TSRX4003"],
+  // acorn: parseNew
+  [/^The only valid meta property for new is 'new\.target'$/, "TS17012"],
+  // acorn: parseNew
+  [/^'new\.target' must not contain escaped characters$/, "TSRX4003"],
+  // acorn: parseNew
+  UPSTREAM_ERRORS.NEW_TARGET_OUTSIDE_FUNCTION,
+  // acorn: parseTemplateElement
+  [/^Bad escape sequence in untagged template literal$/, "TS1125"],
+  // acorn: parseTemplate
+  [/^Unterminated template literal$/, "TS1160"],
+  // acorn: parseFunctionBody
+  TS_ERRORS.USE_STRICT_NON_SIMPLE_PARAMETERS,
+  // acorn: checkUnreserved
+  [/^Cannot use 'yield' as identifier inside a generator$/, "TS1212"],
+  // acorn: checkUnreserved
+  [/^Cannot use 'arguments' in class field initializer$/, "TS2815"],
+  // acorn: checkUnreserved
+  [/^Cannot use arguments in class static initialization block$/, "TS2815"],
+  // acorn: checkUnreserved
+  [/^Cannot use await in class static initialization block$/, "TS18037"],
+  // acorn: checkUnreserved
+  [/^Unexpected keyword '[^']+'$/, "TS1359"],
+  // acorn: checkUnreserved
+  [/^Cannot use keyword 'await' outside an async function$/, "TS1262"],
+  // acorn: checkUnreserved
+  UPSTREAM_ERRORS.LET_RESERVED,
+  // acorn: checkUnreserved
+  [/^The keyword '[^']+' is reserved$/, "TS1212"],
+  // acorn: validateRegExpFlags
+  [/^Invalid regular expression flag$/, "TS1499"],
+  // acorn: validateRegExpFlags
+  [/^Duplicate regular expression flag$/, "TS1500"],
+  // acorn: skipBlockComment
+  [/^Unterminated comment$/, "TS1010"],
+  // acorn: readToken_numberSign, getTokenFromCode
+  [/^Unexpected character '.+'$/, "TS1127"],
+  // acorn: readRegexp
+  [/^Unterminated regular expression$/, "TS1161"],
+  // acorn: readInt
+  [/^Numeric separator is not allowed in legacy octal numeric literals$/, "TS6188"],
+  // acorn: readInt
+  [/^Numeric separator must be exactly one underscore$/, "TS6189"],
+  // acorn: readInt
+  [/^Numeric separator is not allowed at the first of digits$/, "TS6188"],
+  // acorn: readInt
+  [/^Numeric separator is not allowed at the last of digits$/, "TS6188"],
+  // acorn: readRadixNumber
+  [/^Expected number in radix 16$/, "TS1125"],
+  // acorn: readRadixNumber
+  [/^Expected number in radix 2$/, "TS1177"],
+  // acorn: readRadixNumber
+  [/^Expected number in radix 8$/, "TS1178"],
+  // acorn: readRadixNumber, readNumber
+  [/^Identifier directly after number$/, "TS1351"],
+  // acorn: readNumber
+  [/^Invalid number$/, "TS1124"],
+  // acorn: readString
+  [/^Unterminated string constant$/, "TS1002"],
+  // acorn: parseTemplate, readTmplToken, readInvalidTemplateToken
+  [/^Unterminated template$/, "TS1160"],
+  // acorn: readCodePoint
+  [/^Code point out of bounds$/, "TS1198"],
+  // acorn: readEscapedChar
+  [/^Invalid escape sequence$/, "TS1488"],
+  // acorn: readEscapedChar
+  [/^Invalid escape sequence in template string$/, "TS1488"],
+  // acorn: readEscapedChar
+  [/^Octal literal in template string$/, "TS1487"],
+  // acorn: readEscapedChar
+  [/^Octal literal in strict mode$/, "TS1487"],
+  // acorn: readHexChar
+  [/^Bad character escape sequence$/, "TS1125"],
+  // acorn: readWord1
+  [/^Expecting Unicode escape sequence \\uXXXX$/, "TS1127"],
+  // acorn: readWord1
+  [/^Invalid Unicode escape$/, "TS1127"],
+  // acorn's regular expression validator, as `Invalid regular expression:
+  // /{0}/: {1}`
+  // acorn: regexp_pattern
+  [/^Invalid regular expression: \/.*\/: Unmatched '\)'$/, "TS1508"],
+  // acorn: regexp_pattern, regexp_disjunction
+  [/^Invalid regular expression: \/.*\/: Lone quantifier brackets$/, "TS1508"],
+  // acorn: regexp_pattern, regexp_eatAtomEscape, regexp_eatClassAtom, regexp_eatClassStringDisjunction, regexp_eatHexEscapeSequence
+  [/^Invalid regular expression: \/.*\/: Invalid escape$/, "TS1535"],
+  // acorn: regexp_pattern
+  [/^Invalid regular expression: \/.*\/: Invalid named capture referenced$/, "TS1532"],
+  // acorn: regexp_disjunction, regexp_eatInvalidBracedQuantifier
+  [/^Invalid regular expression: \/.*\/: Nothing to repeat$/, "TS1507"],
+  // acorn: regexp_eatTerm
+  [/^Invalid regular expression: \/.*\/: Invalid quantifier$/, "TS1507"],
+  // acorn: regexp_eatAssertion, regexp_eatCapturingGroup, regexp_eatUncapturingGroup
+  [/^Invalid regular expression: \/.*\/: Unterminated group$/, "TS1005"],
+  // acorn: regexp_eatBracedQuantifier
+  [/^Invalid regular expression: \/.*\/: numbers out of order in \{\} quantifier$/, "TS1506"],
+  // acorn: regexp_eatBracedQuantifier
+  [/^Invalid regular expression: \/.*\/: Incomplete quantifier$/, "TS1005"],
+  // acorn: regexp_eatUncapturingGroup
+  [/^Invalid regular expression: \/.*\/: Duplicate regular expression modifiers$/, "TS1500"],
+  // acorn: regexp_eatUncapturingGroup
+  [/^Invalid regular expression: \/.*\/: Invalid regular expression modifiers$/, "TS1504"],
+  // acorn: regexp_eatCapturingGroup, regexp_groupSpecifier
+  [/^Invalid regular expression: \/.*\/: Invalid group$/, "TS1005"],
+  // acorn: regexp_groupSpecifier
+  [/^Invalid regular expression: \/.*\/: Duplicate capture group name$/, "TS1515"],
+  // acorn: regexp_eatGroupName
+  [/^Invalid regular expression: \/.*\/: Invalid capture group name$/, "TS1514"],
+  // acorn: regexp_eatAtomEscape, regexp_eatRegExpUnicodeEscapeSequence
+  [/^Invalid regular expression: \/.*\/: Invalid unicode escape$/, "TS1198"],
+  // acorn: regexp_eatKGroupName
+  [/^Invalid regular expression: \/.*\/: Invalid named reference$/, "TS1510"],
+  // acorn: regexp_eatCharacterClassEscape, regexp_validateUnicodePropertyNameAndValue, regexp_validateUnicodePropertyNameOrValue
+  [/^Invalid regular expression: \/.*\/: Invalid property name$/, "TS1529"],
+  // acorn: regexp_validateUnicodePropertyNameAndValue
+  [/^Invalid regular expression: \/.*\/: Invalid property value$/, "TS1526"],
+  // acorn: regexp_eatCharacterClass
+  [/^Invalid regular expression: \/.*\/: Unterminated character class$/, "TS1005"],
+  // acorn: regexp_eatCharacterClass, regexp_eatNestedClass
+  [/^Invalid regular expression: \/.*\/: Negated character class may contain strings$/, "TS1518"],
+  // acorn: regexp_nonEmptyClassRanges
+  [/^Invalid regular expression: \/.*\/: Invalid character class$/, "TS1516"],
+  // acorn: regexp_nonEmptyClassRanges, regexp_eatClassSetRange
+  [/^Invalid regular expression: \/.*\/: Range out of order in character class$/, "TS1517"],
+  // acorn: regexp_eatClassAtom
+  [/^Invalid regular expression: \/.*\/: Invalid class escape$/, "TS1512"],
+  // acorn: regexp_classSetExpression
+  [/^Invalid regular expression: \/.*\/: Invalid character in character class$/, "TS1508"],
+  // acorn-typescript: jsx_readToken
+  TS_ERRORS.UNTERMINATED_JSX_CONTENTS,
+  // acorn-typescript: jsx_readToken
+  TS_ERRORS.JSX_UNESCAPED_GREATER_THAN,
+  // acorn-typescript: jsx_readToken
+  TS_ERRORS.JSX_UNESCAPED_CLOSING_BRACE,
+  // acorn-typescript: jsx_parseAttributeValue
+  [/^JSX attributes must only be assigned a non-empty expression$/, "TS17000"],
+  // acorn-typescript: jsx_parseAttributeValue
+  [/^JSX value should be either an expression or a quoted JSX text$/, "TS1145"],
+  // acorn-typescript: jsx_parseElementAt
+  [/^Expected corresponding JSX closing tag for <[^>]*>$/, "TS17002"],
+  // acorn-typescript: jsx_parseElementAt
+  [/^Adjacent JSX elements must be wrapped in an enclosing tag$/, "TS2657"],
+  // acorn-typescript: parseWithEntries
+  TSRX_ERRORS.DUPLICATED_ATTRIBUTE_KEY,
+  // acorn-typescript: parseWithEntries
+  TS_ERRORS.ONLY_STRING_ATTRIBUTE_VALUE,
+  // acorn-typescript: tsParsePropertyOrMethodSignature
+  [/^A 'get' accesor must not have any formal parameters\.$/, "TS1054"],
+  // acorn-typescript: parseNew
+  [/^Cannot use new with import\(\)$/, "TS1109"],
+  // acorn-typescript: parseTaggedTemplateExpression
+  [/^Tagged Template Literals are not allowed in optionalChain\.$/, "TS1358"],
+  // acorn-typescript: parseMethod
+  [/^Method '.+' cannot have an implementation because it is marked abstract\.$/, "TS1245"],
+  // acorn-typescript: parseClassField
+  [/^Property '.+' cannot have an initializer because it is marked abstract\.$/, "TS1267"],
+  // acorn-typescript: tsParsePropertyOrMethodSignature
+  [/^'get' and 'set' accessors cannot declare 'this' parameters\.$/, "TS2784"],
+  // acorn-typescript: tsParsePropertyOrMethodSignature
+  [/^An accessor cannot have type parameters\.$/, "TS1094"],
+  // acorn-typescript: tsTryNextParseConstantContext
+  [/^Cannot find name '[^']+'\.$/, "TS2304"],
+  // acorn-typescript: parsePostMemberNameModifiers
+  [/^Class methods cannot have the 'declare' modifier\.$/, "TS1031"],
+  // acorn-typescript: parsePostMemberNameModifiers
+  [/^Class methods cannot have the 'readonly' modifier\.$/, "TS1024"],
+  // acorn-typescript: parseVarStatement
+  [
+    /^A 'const' initializer in an ambient context must be a string or numeric literal or literal enum reference\.$/,
+    "TS1254"
+  ],
+  // acorn-typescript: parseClassMethod
+  [/^Type parameters cannot appear on a constructor declaration\.$/, "TS1092"],
+  // acorn-typescript: parseClassMethod
+  [/^'declare' is not allowed in (?:get|set)ters\.$/, "TS1031"],
+  // acorn-typescript: parseVarStatement, parseClassField
+  UPSTREAM_ERRORS.AMBIENT_INITIALIZER,
+  // acorn-typescript: parseFunctionBody
+  [/^An implementation cannot be declared in ambient contexts\.$/, "TS1183"],
+  // acorn-typescript: tsParseModifiers
+  TS_ERRORS.ACCESSIBILITY_MODIFIER_ALREADY_SEEN,
+  // acorn-typescript: tsParseModifiers
+  UPSTREAM_ERRORS.DUPLICATE_MODIFIER,
+  // acorn-typescript: tsParseHeritageClause
+  [/^'(?:extends|implements)' list cannot be empty\.$/, "TS1097"],
+  // acorn-typescript: tsParseTypeArguments
+  [/^Type argument list cannot be empty\.$/, "TS1099"],
+  // acorn-typescript: tsParseTypeParameters
+  [/^Type parameter list cannot be empty\.$/, "TS1098"],
+  // acorn-typescript: parseExportDeclaration
+  [/^'export declare' must be followed by an ambient declaration\.$/, "TS1128"],
+  // acorn-typescript: tsParseImportEqualsDeclaration
+  [/^An import alias can not use 'import type'\.$/, "TS1392"],
+  // acorn-typescript: tsParseModifiers (incompatible)
+  TS_ERRORS.MODIFIER_CANNOT_BE_USED_WITH,
+  // acorn-typescript: callParseClassMemberWithIsStatic
+  [/^Index signatures cannot have the 'abstract' modifier\.$/, "TS1071"],
+  // acorn-typescript: callParseClassMemberWithIsStatic
+  [/^Index signatures cannot have an accessibility modifier \('\w+'\)\.$/, "TS1071"],
+  // acorn-typescript: callParseClassMemberWithIsStatic
+  [/^Index signatures cannot have the 'declare' modifier\.$/, "TS1071"],
+  // acorn-typescript: callParseClassMemberWithIsStatic
+  [/^'override' modifier cannot appear on an index signature\.$/, "TS1071"],
+  // acorn-typescript: tsParseModifiers
+  UPSTREAM_ERRORS.TYPE_MEMBER_MODIFIER,
+  // acorn-typescript: tsParseModifiers
+  UPSTREAM_ERRORS.TYPE_PARAMETER_MODIFIER,
+  // acorn-typescript: tsParseModifiers
+  UPSTREAM_ERRORS.VARIANCE_MODIFIER,
+  // acorn-typescript: tsParseModifiers (enforceOrder)
+  TS_ERRORS.MODIFIER_MUST_PRECEDE,
+  // acorn-typescript: parseSubscript
+  [
+    /^Invalid property access after an instantiation expression\. You can either wrap the instantiation expression in parentheses, or delete the type arguments\.$/,
+    "TS1477"
+  ],
+  // acorn-typescript: tsParseTupleElementType
+  [/^Tuple members must be labeled with a simple identifier\.$/, "TS1005"],
+  // acorn-typescript: tsParseInterfaceDeclaration
+  [/^'interface' declarations must be followed by an identifier\.$/, "TS1438"],
+  // acorn-typescript: callParseClassMemberWithIsStatic
+  UPSTREAM_ERRORS.ABSTRACT_METHOD_IN_CLASS,
+  // acorn-typescript: tsParseTupleType
+  [/^A required element cannot follow an optional element\.$/, "TS1257"],
+  // acorn-typescript: callParseClassMemberWithIsStatic
+  [
+    /^This member cannot have an 'override' modifier because its containing class does not extend another class\.$/,
+    "TS4112"
+  ],
+  // acorn-typescript: parseBindingListItem
+  TS_ERRORS.OPTIONAL_BINDING_PATTERN_PARAMETER,
+  // acorn-typescript: parseClassField
+  UPSTREAM_ERRORS.PRIVATE_ELEMENT_ABSTRACT,
+  // acorn-typescript: parseClassField
+  UPSTREAM_ERRORS.PRIVATE_ELEMENT_ACCESSIBILITY,
+  // acorn-typescript: parseClassMethod
+  [/^Private methods cannot have an accessibility modifier \('\w+'\)\.$/, "TS18010"],
+  // acorn-typescript: tsParsePropertyOrMethodSignature
+  TS_ERRORS.READONLY_MODIFIER_NOT_ALLOWED,
+  // acorn-typescript: tsParseTypeAssertion
+  TS_ERRORS.RESERVED_ARROW_TYPE_PARAMETER,
+  // acorn-typescript: tsParseTypeAssertion
+  [
+    /^This syntax is reserved in files with the \.mts or \.cts extension\. Use an `as` expression instead\.$/,
+    "TS7059"
+  ],
+  // acorn-typescript: tsParsePropertyOrMethodSignature
+  [/^A 'set' accessor cannot have an optional parameter\.$/, "TS1051"],
+  // acorn-typescript: tsParsePropertyOrMethodSignature
+  [/^A 'set' accessor cannot have rest parameter\.$/, "TS1053"],
+  // acorn-typescript: tsParsePropertyOrMethodSignature
+  [/^A 'set' accessor cannot have a return type annotation\.$/, "TS1095"],
+  // acorn-typescript: callParseClassMemberWithIsStatic
+  [/^Static class blocks cannot have any modifier\.$/, "TS1184"],
+  // acorn-typescript: parseMaybeDefault
+  [
+    /^Type annotations must come before default assignments, e\.g\. instead of `age = 25: number` use `age: number = 25`\.$/,
+    "TS1005"
+  ],
+  // acorn-typescript: parseImport
+  [/^A type-only import can specify a default import or named bindings, but not both\.$/, "TS1363"],
+  // acorn-typescript: parseTypeOnlyImportExportSpecifier
+  [
+    /^The 'type' modifier cannot be used on a named export when 'export type' is used on its export statement\.$/,
+    "TS2207"
+  ],
+  // acorn-typescript: parseTypeOnlyImportExportSpecifier
+  [
+    /^The 'type' modifier cannot be used on a named import when 'import type' is used on its import statement\.$/,
+    "TS2206"
+  ],
+  // acorn-typescript: parseAssignableListItem
+  TS_ERRORS.PARAMETER_PROPERTY_OUTSIDE_CONSTRUCTOR,
+  // acorn-typescript: tsCheckTypeAnnotationForReadOnly
+  TS_ERRORS.READONLY_TYPE_MODIFIER,
+  // acorn-typescript: tsCheckForInvalidTypeCasts
+  TS_ERRORS.UNEXPECTED_TYPE_ANNOTATION,
+  // acorn-typescript: toAssignable
+  TS_ERRORS.TYPE_CAST_IN_PARAMETER,
+  // acorn-typescript: tsParseImportType
+  TS_ERRORS.TYPE_IMPORT_ARGUMENT,
+  // acorn-typescript: parseAssignableListItem
+  TS_ERRORS.PATTERN_PARAMETER_PROPERTY,
+  // acorn-typescript: tsParseBindingListForSignature
+  TS_ERRORS.SIGNATURE_PARAMETER_NAME,
+  // acorn-typescript: parseDecorators
+  TS_ERRORS.UNEXPECTED_LEADING_DECORATOR,
+  // acorn-typescript: parseClass
+  UPSTREAM_ERRORS.DECORATED_CONSTRUCTOR,
+  // acorn-typescript: parseClass
+  [/^Decorators must be attached to a class element\.$/, "TS1146"],
+  // acorn-typescript: parseProperty
+  [/^Decorators can't be used with SpreadElement$/, "TS1206"]
+];
+function message_pattern(entry) {
+  const placeholder = "\0";
+  const message = typeof entry === "function" ? entry(placeholder, placeholder, placeholder).message : entry.message;
+  const source = message.split(placeholder).map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".+");
+  return new RegExp(`^${source}$`);
+}
+var UPSTREAM_LOOKUP = UPSTREAM_LOOKUP_ROWS.map((row) => {
+  if (Array.isArray(row)) return { pattern: row[0], error: { pattern: row[0], code: row[1] } };
+  if ("pattern" in row) return { pattern: row.pattern, error: row };
+  return { pattern: message_pattern(row), error: row };
+});
+function get_upstream_error(message) {
+  return UPSTREAM_LOOKUP.find((row) => row.pattern.test(message))?.error;
+}
+
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/parse/style.js
 var REGEX_MATCHER = /^[~^$*|]?=/;
 var REGEX_ATTRIBUTE_FLAGS = /^[a-zA-Z]+/;
 var REGEX_COMMENT_CLOSE = /\*\//;
@@ -14409,7 +16383,7 @@ function parse_style(content, location, options) {
     source: content,
     hash: `tsrx-${strong_hash(hash_source)}`,
     type: "StyleSheet",
-    children: read_body(parser),
+    children: read_css_body(parser),
     start: 0,
     end: content.length,
     filename: location.filename
@@ -14422,6 +16396,17 @@ function parse_style(content, location, options) {
     };
   }
   return sheet;
+}
+function read_css_body(parser) {
+  try {
+    return read_body(parser);
+  } catch (error2) {
+    if (error2 instanceof Error && !/** @type {{ code?: string }} */
+    error2.code) {
+      error2.code = DIAGNOSTIC_CODES.CSS_SYNTAX;
+    }
+    throw error2;
+  }
 }
 function css_position(sheet, offset2, origin) {
   const source = sheet.source;
@@ -14890,10 +16875,14 @@ function unescape_css(value) {
   });
 }
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/errors.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/errors.js
 function error(message, filename, node, errors, comments, code) {
   if (errors && comments && is_error_suppressed(node, comments)) {
     return;
+  }
+  if (typeof message !== "string") {
+    code ??= message.code;
+    message = message.message;
   }
   const error2 = (
     /** @type {CompileError} */
@@ -14940,127 +16929,8 @@ function is_error_suppressed(node, comments) {
   return false;
 }
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/diagnostics.js
-var DIAGNOSTIC_CODES = {
-  /** A recognized `import.meta.env.platform.*` flag is used without a selected platform. */
-  PLATFORM_REQUIRED: "tsrx-platform-required",
-  JSX_EXPRESSION_VALUE: "tsrx-jsx-expression-value",
-  UNCLOSED_TAG: "tsrx-unclosed-tag",
-  MISMATCHED_CLOSING_TAG: "tsrx-mismatched-closing-tag",
-  TEMPLATE_EXPRESSION_TRAILING_SEMICOLON: "tsrx-template-expression-trailing-semicolon",
-  TEMPLATE_RETURN_STATEMENT: "tsrx-template-return-statement",
-  FORGOTTEN_STATEMENT_CONTAINER: "tsrx-forgotten-statement-container",
-  /** A JSX spread child (`{...items}`), which parses but no target supports. */
-  JSX_SPREAD_CHILD: "tsrx-jsx-spread-child",
-  /** `<style apply>` carries no expression value. */
-  STYLE_APPLY_VALUE: "tsrx-style-apply-value",
-  /** An `apply` entry is not an identifier, member, or array of those, or does not resolve to a style block. */
-  STYLE_APPLY_TARGET: "tsrx-style-apply-target",
-  /** An `apply` target is declared after the applying block in source order. */
-  STYLE_APPLY_BEFORE_DECLARATION: "tsrx-style-apply-before-declaration",
-  /** Two `apply` attributes on one `<style>` block. */
-  STYLE_APPLY_DUPLICATE: "tsrx-style-apply-duplicate",
-  /** `apply` on a `<head>` style or a resource (`href`) style. */
-  STYLE_APPLY_UNSUPPORTED_HOST: "tsrx-style-apply-unsupported-host",
-  /** An assigned style block authors a `.$class` class selector. */
-  STYLE_RESERVED_CLASS_KEY: "tsrx-style-reserved-class-key",
-  /** A standalone `<style>` block at module scope. */
-  STYLE_STANDALONE_AT_MODULE_SCOPE: "tsrx-style-standalone-at-module-scope",
-  /** A standalone `<style>` block with CSS text outside any `@{ … }` or control-flow body. */
-  STYLE_STANDALONE_OUTSIDE_TEMPLATE: "tsrx-style-standalone-outside-template",
-  /** A standalone `<style>` block in a statement slot: the lone output of a `@{ … }` or control-flow body, or a statement. */
-  STYLE_STANDALONE_NEEDS_FRAGMENT: "tsrx-style-standalone-needs-fragment",
-  /** A `<style>` attribute other than `ref` and `apply`. */
-  STYLE_UNKNOWN_ATTRIBUTE: "tsrx-style-unknown-attribute",
-  /** `:global` used where the scoping rules do not allow it. */
-  CSS_GLOBAL_PLACEMENT: "tsrx-css-global-placement",
-  /** An `@import` rule in a `<style>` block, whose rules would not be scoped. */
-  CSS_IMPORT: "tsrx-css-import"
-};
-
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/analyze/validation.js
-var TSRX_RETURN_STATEMENT_ERROR = "Return statements are not allowed inside TSRX templates. Move the return before the TSRX return value, or use conditional rendering instead.";
-var TSRX_FORGOTTEN_STATEMENT_CONTAINER_ERROR = "This TSRX template output is unused. Return it, assign it to a value that is rendered, or make it part of the rendered output of a function '@{...}' body.";
-var TSRX_JSX_SPREAD_CHILD_ERROR = "JSX spread children (`{...items}`) are not supported. Render the array as an expression child instead: `{items}`.";
-var TSRX_STYLE_APPLY_VALUE_ERROR = "The 'apply' attribute of a <style> block requires an expression value: apply={theme} or apply={[a, b]}.";
-var TSRX_STYLE_APPLY_DUPLICATE_ERROR = "A <style> block accepts a single 'apply' attribute; pass several themes as an array: apply={[a, b]}.";
-var TSRX_STYLE_APPLY_UNSUPPORTED_HOST_ERROR = "The 'apply' attribute is only supported on scoped <style> blocks, not on <head> styles or resource styles.";
-var TSRX_STYLE_RESERVED_CLASS_KEY_ERROR = "'$class' is reserved on assigned <style> blocks for the block's scope hash; rename the '.$class' selector.";
-var TSRX_STYLE_STANDALONE_AT_MODULE_SCOPE_ERROR = "A standalone <style> block is only allowed inside a template scope. At module scope assign it: const theme = <style>\u2026</style>.";
-var TSRX_STYLE_STANDALONE_NEEDS_FRAGMENT_ERROR = "A standalone <style> block must be a child of an element or a fragment. Wrap it with the output it styles in a fragment: <><style>\u2026</style><div>\u2026</div></>.";
-var TSRX_STYLE_STANDALONE_OUTSIDE_TEMPLATE_ERROR = "A standalone <style> block with CSS text is TSRX template syntax and needs an enclosing @{ \u2026 } body or an @if/@for/@switch/@try body. In plain TSX give <style> an expression child instead: <style>{css}</style>. To declare a reusable block here, assign it: const theme = <style>\u2026</style>.";
-var TSRX_CSS_GLOBAL_NESTED_IN_PSEUDOCLASS_ERROR = "A :global selector cannot be inside a pseudoclass.";
-var TSRX_CSS_GLOBAL_MIDDLE_PLACEMENT_ERROR = ":global(...) can be at the start or end of a selector sequence, but not in the middle.";
-var TSRX_CSS_IMPORT_ERROR = "@import is not supported in <style> blocks: the imported rules would not be scoped. Share scoped styles with an assigned block (const theme = <style>\u2026</style>) and apply={theme}. For global CSS, use :global in the block, or import the stylesheet in JavaScript: import './global.css'.";
-function tsrx_style_apply_target_error(name) {
-  return `'${name}' is not a style block. An 'apply' target must be a variable, import, or member holding an assigned <style> block.`;
-}
-function tsrx_style_apply_before_declaration_error(name) {
-  return `'${name}' is applied before its declaration. Declare the style block before the block that applies it.`;
-}
-function tsrx_style_unknown_attribute_error(name) {
-  return `Unknown <style> attribute '${name}'. Scoped style blocks accept 'ref' and 'apply'.`;
-}
-function validate_forgotten_statement_container(node, filename, errors, comments) {
-  error(
-    TSRX_FORGOTTEN_STATEMENT_CONTAINER_ERROR,
-    filename ?? null,
-    node,
-    errors,
-    comments,
-    DIAGNOSTIC_CODES.FORGOTTEN_STATEMENT_CONTAINER
-  );
-}
-function validate_jsx_spread_child(node, filename, errors, comments) {
-  error(
-    TSRX_JSX_SPREAD_CHILD_ERROR,
-    filename ?? null,
-    node,
-    errors,
-    comments,
-    DIAGNOSTIC_CODES.JSX_SPREAD_CHILD
-  );
-}
-function is_template_value_position(parent, child) {
-  switch (parent.type) {
-    case "VariableDeclarator":
-      return parent.init === child;
-    case "AssignmentExpression":
-      return parent.right === child;
-    case "Property":
-    case "PropertyDefinition":
-      return parent.value === child;
-    case "ArrayExpression":
-      return parent.elements.some((element) => element === child);
-    case "CallExpression":
-    case "NewExpression":
-      return parent.callee === child || parent.arguments.some((argument) => argument === child);
-    case "ConditionalExpression":
-      return parent.test === child || parent.consequent === child || parent.alternate === child;
-    case "LogicalExpression":
-    case "BinaryExpression":
-      return parent.left === child || parent.right === child;
-    case "UnaryExpression":
-    case "AwaitExpression":
-    case "SpreadElement":
-    case "YieldExpression":
-      return parent.argument === child;
-    case "TemplateLiteral":
-    case "SequenceExpression":
-      return parent.expressions.some((expression) => expression === child);
-    case "TSAsExpression":
-    case "TSNonNullExpression":
-    case "TSSatisfiesExpression":
-      return parent.expression === child;
-    default:
-      return false;
-  }
-}
-function validate_style(message, code, node, filename, errors, comments) {
-  error(message, filename, node, errors, comments, code);
-}
-
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/plugin.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/plugin.js
+var regex_space_and_comments = /(?:\s|\/\/[^\n\r\u2028\u2029]*|\/\*[\s\S]*?\*\/)*/y;
 var CharCode = Object.freeze({
   tab: 9,
   lineFeed: 10,
@@ -15123,6 +16993,288 @@ var REGEX_PRECEDING_KEYWORDS = /* @__PURE__ */ new Set([
   "yield"
 ]);
 var regex_identifier = /[$_\p{ID_Start}][$_\u200c\u200d\p{ID_Continue}]*/uy;
+var regex_line_break = /\r\n?|[\n\u2028\u2029]/;
+var regex_escaped_word = /[$_\p{ID_Continue}\u200c\u200d]*\\/uy;
+var TYPE_ASSERTIONS = /* @__PURE__ */ new Set([
+  "TSAsExpression",
+  "TSSatisfiesExpression",
+  "TSNonNullExpression",
+  "TSTypeAssertion"
+]);
+var NON_PARAMETER_LIST = Object.freeze({ parameters: false, position: -1, error: null });
+var DECLARATION_MODIFIERS = /* @__PURE__ */ new Set([
+  "abstract",
+  "accessor",
+  "async",
+  "declare",
+  "private",
+  "protected",
+  "public",
+  "readonly",
+  "static"
+]);
+var CLASS_MEMBER_MODIFIERS = /* @__PURE__ */ new Set([
+  "accessor",
+  "private",
+  "protected",
+  "public",
+  "readonly",
+  "static"
+]);
+var KEYWORD_TYPES = /* @__PURE__ */ new Set([
+  "any",
+  "bigint",
+  "boolean",
+  "never",
+  "number",
+  "object",
+  "string",
+  "symbol",
+  "undefined",
+  "unknown"
+]);
+var PARAMETER_MODIFIERS = ["public", "private", "protected", "override", "readonly"];
+var DECORATED_DECLARATION_TYPES = /* @__PURE__ */ new Set([
+  "VariableDeclaration",
+  "FunctionDeclaration",
+  "TSDeclareFunction",
+  "ClassDeclaration",
+  "TSInterfaceDeclaration",
+  "TSTypeAliasDeclaration",
+  "TSEnumDeclaration",
+  "TSModuleDeclaration",
+  "ImportDeclaration",
+  "TSImportEqualsDeclaration",
+  "ExportNamedDeclaration",
+  "ExportDefaultDeclaration",
+  "ExportAllDeclaration",
+  "TSExportAssignment",
+  "TSNamespaceExportDeclaration"
+]);
+var DECLARATION_KEYWORDS = /* @__PURE__ */ new Set([
+  "abstract",
+  "async",
+  "await",
+  "declare",
+  "enum",
+  "global",
+  "interface",
+  "let",
+  "module",
+  "namespace",
+  "type",
+  "using"
+]);
+var CHECKER_LEVEL_ERRORS = /* @__PURE__ */ new Set([
+  // acorn and acorn-typescript: a redeclared variable, import, type alias, or
+  // private name (TS2300), and a repeated parameter name (TS2300).
+  UPSTREAM_ERRORS.REDECLARED,
+  TS_ERRORS.ARGUMENT_NAME_CLASH,
+  // acorn: `export { missing }` (TS2304).
+  UPSTREAM_ERRORS.EXPORT_NOT_DEFINED,
+  // acorn: `a?.b = c` (TS2779).
+  UPSTREAM_ERRORS.OPTIONAL_CHAIN_ASSIGNMENT,
+  // acorn: `import.source('x')` (TS18061).
+  UPSTREAM_ERRORS.IMPORT_META_PROPERTY,
+  // acorn: `new.target` outside a function (TS17013).
+  UPSTREAM_ERRORS.NEW_TARGET_OUTSIDE_FUNCTION,
+  // acorn: `super` outside a method, or `super()` outside a derived class's
+  // constructor (TS2337, TS2335).
+  UPSTREAM_ERRORS.SUPER_OUTSIDE_METHOD,
+  UPSTREAM_ERRORS.SUPER_CALL_OUTSIDE_CONSTRUCTOR,
+  // acorn: `function f(...a,) {}` (TS1013).
+  TS_ERRORS.REST_ELEMENT_TRAILING_COMMA,
+  // acorn: `let` used as a name in strict code (TS1213, TS1214), such as a bare
+  // `let`, a binding name (`var let`, `class let {}`), or an assignment target
+  // (`let = 1`). acorn reports a binding name or a target more than once, and
+  // only the first is recorded (see `#collectCheckerLevelError`).
+  UPSTREAM_ERRORS.LET_RESERVED,
+  UPSTREAM_ERRORS.LET_BINDING,
+  // acorn-typescript: `abstract` members in a class that isn't abstract (TS1244).
+  UPSTREAM_ERRORS.ABSTRACT_METHOD_IN_CLASS,
+  // `abstract function f() {}`, `export abstract let x = 1;` (TS1242), raised
+  // by `tsParseDeclaration` and `tsTryParseDeclare`.
+  TS_ERRORS.ABSTRACT_MODIFIER_NOT_ALLOWED,
+  // `export global {}` (TS2668), raised by `parseExportDeclaration`.
+  TS_ERRORS.EXPORT_MODIFIER_ON_AUGMENTATION,
+  // acorn-typescript: `declare class A { x = 1 }`, `declare let x = 1` (TS1039).
+  UPSTREAM_ERRORS.AMBIENT_INITIALIZER,
+  // acorn-typescript: modifiers out of order, incompatible, or repeated
+  // (TS1029, TS1243, TS1030, TS1028). See `raise` for the repeated ones.
+  TS_ERRORS.MODIFIER_MUST_PRECEDE,
+  TS_ERRORS.MODIFIER_CANNOT_BE_USED_WITH,
+  TS_ERRORS.ACCESSIBILITY_MODIFIER_ALREADY_SEEN,
+  UPSTREAM_ERRORS.DUPLICATE_MODIFIER,
+  // acorn-typescript: a modifier where TypeScript doesn't allow one, on a type
+  // member (TS1070) or a type parameter (TS1273), or `in` or `out` outside the
+  // type parameters of a class, interface, or type alias (TS1274). See `raise`.
+  UPSTREAM_ERRORS.TYPE_MEMBER_MODIFIER,
+  UPSTREAM_ERRORS.TYPE_PARAMETER_MODIFIER,
+  UPSTREAM_ERRORS.VARIANCE_MODIFIER,
+  // acorn-typescript: a parameter property with a binding pattern,
+  // `constructor(public [a]: T) {}` (TS1187), also with a default (see
+  // `#parseAssignableListItem`).
+  TS_ERRORS.PATTERN_PARAMETER_PROPERTY,
+  // acorn-typescript: a parameter property modifier on a function's or a
+  // signature's parameter, `function f(public x) {}` (TS2369), when collecting.
+  // See `parseBindingList` and `tsParseBindingListForSignature`.
+  TS_ERRORS.PARAMETER_PROPERTY_OUTSIDE_CONSTRUCTOR,
+  // A parameter's default in a signature, `type F = (a = 1) => void` (TS2371),
+  // raised by `tsParseBindingListForSignature`.
+  TS_ERRORS.SIGNATURE_PARAMETER_INITIALIZER,
+  // acorn-typescript: `private #x` (TS18010), `abstract #x` (TS18019).
+  UPSTREAM_ERRORS.PRIVATE_ELEMENT_ACCESSIBILITY,
+  UPSTREAM_ERRORS.PRIVATE_ELEMENT_ABSTRACT,
+  // `function f({ a }?: T) {}` (TS2463), raised by `parseFunctionBody` for a
+  // function with a body.
+  TS_ERRORS.OPTIONAL_BINDING_PATTERN_PARAMETER,
+  // `function f(...a?: T[]) {}` (TS1047), raised by `parseBindingListItem`.
+  TS_ERRORS.OPTIONAL_REST_PARAMETER,
+  // `function f(...a = []) {}` (TS1048), raised by `parseBindingListItem`, or
+  // by `parseFunctionBody` for an arrow function. See
+  // `#readRestParameterDefault`.
+  TS_ERRORS.REST_PARAMETER_INITIALIZER,
+  // acorn-typescript: `class A { @dec constructor() {} }` (TS1206).
+  UPSTREAM_ERRORS.DECORATED_CONSTRUCTOR,
+  // acorn-typescript: `with { type: 'json', type: 'json' }`, an ECMAScript early
+  // error that TypeScript doesn't report at all.
+  TSRX_ERRORS.DUPLICATED_ATTRIBUTE_KEY
+]);
+function get_error_message(message) {
+  return typeof message === "string" ? message : typeof message?.message === "string" ? message.message : String(message);
+}
+function is_pattern_parameter_expression(node) {
+  let target = (
+    /** @type {ParameterExpression} */
+    node
+  );
+  if (target.type === "AssignmentExpression") {
+    target = /** @type {ParameterExpression} */
+    target.left;
+  }
+  if (target.type === "TSTypeCastExpression") {
+    target = /** @type {ParameterExpression} */
+    target.expression;
+  }
+  return target.type === "ArrayExpression" || target.type === "ObjectExpression" || target.type === "ArrayPattern" || target.type === "ObjectPattern";
+}
+var NESTED_IMPORT_EXPORT = "'import' and 'export' may only appear at the top level";
+var regex_next_token = /(?:\s|\/\/[^\n\r\u2028\u2029]*|\/\*[\s\S]*?\*\/)*([\p{ID_Start}$_][\p{ID_Continue}$\u200c\u200d]*|\S)/uy;
+function nested_import_export_error(input, position) {
+  const tokens = [];
+  regex_next_token.lastIndex = position;
+  for (let match; tokens.length < 4 && (match = regex_next_token.exec(input)); ) {
+    tokens.push(match[1]);
+  }
+  const [keyword, first, second, third] = tokens;
+  if (keyword === "import" || first === "import") return TS_ERRORS.NESTED_IMPORT;
+  if (first === "=") return TS_ERRORS.NESTED_EXPORT_ASSIGNMENT;
+  if (first === "as") return TS_ERRORS.NESTED_GLOBAL_EXPORT;
+  if (first === "{" || first === "*" || first === "type" && (second === "{" || second === "*")) {
+    return TS_ERRORS.NESTED_EXPORT;
+  }
+  if (first === "default" && !(second === "function" || second === "class" || second === "interface" || second === "async" && third === "function" || second === "abstract" && third === "class")) {
+    return TS_ERRORS.NESTED_DEFAULT_EXPORT;
+  }
+  const declared = first === "declare" ? second : first;
+  if (declared === "namespace" || declared === "module") return TS_ERRORS.NESTED_NAMESPACE;
+  return TS_ERRORS.MODIFIERS_CANNOT_APPEAR_HERE;
+}
+function modified_declaration_kind(declaration2) {
+  switch (declaration2.type) {
+    case "ClassDeclaration":
+      return "class";
+    case "FunctionDeclaration":
+    case "TSDeclareFunction":
+      return "function";
+    case "VariableDeclaration": {
+      const kind = (
+        /** @type {string} */
+        /** @type {AST.VariableDeclaration} */
+        declaration2.kind
+      );
+      return kind === "using" || kind === "await using" ? kind : "variable";
+    }
+    case "TSEnumDeclaration":
+      return "enum";
+    case "TSInterfaceDeclaration":
+      return "interface";
+    case "TSTypeAliasDeclaration":
+      return "type";
+    case "TSModuleDeclaration":
+      return "module";
+    default:
+      return "import";
+  }
+}
+function dropped_modifier_error(modifier, kind, block2, duplicate) {
+  if (block2) {
+    return modifier === "abstract" && kind === "class" || modifier === "async" && kind === "function" ? TS_ERRORS.MODIFIER_ALREADY_SEEN(modifier) : TS_ERRORS.MODIFIERS_CANNOT_APPEAR_HERE;
+  }
+  switch (modifier) {
+    case "public":
+    case "protected":
+    case "private":
+    case "static":
+      return TS_ERRORS.MODIFIER_ON_MODULE_ELEMENT(modifier);
+    case "readonly":
+      return TS_ERRORS.READONLY_MODIFIER_NOT_ALLOWED;
+    case "accessor":
+      return TS_ERRORS.ACCESSOR_MODIFIER_NOT_ALLOWED;
+  }
+  if (duplicate) return TS_ERRORS.MODIFIER_ALREADY_SEEN(modifier);
+  switch (modifier) {
+    case "abstract":
+      return TS_ERRORS.ABSTRACT_MODIFIER_NOT_ALLOWED;
+    case "async":
+      return TS_ERRORS.MODIFIER_CANNOT_BE_USED_HERE(modifier);
+  }
+  return kind === "import" ? TS_ERRORS.MODIFIER_ON_IMPORT("declare") : using_modifier_error(
+    /** @type {'using' | 'await using'} */
+    kind,
+    modifier
+  );
+}
+function using_modifier_error(kind, modifier) {
+  return kind === "using" ? TS_ERRORS.MODIFIER_ON_USING(modifier) : TS_ERRORS.MODIFIER_ON_AWAIT_USING(modifier);
+}
+function error_kind(error2) {
+  return typeof error2 === "string" ? get_upstream_error(error2) : error2;
+}
+function to_diagnostic(error2, kind = error_kind(error2)) {
+  if (typeof error2 !== "string") return error2;
+  return { code: (
+    /** @type {{ code?: string } | undefined} */
+    kind?.code
+  ), message: error2 };
+}
+var SCOPE_TOP2 = 1;
+var SCOPE_FUNCTION2 = 2;
+var SCOPE_ASYNC2 = 4;
+var SCOPE_SIMPLE_CATCH2 = 32;
+var SCOPE_CLASS_STATIC_BLOCK2 = 256;
+var SCOPE_CLASS_FIELD_INIT2 = 512;
+var TS_SCOPE_OTHER2 = 1 << 20;
+var TS_SCOPE_TS_MODULE2 = 1 << 21;
+var TABLE_SCOPE_FLAGS = SCOPE_TOP2 | SCOPE_FUNCTION2 | SCOPE_CLASS_STATIC_BLOCK2;
+var BIND_TS_TYPE2 = 6;
+var BIND_FLAGS_TS_ENUM2 = 256;
+var FUNC_STATEMENT3 = 1;
+var FUNC_NULLABLE_ID3 = 4;
+var block_scoped_names = /* @__PURE__ */ new WeakMap();
+function block_scoped_names_of(scope) {
+  let names = block_scoped_names.get(scope);
+  if (!names) block_scoped_names.set(scope, names = []);
+  return names;
+}
+var function_names = /* @__PURE__ */ new WeakMap();
+function function_names_of(scope) {
+  let names = function_names.get(scope);
+  if (!names) function_names.set(scope, names = []);
+  return names;
+}
+var catch_parameter_names = /* @__PURE__ */ new WeakMap();
+var block_scoped_redeclarations = /* @__PURE__ */ new WeakMap();
 var parser_line_starts = /* @__PURE__ */ new WeakMap();
 function get_line_info(parser, offset2) {
   let starts = parser_line_starts.get(parser);
@@ -15151,24 +17303,35 @@ function get_line_info(parser, offset2) {
   }
   return new Position(low + 1, offset2 - starts[low]);
 }
-var DYNAMIC_TAG_WRAPPER_TYPES = /* @__PURE__ */ new Set([
-  "TSAsExpression",
-  "TSTypeAssertion",
-  "TSNonNullExpression",
-  "ParenthesizedExpression",
-  "ChainExpression"
-]);
-var DYNAMIC_TAG_DISALLOWED_TYPES = /* @__PURE__ */ new Set([
-  "SpreadElement",
-  "ExperimentalSpreadProperty",
-  "ObjectExpression",
-  "ArrayExpression",
-  "CallExpression",
-  "NewExpression",
-  "TaggedTemplateExpression"
-]);
-function is_dynamic_tag_wrapper(node) {
-  return DYNAMIC_TAG_WRAPPER_TYPES.has(node.type);
+function find_invalid_dynamic_tag_part(node) {
+  if (node.metadata?.parenthesized) return node;
+  if (node.type === "Identifier") return node.name === "undefined" ? node : null;
+  if (node.type === "Literal") return typeof node.value === "string" ? null : node;
+  if (node.type !== "MemberExpression") return node;
+  const object3 = node.object;
+  const invalid_object = object3.type === "Identifier" || object3.type === "MemberExpression" ? find_invalid_dynamic_tag_part(object3) : object3.type !== "ThisExpression" || object3.metadata?.parenthesized ? object3 : null;
+  if (invalid_object || !node.computed) return invalid_object;
+  const key2 = node.property;
+  if (key2.metadata?.parenthesized) return key2;
+  if (key2.type === "Identifier") return null;
+  if (key2.type === "Literal") {
+    return typeof key2.value === "string" || typeof key2.value === "number" ? null : key2;
+  }
+  if (key2.type === "MemberExpression") return find_invalid_dynamic_tag_part(key2);
+  return key2;
+}
+function end_after_parentheses(input, node) {
+  let end = node.end;
+  const paren_start = node.metadata?.paren_start;
+  if (paren_start === void 0) return end;
+  for (let i2 = paren_start; i2 !== -1 && i2 < node.start; ) {
+    if (input.charCodeAt(i2) !== CharCode.openParen) break;
+    i2 = skip_space_and_comments_from(input, i2 + 1);
+    const close = skip_space_and_comments_from(input, end);
+    if (close === -1 || input.charCodeAt(close) !== CharCode.closeParen) break;
+    end = close + 1;
+  }
+  return end;
 }
 var argument_clash_first_positions = /* @__PURE__ */ new WeakMap();
 var argument_clash_reported_names = /* @__PURE__ */ new WeakMap();
@@ -15191,6 +17354,10 @@ function get_argument_clash_reported_names(check_clashes) {
 function can_start_tag_after_lt(input, index) {
   const next = index + 1 < input.length ? input.charCodeAt(index + 1) : -1;
   return next === CharCode.slash || next === CharCode.greaterThan || next === CharCode.openBrace || next === CharCode.at || next === CharCode.dollar || next === CharCode.underscore || next >= CharCode.uppercaseA && next <= CharCode.uppercaseZ || next >= CharCode.lowercaseA && next <= CharCode.lowercaseZ;
+}
+var regex_script_end_tag_start = /<\/script/giu;
+function is_html_whitespace(code) {
+  return code === CharCode.tab || code === CharCode.lineFeed || code === 12 || code === CharCode.carriageReturn || code === CharCode.space;
 }
 function skip_whitespace_from(input, i2) {
   while (i2 < input.length) {
@@ -15415,19 +17582,22 @@ function TSRXPlugin(config) {
     const b_stat = tc.b_stat || types.b_stat;
     const b_expr = tc.b_expr || types.b_expr;
     const q_tmpl = tc.q_tmpl || types.q_tmpl;
+    const b_tmpl = tc.b_tmpl || types.b_tmpl;
     const tstt = Parser4.acornTypeScript.tokTypes;
     const tstc = Parser4.acornTypeScript.tokContexts;
     class TSRXParser extends Parser4 {
       /** @type {AST.Node[]} */
       #path = [];
-      #commentContextId = 0;
       #collect = false;
       #loose = false;
+      // Set while `parseVarStatement` or `parseVar` lets `const` declarators omit
+      // the initializer (see `#parseConstWithoutInitializer`).
+      #collectingConstWithoutInitializer = false;
       /** @type {import('../types/index').CompileError[] | undefined} */
       #errors = void 0;
       /** @type {string | null} */
       #filename = null;
-      /** @type {WeakMap<object, { names: Set<string>, lexicalLength: number, varLength: number }>} */
+      /** @type {WeakMap<object, { names: Set<string>, lengths: number[] }>} */
       #localExportNamesByScope = /* @__PURE__ */ new WeakMap();
       #functionBodyDepth = 0;
       #allowExpressionContainerTrailingSemicolon = false;
@@ -15442,12 +17612,13 @@ function TSRXPlugin(config) {
       // `#filterTemplateScriptContexts`.
       /** @type {number[]} */
       #expressionContainerContextBaselines = [];
-      // `#path` length at the start of each open `{ … }` expression container.
-      // Raw template text inside a container belongs only to an element opened
-      // inside it (`{<div>   a</div>}`); at the container's own expression level
-      // (`{cond ? (<Outer>…</Outer>) : null}` after the `)`) the next characters
-      // are JS, and reading them as raw text would swallow tokens like `: null`.
-      /** @type {number[]} */
+      // `#path` and its length at the start of each open `{ … }` expression
+      // container. Raw template text inside a container belongs only to an
+      // element opened inside it (`{<div>   a</div>}`); at the container's own
+      // expression level (`{cond ? (<Outer>…</Outer>) : null}` after the `)`)
+      // the next characters are JS, and reading them as raw text would swallow
+      // tokens like `: null`. See `#containerPathBaseline`.
+      /** @type {Array<{ path: AST.Node[], length: number }>} */
       #expressionContainerPathBaselines = [];
       #consumeContainerBraceAfterScope = false;
       #scriptJSXElementDepth = 0;
@@ -15457,6 +17628,67 @@ function TSRXPlugin(config) {
       // `?` allows an expression next, so the tokenizer would otherwise read the
       // `<` of the type parameters as a JSX tag.
       #afterOptionalMemberName = false;
+      // The node `tsParseModifiers` is reading modifiers for, so that
+      // `tsParseModifier` can tell whether it has already read `static`.
+      /** @type {{ static?: unknown } | null} */
+      #modifiersNode = null;
+      // The closing token of the binding list being read (see
+      // `parseBindingListItem`).
+      /** @type {Parse.TokenType | null} */
+      #bindingListClose = null;
+      // Where the binding list item being read starts, after its decorators (see
+      // `#parseAssignableListItem`).
+      #assignableListItemStart = -1;
+      // When collecting, the list being read that can be an arrow function's
+      // parameters: a parenthesized expression or the arguments of `async (…)`
+      // (see `#parseArrowParameterProperty`).
+      /** @type {ArrowParameterList | null} */
+      #arrowParameterList = null;
+      // The innermost list of expressions being read (see
+      // `#checkParameterSyntax`).
+      /** @type {ExpressionList | null} */
+      #expressionList = null;
+      // The `?` of each optional rest parameter whose default
+      // `#readRestParameterDefault` read, where `#reportRestParameterMistakes`
+      // reports TS1047 for an arrow function's.
+      /** @type {WeakMap<AST.Node, number>} */
+      #restParameterQuestions = /* @__PURE__ */ new WeakMap();
+      // Where the last type parameter list ended (see `tsParseTypeParameters`).
+      #typeParametersEnd = -1;
+      // The innermost expression being read that can be a generic arrow
+      // function (see `#parseGenericArrowFunction`).
+      /** @type {GenericArrowFunction | null} */
+      #genericArrowFunction = null;
+      // Whether the binding list being read is the parameters of the generic
+      // arrow function being read (see `parseBindingListItem`).
+      #readingGenericArrowParameters = false;
+      // While the arguments of `async (…)` are read: where the `(` is, and the
+      // list of them (see `#parseAsyncArguments`).
+      /** @type {ExpressionList & { start: number } | null} */
+      #asyncArguments = null;
+      // While `parseVarId` reads a declaration's names, or `parseClassId` a class
+      // declaration's, the kind of declaration and the scope it declares them
+      // in (see `declareName`).
+      /** @type {{ kind: string, scope: Parse.Scope } | null} */
+      #declaration = null;
+      // While `declareName` declares a name that TypeScript reports as a
+      // redeclaration with another code than acorn's TS2300, the name and the
+      // error, which `raiseRecoverable` reports in place of acorn's, and for
+      // TS2451 the scope it's in (see `#redeclarationError`).
+      /** @type {{ name: string, error: Diagnostic, table: Parse.Scope | null } | null} */
+      #redeclaration = null;
+      // While `parseExportDeclaration` reads the declaration after `export`,
+      // where it starts (-1 otherwise).
+      #exportedDeclarationStart = -1;
+      // When collecting, where the leading decorators of the statement being read
+      // start, while `parseDecorators` reads them (-1 otherwise), and the error
+      // recorded for them when no class follows (see `parseDecorators`).
+      #leadingDecoratorsStart = -1;
+      /** @type {{ position: number, error: Diagnostic } | null} */
+      #droppedDecoratorsError = null;
+      // Set when `parseExportDefaultDeclaration` reads the decorators after
+      // `export default`, which are the declaration's leading decorators.
+      #readingDefaultExportDecorators = false;
       #templateScriptParsingDepth = 0;
       #controlFlowBlockAllowsNativeReturn = false;
       #parsingJSXSwitchCaseScriptStatementDepth = 0;
@@ -15473,13 +17705,49 @@ function TSRXPlugin(config) {
       // `parseElement`), for its closing tag to restore.
       /** @type {WeakMap<AST.Node, number>} */
       #elementContextDepths = /* @__PURE__ */ new WeakMap();
+      // The context depth before the `<` of an element that is an attribute
+      // value without braces, for `parseElement` to keep: the host's opening
+      // tag contexts. -1 otherwise.
+      #tagValueContextDepth = -1;
+      // The elements that are attribute values without braces: each closes in
+      // its host's opening tag, not in a template.
+      /** @type {WeakSet<AST.Node>} */
+      #tagValueElements = /* @__PURE__ */ new WeakSet();
+      // What enclosed each element when it started: `this.labels` and its length
+      // (see `#insideSwitchStartedAfter`), and the setup-statement depths (see
+      // `#elementStart`).
+      /** @type {WeakMap<AST.Node, { labels: Parse.Parser['labels'], labelsLength: number, scriptDepth: number, switchCaseScriptDepth: number, scriptJSXDepth: number }>} */
+      #elementStarts = /* @__PURE__ */ new WeakMap();
       #readingJSXControlFlowDirectiveKeyword = false;
       #readingJSXControlFlowHeader = false;
+      // Set while `@for` reads its statement, until `parseForStatement` takes it:
+      // the loop whose head may end with `index` and `key` clauses.
+      #readingForDirective = false;
+      /** @type {WeakSet<AST.Node>} */
+      #forDirectiveLoops = /* @__PURE__ */ new WeakSet();
+      // Where the last element of a `{ … }` list ended, so that `expect` can
+      // tell a comma expected after it at the end of the input is the list's
+      // missing `}`.
+      #braceListElementEnd = -1;
+      // Where the last decorator ended: a class member missing after one is not
+      // a missing `}`.
+      #decoratorEnd = -1;
+      // Where the `interface` after `export default` starts, which starts an
+      // interface declaration wherever its name is (see `hasFollowingLineBreak`).
+      #defaultExportInterfaceStart = -1;
+      // The modifiers `#parseModifiedStatement` read before `export`, for
+      // `#parseModifiedExport` to read the declaration after it with.
+      /** @type {{ read: DeclarationModifiers, context: ModifierContext } | null} */
+      #pendingModifiers = null;
+      // Where the declaration after an `abstract` that `tsParseDeclaration`
+      // reports starts, which keeps acorn-typescript's reading of modifiers.
+      #declarationAfterAbstractStart = -1;
       /**
        * @type {Parse.Parser['finishNode']}
        */
       finishNode(node, type) {
         const finished = super.finishNode(node, type);
+        if (this.#collect) this.#reportAwaitInNamespace(finished);
         if (DECORATABLE_NODE_TYPES.has(type)) {
           const decoratable = (
             /** @type {{ decorators?: AST.Decorator[] }} */
@@ -15530,6 +17798,9 @@ function TSRXPlugin(config) {
         this.#loose = tsrx_options?.loose === true;
         this.#errors = tsrx_options?.errors;
         this.#filename = tsrx_options?.filename || null;
+        if (this.#collect) {
+          this.options.checkPrivateFields = false;
+        }
       }
       /** @this {Parse.Parser} */
       #resetTokenStartToCurrentPosition() {
@@ -15610,6 +17881,9 @@ function TSRXPlugin(config) {
         try {
           this.expect(tt.braceL);
           this.#parseCodeBlockBody(node.body);
+          if (this.type !== tt.braceR) {
+            this.#raiseClosingBraceExpected();
+          }
         } finally {
           if (createNewLexicalScope) {
             this.exitScope();
@@ -15638,6 +17912,66 @@ function TSRXPlugin(config) {
       }
       #currentNativeTemplateNode() {
         return this.#openingNativeTemplateNode ?? this.#path.findLast((node) => this.#isNativeTemplateNode(node));
+      }
+      /**
+       * Whether a `switch` (`@switch` or JS) started after `node`: the position is
+       * then in the switch's own body, between its cases, which is code. In an
+       * element opened in a case, it is that element's children. A function body
+       * starts a new `this.labels`, so a switch in it started after any element
+       * outside it.
+       * @param {AST.Node} node
+       */
+      #insideSwitchStartedAfter(node) {
+        const at_start = this.#elementStarts.get(node);
+        const from = at_start?.labels === this.labels ? at_start.labelsLength : 0;
+        for (let i2 = from; i2 < this.labels.length; i2++) {
+          if (this.labels[i2].kind === "switch") return true;
+        }
+        return false;
+      }
+      /**
+       * The setup-statement depths when `node` started, to compare with the
+       * current ones: a depth above its value there means a setup statement
+       * started after `node`, and the position is in that statement's code. In
+       * an element opened in the statement, it is that element's children.
+       * `scriptDepth` is `#templateScriptParsingDepth`, raised by a setup
+       * statement of a `@{ … }` or directive body; `switchCaseScriptDepth` is
+       * `#parsingJSXSwitchCaseScriptStatementDepth`, raised by one of an `@case`.
+       * `scriptJSXDepth` is `#scriptJSXElementDepth` (see
+       * `#insideScriptJSXElement`). A node that no element start recorded counts
+       * from 0.
+       * @param {AST.Node} node
+       */
+      #elementStart(node) {
+        return this.#elementStarts.get(node) ?? {
+          labels: null,
+          labelsLength: 0,
+          scriptDepth: 0,
+          switchCaseScriptDepth: 0,
+          scriptJSXDepth: 0
+        };
+      }
+      /**
+       * Whether the position is in an element that acorn-typescript's JSX parser
+       * reads (see `jsx_parseElement`) and that started after the innermost TSRX
+       * element: an element in a dynamic tag name (`<{c ? <b>…</b> : 'i'}>`).
+       * Its children are read as template text, but that parser takes each text
+       * token as a child as it is, so a template's comments are text there, as
+       * in TSX.
+       */
+      #insideScriptJSXElement() {
+        const node = this.#path.findLast((node2) => this.#isNativeTemplateNode(node2));
+        return this.#scriptJSXElementDepth > (node ? this.#elementStart(node).scriptJSXDepth : 0);
+      }
+      /**
+       * Where the nodes opened inside the innermost `{ … }` expression container
+       * start in `#path`: after the nodes around the container, or at 0 once a
+       * directive body or a setup statement in the container has replaced
+       * `#path`, since every node on it opened inside the container.
+       */
+      #containerPathBaseline() {
+        const baseline = this.#expressionContainerPathBaselines.at(-1);
+        return baseline?.path === this.#path ? baseline.length : 0;
       }
       /**
        * @param {AST.Node | undefined} node
@@ -15741,25 +18075,43 @@ function TSRXPlugin(config) {
         }
         return this.#keywordEndsAt(previous, "function");
       }
-      #parseTemplateRawText() {
+      /**
+       * Read template text up to the next child or closing tag, and add it to
+       * `body` (see `#addTemplateText`). Returns where the text ends.
+       * @param {any[]} body
+       * @returns {number}
+       */
+      #parseTemplateRawText(body) {
         const start = this.start;
+        const start_loc = this.startLoc;
         const token_end = this.end;
         let index = start;
-        let value = "";
+        const pieces = [];
+        const comments = [];
+        let piece_start = start;
         while (index < this.input.length) {
           if (this.#isTemplateLineCommentStart(index, start)) {
             const comment_start = index;
+            pieces.push([piece_start, comment_start]);
             index += 2;
             while (index < this.input.length && this.input.charCodeAt(index) !== CharCode.lineFeed && this.input.charCodeAt(index) !== CharCode.carriageReturn) {
               index++;
             }
             if (comment_start >= token_end) {
-              this.#emitTemplateLineComment(comment_start, index, null);
+              this.#emitTemplateLineComment(comment_start, index);
             }
+            comments.push({
+              type: "Line",
+              value: this.input.slice(comment_start + 2, index),
+              start: comment_start,
+              end: index
+            });
+            piece_start = index;
             continue;
           }
           if (this.#isTemplateBlockCommentStart(index)) {
             const comment_start = index;
+            pieces.push([piece_start, comment_start]);
             const comment_start_loc = get_line_info(this, comment_start);
             const close = this.input.indexOf("*/", index + 2);
             const value_end = close === -1 ? this.input.length : close;
@@ -15772,77 +18124,216 @@ function TSRXPlugin(config) {
                 comment_start,
                 index,
                 new Position(comment_start_loc.line, comment_start_loc.column),
-                new Position(comment_end_loc.line, comment_end_loc.column),
-                null
+                new Position(comment_end_loc.line, comment_end_loc.column)
               );
             }
+            comments.push({
+              type: "Block",
+              value: this.input.slice(comment_start + 2, value_end),
+              start: comment_start,
+              end: index
+            });
+            piece_start = index;
             continue;
           }
           const ch = this.input.charCodeAt(index);
           if (ch === CharCode.lessThan && can_start_tag_after_lt(this.input, index) || ch === CharCode.openBrace || ch === CharCode.closeBrace || this.#isCodeBlockStart(index) || this.#isJSXControlFlowDirectiveAt(index)) {
             break;
           }
-          value += this.input[index];
           index++;
         }
         const endLoc = get_line_info(this, index);
-        const node = (
-          /** @type {ESTreeJSX.JSXText} */
-          this.startNodeAt(start, this.startLoc)
-        );
-        node.value = value;
-        node.raw = this.input.slice(start, index);
-        if (node.raw.match(regex_newline_characters)) {
+        if (this.input.slice(start, index).match(regex_newline_characters)) {
           this.curLine = endLoc.line;
           this.lineStart = index - endLoc.column;
         }
         this.pos = index;
         this.#popTemplateLiteralTokenContext();
         this.next();
-        return this.finishNodeAt(node, "JSXText", index, endLoc);
+        if (comments.length > 0) {
+          pieces.push([piece_start, index]);
+          this.#addTemplateText(body, pieces, comments);
+        } else {
+          const node = (
+            /** @type {ESTreeJSX.JSXText} */
+            this.startNodeAt(start, start_loc)
+          );
+          node.raw = this.input.slice(start, index);
+          node.value = this.#readJSXTextValue(start, index);
+          this.finishNodeAt(node, "JSXText", index, endLoc);
+          if (node.raw !== "") body.push(node);
+        }
+        return index;
       }
       /**
-       * JSX significant-whitespace rule for a template text child. Non-whitespace
-       * text is always kept; whitespace-only text is kept only when it is an
-       * intentional inline space (no newline) separating two siblings, and dropped
-       * when it is layout indentation (contains a newline).
-       *
-       * @param {ESTreeJSX.JSXText} node
+       * Add text with comments to `body`. A comment between children renders
+       * like `{/* … *\/}` in TSX, so the text becomes the children TSX has for
+       * it: the text before, between and after the comments, each piece exactly
+       * as written, and an empty `{}` for each comment. Each piece follows JSX's
+       * whitespace rules on its own, and a piece that is only layout whitespace
+       * renders nothing (see `isLayoutWhitespace`).
+       * @param {any[]} body
+       * @param {Array<[number, number]>} pieces The text before, between and
+       *   after the comments, one more than the comments
+       * @param {TemplateTextComment[]} comments
        */
-      #shouldKeepTemplateTextNode(node) {
-        if (!isWhitespaceTextNode(node)) {
-          return true;
-        }
-        return node.value !== "" && !regex_newline_characters.test(node.value);
-      }
-      #skipTrailingLayoutWhitespace() {
-        let index = this.start;
-        let has_newline = false;
-        while (index < this.input.length) {
-          const ch = this.input.charCodeAt(index);
-          if (ch === CharCode.lineFeed || ch === CharCode.carriageReturn) {
-            has_newline = true;
-            index++;
-          } else if (ch === CharCode.space || ch === CharCode.tab) {
-            index++;
-          } else if (ch === CharCode.slash && this.input.charCodeAt(index + 1) === CharCode.slash) {
-            const comment_start = index;
-            while (index < this.input.length && !this.#isNewlineCharCode(index)) {
-              index++;
-            }
-            this.#emitTemplateLineComment(comment_start, index, null);
-          } else {
-            break;
+      #addTemplateText(body, pieces, comments) {
+        for (const [index, [start, end]] of pieces.entries()) {
+          if (end > start) {
+            const node = (
+              /** @type {ESTreeJSX.JSXText} */
+              this.startNodeAt(start, this.#positionAt(start))
+            );
+            node.raw = this.input.slice(start, end);
+            node.value = this.#readJSXTextValue(start, end);
+            body.push(this.finishNodeAt(node, "JSXText", end, this.#positionAt(end)));
+          }
+          if (index < comments.length) {
+            body.push(this.#emptyTemplateContainer(comments[index].start, comments[index].end));
           }
         }
-        if (!has_newline) return;
-        const loc = get_line_info(this, index);
-        this.start = index;
-        this.startLoc = new Position(loc.line, loc.column);
-        if (this.pos <= index) {
-          this.curLine = loc.line;
-          this.lineStart = index - loc.column;
+      }
+      /**
+       * A `JSXText` node's `value`: the text from `start` to `end` as acorn's
+       * JSX parser reads an element's text, with its character references
+       * decoded (`&amp;` is `&`) by the reader it uses for them, and each CRLF
+       * line break read as LF. `raw` is the text as written. A `&` that starts
+       * no character reference is text.
+       * @param {number} start
+       * @param {number} end
+       * @returns {string}
+       */
+      #readJSXTextValue(start, end) {
+        const pos = this.pos;
+        let value = "";
+        let chunk_start = start;
+        let index = start;
+        while (index < end) {
+          const ch = this.input.charCodeAt(index);
+          if (ch === CharCode.ampersand) {
+            value += this.input.slice(chunk_start, index);
+            this.pos = index;
+            const entity = this.jsx_readEntity();
+            if (this.pos > end) {
+              value += "&";
+              this.pos = index + 1;
+            } else {
+              value += entity;
+            }
+            index = chunk_start = this.pos;
+          } else if (ch === CharCode.carriageReturn && index + 1 < end && this.input.charCodeAt(index + 1) === CharCode.lineFeed) {
+            value += this.input.slice(chunk_start, index) + "\n";
+            index = chunk_start = index + 2;
+          } else {
+            index++;
+          }
         }
+        this.pos = pos;
+        return value + this.input.slice(chunk_start, end);
+      }
+      /**
+       * Add the whitespace and comments from `start` to `end`, which the
+       * tokenizer skipped as code, as the text and comments they are between
+       * children (see `#addTemplateText`). The tokenizer has already recorded the
+       * comments.
+       * @param {any[]} body
+       * @param {number} start
+       * @param {number} end
+       */
+      #addSkippedTemplateText(body, start, end) {
+        const pieces = [];
+        const comments = [];
+        let piece_start = start;
+        let index = start;
+        while (index < end) {
+          const block2 = this.input.startsWith("/*", index);
+          if (!block2 && !this.input.startsWith("//", index)) {
+            index++;
+            continue;
+          }
+          const close = block2 ? this.input.indexOf("*/", index + 2) : -1;
+          let comment_end = block2 ? close === -1 ? end : close + 2 : index + 2;
+          while (!block2 && comment_end < end && !this.#isNewlineCharCode(comment_end)) {
+            comment_end++;
+          }
+          pieces.push([piece_start, index]);
+          comments.push({
+            type: block2 ? "Block" : "Line",
+            value: this.input.slice(index + 2, block2 ? comment_end - 2 : comment_end),
+            start: index,
+            end: comment_end
+          });
+          index = piece_start = comment_end;
+        }
+        pieces.push([piece_start, end]);
+        this.#addTemplateText(body, pieces, comments);
+      }
+      /**
+       * The tokenizer skips what is between two children when it reads the
+       * next token as code (after a control-flow block's `}`, where `skipSpace()`
+       * runs) or skips a comment where a text run would start (`<b />/* c *\/`).
+       * In an element's or fragment's children, that whitespace and those
+       * comments are the text and comments TSX has there: when text follows,
+       * the text starts where the previous child ends, so it is read as one run
+       * with them (`@if (x) { … } else` is the text " else"); otherwise they are
+       * added before the next child.
+       * @param {any[]} body
+       */
+      #readSkippedTemplateText(body) {
+        const parent = this.#path.at(-1);
+        if (parent?.type !== "JSXElement" && parent?.type !== "JSXFragment") return;
+        const opening = parent.type === "JSXElement" ? (
+          /** @type {AST.TSRXJSXElement} */
+          parent.openingElement
+        ) : (
+          /** @type {AST.TSRXJSXFragment} */
+          parent.openingFragment
+        );
+        const previous = body.at(-1) ?? opening;
+        const start = previous?.end;
+        if (typeof start !== "number" || this.start <= start) return;
+        if (!/^(?:\s|\/\/[^\n\r]*|\/\*[\s\S]*?\*\/)*$/.test(this.input.slice(start, this.start))) {
+          return;
+        }
+        const next = this.input.charCodeAt(this.start);
+        const starts_text = this.type === tstt.jsxText || this.type !== tt.eof && this.type !== tt.braceR && next !== CharCode.lessThan && next !== CharCode.openBrace && next !== CharCode.closeBrace && !this.#atCodeBlockStart() && !this.#isJSXControlFlowDirectiveStart();
+        if (starts_text) {
+          const loc = get_line_info(this, start);
+          this.pos = start;
+          this.start = start;
+          this.startLoc = new Position(loc.line, loc.column);
+        } else {
+          this.#addSkippedTemplateText(body, start, this.start);
+        }
+      }
+      /**
+       * An empty `{}` child, which renders nothing, for the comment from
+       * `start` to `end`, which the comment attachment puts in its
+       * `JSXEmptyExpression`. There are no braces in the source.
+       * @param {number} start
+       * @param {number} end
+       */
+      #emptyTemplateContainer(start, end) {
+        const start_loc = this.#positionAt(start);
+        const end_loc = this.#positionAt(end);
+        const expression = (
+          /** @type {ESTreeJSX.JSXEmptyExpression} */
+          this.startNodeAt(start, start_loc)
+        );
+        this.finishNodeAt(expression, "JSXEmptyExpression", end, end_loc);
+        const container = (
+          /** @type {ESTreeJSX.JSXExpressionContainer} */
+          this.startNodeAt(start, start_loc)
+        );
+        container.expression = expression;
+        return this.finishNodeAt(container, "JSXExpressionContainer", end, end_loc);
+      }
+      /**
+       * @param {number} index
+       */
+      #positionAt(index) {
+        const { line, column } = get_line_info(this, index);
+        return new Position(line, column);
       }
       /**
        * @param {number} index
@@ -15854,9 +18345,8 @@ function TSRXPlugin(config) {
       /**
        * @param {number} start
        * @param {number} end
-       * @param {Parse.CommentMetaData | null} metadata
        */
-      #emitTemplateLineComment(start, end, metadata) {
+      #emitTemplateLineComment(start, end) {
         if (!this.options.onComment) return;
         this.options.onComment(
           false,
@@ -15864,8 +18354,7 @@ function TSRXPlugin(config) {
           start,
           end,
           get_line_info(this, start),
-          get_line_info(this, end),
-          metadata
+          get_line_info(this, end)
         );
       }
       #isSwitchCaseScriptStatementStart() {
@@ -15932,7 +18421,7 @@ function TSRXPlugin(config) {
         const start = this.#switchCaseLabelStart();
         if (start === -1) return false;
         while (this.curContext() === tstc.tc_expr) {
-          this.context.pop();
+          this.#popContext();
         }
         this.pos = start;
         this.start = start;
@@ -16006,9 +18495,9 @@ function TSRXPlugin(config) {
           /** @type {ESTreeJSX.JSXText} */
           this.startNodeAt(start, this.startLoc)
         );
-        node.value = this.input.slice(start, index);
-        node.raw = node.value;
-        if (node.value.match(regex_newline_characters)) {
+        node.raw = this.input.slice(start, index);
+        node.value = this.#readJSXTextValue(start, index);
+        if (node.raw.match(regex_newline_characters)) {
           this.curLine = endLoc.line;
           this.lineStart = index - endLoc.column;
         }
@@ -16040,22 +18529,23 @@ function TSRXPlugin(config) {
        *   not depend on which construct the template sits in.
        */
       #shouldReadTemplateRawTextToken(allow_inside_expression_container = false, ignore_directive_start = false) {
-        if (this.#closingNativeTemplateNode || this.#readingJSXControlFlowDirectiveKeyword || this.#readingJSXControlFlowHeader || this.#parsingJSXSwitchCaseScriptStatementDepth > 0 || !ignore_directive_start && this.#templateScriptParsingDepth > 0 || !allow_inside_expression_container && this.#jsxExpressionContainerDepth > 0) {
+        if (this.#closingNativeTemplateNode || this.#readingJSXControlFlowDirectiveKeyword || this.#readingJSXControlFlowHeader || !allow_inside_expression_container && this.#jsxExpressionContainerDepth > 0) {
           return false;
         }
         const current_context_token = this.curContext()?.token;
         if (current_context_token === "<tag" || current_context_token === "</tag") {
           return false;
         }
-        if (!ignore_directive_start && this.labels.some((label) => label.kind === "switch")) {
+        const current_template_node = this.#currentNativeTemplateNode();
+        if (!current_template_node) {
           return false;
         }
-        const current_template_node = this.#currentNativeTemplateNode();
-        if (!current_template_node || !ignore_directive_start && this.#isJSXControlFlowDirectiveAt(this.pos)) {
+        const element_start = this.#elementStart(current_template_node);
+        if (this.#parsingJSXSwitchCaseScriptStatementDepth > element_start.switchCaseScriptDepth || !ignore_directive_start && (this.#templateScriptParsingDepth > element_start.scriptDepth || this.#insideSwitchStartedAfter(current_template_node) || this.#isJSXControlFlowDirectiveAt(this.pos))) {
           return false;
         }
         if (this.#jsxExpressionContainerDepth > 0 && !this.#openingNativeTemplateNode) {
-          const path_baseline = this.#expressionContainerPathBaselines.at(-1) ?? 0;
+          const path_baseline = this.#containerPathBaseline();
           let inside_container = false;
           for (let i2 = this.#path.length - 1; i2 >= path_baseline; i2--) {
             if (this.#isNativeTemplateNode(this.#path[i2])) {
@@ -16086,7 +18576,7 @@ function TSRXPlugin(config) {
           return false;
         }
         const opening = this.#openingNativeTemplateNode;
-        if (opening && current_template_node === opening && opening.type !== "JSXFragment" && opening.openingElement?.selfClosing && this.input.charCodeAt(this.lastTokEnd - 1) === CharCode.greaterThan && this.input.charCodeAt(this.lastTokEnd - 2) === CharCode.slash) {
+        if (opening && current_template_node === opening && opening.type !== "JSXFragment" && opening.openingElement?.selfClosing && this.input.charCodeAt(this.lastTokEnd - 1) === CharCode.greaterThan) {
           const enclosing = this.#path.findLast(
             (node) => node !== opening && this.#isNativeTemplateNode(node)
           );
@@ -16115,7 +18605,7 @@ function TSRXPlugin(config) {
       }
       #readTemplateRawTextToken() {
         const start = this.pos;
-        const index = this.#templateRawTextEnd(start);
+        const index = this.#templateRawTextEnd(start, this.#insideScriptJSXElement());
         const endLoc = get_line_info(this, index);
         const value = this.input.slice(start, index);
         if (value.match(regex_newline_characters)) {
@@ -16126,11 +18616,12 @@ function TSRXPlugin(config) {
         return this.finishToken(tstt.jsxText, value);
       }
       /**
-       * A `//` is a comment only when nothing but whitespace precedes it on its
+       * A `//` is a comment when whitespace comes right before it, it starts a
        * line, or — given `run_start`, the position where the current text run
-       * began (right after a sibling element, code block, or expression
-       * container) — since that boundary. Once real text has begun, `//` is
-       * literal so inline text like `https://…` stays text.
+       * began (right after a tag, an expression container, a code block, or a
+       * directive's block) — it starts the run. A `//` that touches other text
+       * or a block comment is text: `https://…`, `a//b`, and `/* a *\/// b`.
+       * The comment runs to the end of the line, a closing tag on it included.
        * @param {number} index
        * @param {number} [run_start]
        */
@@ -16139,13 +18630,9 @@ function TSRXPlugin(config) {
           return false;
         }
         if (this.#isLineStartPosition(index)) return true;
-        if (run_start < 0) return false;
-        for (let i2 = index - 1; i2 >= run_start; i2--) {
-          const ch = this.input.charCodeAt(i2);
-          if (ch === CharCode.lineFeed || ch === CharCode.carriageReturn) return false;
-          if (ch !== CharCode.space && ch !== CharCode.tab) return false;
-        }
-        return true;
+        if (index === run_start) return true;
+        const before2 = this.input.charCodeAt(index - 1);
+        return before2 === CharCode.space || before2 === CharCode.tab || before2 === CharCode.lineFeed || before2 === CharCode.carriageReturn;
       }
       /**
        * Unlike `//` (which is only a comment at line-start so inline text like
@@ -16158,12 +18645,14 @@ function TSRXPlugin(config) {
       }
       /**
        * @param {number} start
+       * @param {boolean} comments_are_text Whether a comment is part of the text
+       *   (see `#insideScriptJSXElement`) instead of ending it.
        */
-      #templateRawTextEnd(start) {
+      #templateRawTextEnd(start, comments_are_text) {
         let index = start;
         while (index < this.input.length) {
           const ch = this.input.charCodeAt(index);
-          if (ch === CharCode.lessThan && can_start_tag_after_lt(this.input, index) || ch === CharCode.openBrace || ch === CharCode.closeBrace || this.#isJSXControlFlowDirectiveAt(index) || this.#isTemplateLineCommentStart(index, start) || this.#isTemplateBlockCommentStart(index)) {
+          if (ch === CharCode.lessThan && can_start_tag_after_lt(this.input, index) || ch === CharCode.openBrace || ch === CharCode.closeBrace || this.#isJSXControlFlowDirectiveAt(index) || !comments_are_text && (this.#isTemplateLineCommentStart(index, start) || this.#isTemplateBlockCommentStart(index))) {
             break;
           }
           index++;
@@ -16171,6 +18660,10 @@ function TSRXPlugin(config) {
         return index;
       }
       /**
+       * The `@` and the keyword touch, but after the keyword (and after the
+       * `await` of `@for await`) the header is code, where a comment is
+       * whitespace: a block comment before the `{` of `@try` or the `(` of
+       * `@if`, or `@if // c` with the `(` on the next line.
        * @param {number} index
        */
       #isJSXControlFlowDirectiveAt(index) {
@@ -16183,8 +18676,9 @@ function TSRXPlugin(config) {
           cursor++;
         }
         const word = this.input.slice(word_start, cursor);
-        const next_non_whitespace = skip_whitespace_from(this.input, cursor);
-        const next = this.input.charCodeAt(next_non_whitespace);
+        const next_token_start = skip_space_and_comments_from(this.input, cursor);
+        if (next_token_start === -1) return false;
+        const next = this.input.charCodeAt(next_token_start);
         if (this.#isIdentifierChar(this.input.charCodeAt(cursor))) {
           return false;
         }
@@ -16193,9 +18687,9 @@ function TSRXPlugin(config) {
         }
         if (word === "for") {
           if (next === CharCode.openParen) return true;
-          if (this.input.slice(next_non_whitespace, next_non_whitespace + 5) === "await" && !this.#isIdentifierChar(this.input.charCodeAt(next_non_whitespace + 5))) {
-            const after_await = skip_whitespace_from(this.input, next_non_whitespace + 5);
-            return this.input.charCodeAt(after_await) === CharCode.openParen;
+          if (this.input.slice(next_token_start, next_token_start + 5) === "await" && !this.#isIdentifierChar(this.input.charCodeAt(next_token_start + 5))) {
+            const after_await = skip_space_and_comments_from(this.input, next_token_start + 5);
+            return after_await !== -1 && this.input.charCodeAt(after_await) === CharCode.openParen;
           }
           return false;
         }
@@ -16301,7 +18795,7 @@ function TSRXPlugin(config) {
           }
         }
         if (this.curContext() === tstc.tc_expr) {
-          this.context.pop();
+          this.#popContext();
         }
         return node;
       }
@@ -16327,7 +18821,7 @@ function TSRXPlugin(config) {
         if (this.#isJSXControlFlowDirectiveAt(at_index)) {
           return this.#parseJSXControlFlowExpression();
         }
-        this.context.length -= this.#currentTokenContextCount();
+        this.#truncateContext(this.context.length - this.#currentTokenContextCount());
         this.pos = at_index;
         this.exprAllowed = true;
         this.next();
@@ -16343,7 +18837,7 @@ function TSRXPlugin(config) {
           this.unexpected();
         }
         if (this.curContext() === tstc.tc_expr) {
-          this.context.pop();
+          this.#popContext();
         }
         return node;
       }
@@ -16369,7 +18863,7 @@ function TSRXPlugin(config) {
                 render_node.start,
                 /** @type {number} */
                 render_node.end,
-                "A code block renders a single node; wrap multiple nodes or text in a fragment '<>\u2026</>'."
+                TSRX_ERRORS.CODE_BLOCK_SINGLE_OUTPUT
               );
             }
             flat.push(render_node);
@@ -16384,7 +18878,7 @@ function TSRXPlugin(config) {
                 statement.start,
                 /** @type {number} */
                 statement.end,
-                "Code must be at the top of '@{ }'; statements cannot follow the rendered output."
+                TSRX_ERRORS.CODE_BLOCK_STATEMENT_AFTER_OUTPUT
               );
             }
             flat.push(statement);
@@ -16433,6 +18927,9 @@ function TSRXPlugin(config) {
           this.exitScope();
           this.#path = enclosing_path;
         }
+        if (this.type !== tt.braceR) {
+          this.#raiseClosingBraceExpected();
+        }
         const last = flat[flat.length - 1];
         if (is_tsrx_render_output_node(last)) {
           node.render = last;
@@ -16444,9 +18941,6 @@ function TSRXPlugin(config) {
         }
         if (!allowReturnStatements) {
           this.#report_invalid_template_return_statements(node.body);
-        }
-        if (this.type !== tt.braceR) {
-          this.unexpected();
         }
         const brace_close_end = this.end;
         const brace_close_end_loc = this.endLoc;
@@ -16473,6 +18967,60 @@ function TSRXPlugin(config) {
           }
         }
         return super.parseExprAtom(refDestructuringErrors, forInit, forNew);
+      }
+      /**
+       * `yield` takes an argument that starts with `@`, like any other
+       * expression: `yield @{ … }`, `yield @if (…) { … }`, or a decorated class.
+       * TypeScript reads `@` as the start of an expression, but acorn-typescript's
+       * `parseYield` reads an argument only when the next token has
+       * `startsExpr`, which its `@` token doesn't, so it ended the `yield`
+       * before the `@`. A line break after `yield` still ends it.
+       * @type {Parse.Parser['parseYield']}
+       */
+      parseYield(forInit) {
+        const next = skip_space_and_comments_from(this.input, this.end);
+        if (next === -1 || this.input.charCodeAt(next) !== CharCode.at) {
+          return super.parseYield(forInit);
+        }
+        const parser = (
+          /** @type {Parse.Parser} */
+          this
+        );
+        if (!parser.yieldPos) parser.yieldPos = this.start;
+        const node = (
+          /** @type {AST.YieldExpression} */
+          this.startNode()
+        );
+        this.next();
+        node.delegate = false;
+        node.argument = this.canInsertSemicolon() ? null : this.parseMaybeAssign(forInit);
+        return this.finishNode(node, "YieldExpression");
+      }
+      /**
+       * An element or fragment isn't a left-hand-side expression, as in
+       * TypeScript's TSX parser, and neither is a TSRX value that lays out like
+       * one (`@{ … }`, `@if`, `@for`, `@switch`, `@try`). Unless it's
+       * parenthesized, no call, member access, index, non-null assertion, or
+       * tagged template follows it: a `(`, `[`, or template literal on the next
+       * line starts a new statement, and `<b />.foo` fails at the `.`.
+       * `(<b />).foo` and `(<b />)(x)` are still a member access and a call.
+       *
+       * A class or function expression is one, and takes type arguments right
+       * after its body, as in TypeScript: `class<T> {}<string>` and
+       * `function <T>() {}<string>()`. A `<` after a `}` reads as a tag start
+       * (see `getTokenFromCode`), so read it again as `<` when it's on the same
+       * line. On the next line it still starts an element (the line-start `<`
+       * rule), and a closing tag's `</` stays a tag start.
+       * @type {Parse.Parser['parseSubscripts']}
+       */
+      parseSubscripts(base, startPos, startLoc, noCalls, forInit) {
+        if (is_tsrx_render_output_node(base) && !base.metadata?.parenthesized) {
+          return base;
+        }
+        if ((base.type === "ClassExpression" || base.type === "FunctionExpression") && !this.hasPrecedingLineBreak()) {
+          this.#readTagStartAsTypeArgumentStart();
+        }
+        return super.parseSubscripts(base, startPos, startLoc, noCalls, forInit);
       }
       /**
        * Retype a parsed control-flow statement in place as its directive
@@ -16552,6 +19100,7 @@ function TSRXPlugin(config) {
           let node;
           const previous_reading_header = this.#readingJSXControlFlowHeader;
           this.#readingJSXControlFlowHeader = true;
+          this.#readingForDirective = true;
           try {
             node = /** @type {AST.JSXForExpression} */
             this.#finishJSXControlFlowExpression(
@@ -16564,15 +19113,12 @@ function TSRXPlugin(config) {
             this.#readingJSXControlFlowHeader = previous_reading_header;
             this.#templateControlFlowBlockDepth--;
           }
-          if (node.statementType !== "ForOfStatement" && node.statementType !== "ForInStatement" && node.statementType !== "ForStatement") {
-            this.raise(start, "Expected `for` after `@`.");
-          }
           if (node.body?.type !== "BlockStatement") {
-            this.raise(node.body?.start ?? start, "Expected `{` after JSX control-flow directive.");
+            this.raise(node.body?.start ?? start, TSRX_ERRORS.DIRECTIVE_BODY_EXPECTED);
           }
           if (this.#eatJSXForEmptyKeyword()) {
             if (this.type !== tt.braceL) {
-              this.raise(this.start, "Expected `{` after JSX control-flow directive.");
+              this.raise(this.start, TSRX_ERRORS.DIRECTIVE_BODY_EXPECTED);
             }
             const emptyKeyword = this.#lastClauseKeywordSpan;
             let empty3;
@@ -16590,7 +19136,7 @@ function TSRXPlugin(config) {
             if (node.range) node.range[1] = /** @type {number} */
             empty3.end;
           } else if (this.#isUnprefixedDirectiveClauseContinuation("empty", ["{"])) {
-            this.raise(this.start, "Expected `@empty` after `@for` block.");
+            this.raise(this.start, TSRX_ERRORS.DIRECTIVE_BRANCH_EXPECTED("empty", "for"));
           } else {
             node.empty = null;
           }
@@ -16612,7 +19158,7 @@ function TSRXPlugin(config) {
             this.#templateControlFlowTryDepth--;
           }
         }
-        this.raise(start, "Expected `@if`, `@for`, `@switch`, or `@try`.");
+        throw new Error(`Unexpected template directive '@${label}'.`);
       }
       /**
        * @param {string} keyword
@@ -16693,7 +19239,11 @@ function TSRXPlugin(config) {
         if (this.input.slice(keywordStart, keywordStart + keyword.length) !== keyword || this.#isIdentifierChar(this.input.charCodeAt(keywordStart + keyword.length))) {
           return false;
         }
-        const continuationStart = skip_whitespace_from(this.input, keywordStart + keyword.length);
+        const continuationStart = skip_space_and_comments_from(
+          this.input,
+          keywordStart + keyword.length
+        );
+        if (continuationStart === -1) return false;
         for (const continuation of continuations) {
           if (continuation.length === 1 && this.input[continuationStart] === continuation) {
             return true;
@@ -16718,7 +19268,7 @@ function TSRXPlugin(config) {
       }
       #parseTemplateControlFlowStatement() {
         if (this.type !== tt.braceL) {
-          this.raise(this.start, "Expected `{` after JSX control-flow directive.");
+          this.raise(this.start, TSRX_ERRORS.DIRECTIVE_BODY_EXPECTED);
         }
         return this.#parseTemplateControlFlowBlock();
       }
@@ -16745,7 +19295,7 @@ function TSRXPlugin(config) {
             this.#parseTemplateControlFlowStatement()
           );
         } else if (this.#isUnprefixedDirectiveClauseContinuation("else", ["{", "if"])) {
-          this.raise(this.start, "Expected `@else` after `@if` block.");
+          this.raise(this.start, TSRX_ERRORS.DIRECTIVE_BRANCH_EXPECTED("else", "if"));
         }
         return this.finishNode(node, "IfStatement");
       }
@@ -16793,7 +19343,7 @@ function TSRXPlugin(config) {
                 current2.test = this.parseExpression();
               } else {
                 if (sawDefault) {
-                  this.raiseRecoverable(this.lastTokStart, "Multiple default clauses");
+                  this.raise(this.lastTokStart, TS_ERRORS.MULTIPLE_DEFAULT_CLAUSES);
                 }
                 sawDefault = true;
                 current2.test = null;
@@ -16804,19 +19354,35 @@ function TSRXPlugin(config) {
             }
             const enclosing_path = this.#path;
             this.#path = [];
+            const body = (
+              /** @type {AST.BlockStatement} */
+              this.startNode()
+            );
+            body.body = [];
+            body.metadata = {
+              ...body.metadata,
+              path: [],
+              native_tsrx_template_block: true,
+              templateMode: "script",
+              allows_native_return: false
+            };
             try {
               this.expect(tt.braceL);
               this.enterScope(0);
               while (this.type !== tt.braceR && this.type !== tt.eof) {
-                this.#parseJSXSwitchCaseConsequent(current2.consequent);
+                this.#parseJSXSwitchCaseConsequent(body.body);
               }
               this.exitScope();
             } finally {
               this.#path = enclosing_path;
             }
             this.expect(tt.braceR);
+            current2.consequent.push(this.finishNode(body, "BlockStatement"));
             node.cases.push(this.finishNode(current2, "SwitchCase"));
             continue;
+          }
+          if (this.type === tt.eof) {
+            this.#raiseClosingBraceExpected();
           }
           this.unexpected();
         }
@@ -16842,10 +19408,10 @@ function TSRXPlugin(config) {
         if (this.type === tstt.jsxText && String(this.value ?? "").trim() !== "" && !this.#isJSXControlFlowDirectiveStart() && this.#switchCaseLabelStart(this.start) === -1) {
           const raw = String(this.value ?? "").trimStart();
           if (/^break\b/.test(raw)) {
-            this.raise(this.start, "`break` is invalid inside `@switch` cases.");
+            this.raise(this.start, TSRX_ERRORS.SWITCH_CASE_BREAK_STATEMENT);
           }
           if (/^return\b/.test(raw)) {
-            this.raise(this.start, "`return` is invalid inside `@switch` cases.");
+            this.raise(this.start, TSRX_ERRORS.SWITCH_CASE_RETURN_STATEMENT);
           }
           this.#filterTemplateScriptContexts();
           this.pos = this.start;
@@ -16909,17 +19475,17 @@ function TSRXPlugin(config) {
         }
         const label = this.type.keyword || this.type.label;
         if (label === "break") {
-          this.raise(this.start, "`break` is invalid inside `@switch` cases.");
+          this.raise(this.start, TSRX_ERRORS.SWITCH_CASE_BREAK_STATEMENT);
         }
         if (label === "return") {
-          this.raise(this.start, "`return` is invalid inside `@switch` cases.");
+          this.raise(this.start, TSRX_ERRORS.SWITCH_CASE_RETURN_STATEMENT);
         }
         if (label === "continue" || label === "throw") {
           consequent.push(this.parseStatement(null));
           return;
         }
         this.#filterTemplateScriptContexts();
-        const token_context = this.type === tt.backQuote || this.type === tt.parenL ? this.context.pop() : void 0;
+        const token_context = this.type === tt.backQuote || this.type === tt.parenL ? this.#popContext() : void 0;
         if (this.curContext() !== b_stat) {
           this.context.push(b_stat);
         }
@@ -16970,9 +19536,11 @@ function TSRXPlugin(config) {
       }
       /**
        * Read a raw-text element body: capture everything between the opening `>`
-       * and the literal `</tagName>` verbatim (never as template markup),
-       * synthesize the closing element, and restore the tokenizer state past it.
-       * Shared by `<style>` and `<script>`.
+       * and the closing tag verbatim (never as template markup), synthesize the
+       * closing element, and restore the tokenizer state past it. Shared by
+       * `<style>` and `<script>`. A `<style>` body ends at the literal
+       * `</style>`; a `<script>` body ends where HTML ends it (see
+       * `#findScriptBodyEnd`).
        *
        * Without a closing tag the element is unclosed and the rest of the input
        * is its body, except that in loose mode inside a template the body stops
@@ -16996,13 +19564,20 @@ function TSRXPlugin(config) {
         const input = this.input.slice(contentStart);
         const parent = this.#path.at(-2);
         const insideTemplate = this.#isNativeTemplateNode(parent);
-        let relativeCloseStart = input.indexOf(closeTag);
+        let relativeCloseStart = -1;
+        let closeTagLength = closeTag.length;
+        if (tagName === "script") {
+          const close = this.#findScriptBodyEnd(contentStart);
+          if (close) {
+            relativeCloseStart = close.start - contentStart;
+            closeTagLength = close.end - close.start;
+          }
+        } else {
+          relativeCloseStart = input.indexOf(closeTag);
+        }
         const unclosed = relativeCloseStart === -1;
         if (unclosed) {
-          this.#report_broken_markup_error(
-            open.end,
-            `Unclosed tag '<${tagName}>'. Expected '${closeTag}' before end of template.`
-          );
+          this.#report_broken_markup_error(open.end, TSRX_ERRORS.UNCLOSED_TAG(tagName));
           node.unclosed = true;
           relativeCloseStart = input.length;
           if (!this.#loose) {
@@ -17050,7 +19625,7 @@ function TSRXPlugin(config) {
             nameEnd,
             new Position(nameEndInfo.line, nameEndInfo.column)
           );
-          closingEnd = closingStart + closeTag.length;
+          closingEnd = closingStart + closeTagLength;
           const closingEndInfo2 = get_line_info(this, closingEnd);
           const closingElement = (
             /** @type {ESTreeJSX.TSRXJSXClosingElement & AST.NodeWithLocation} */
@@ -17066,7 +19641,7 @@ function TSRXPlugin(config) {
           node.closingElement = closingElement;
         }
         if (this.curContext() === tstc.tc_expr && !insideTemplate) {
-          this.context.pop();
+          this.#popContext();
         }
         this.exprAllowed = false;
         this.pos = closingEnd;
@@ -17080,18 +19655,18 @@ function TSRXPlugin(config) {
         this.endLoc = new Position(closingEndInfo.line, closingEndInfo.column);
         if (insideTemplate && relativeCloseStart === 0) {
           if (this.curContext() === tstc.tc_oTag) {
-            this.context.pop();
+            this.#popContext();
           }
           if (this.curContext() === tstc.tc_expr) {
-            this.context.pop();
+            this.#popContext();
           }
         }
         if (insideTemplate && this.curContext() === tstc.tc_expr) {
-          this.context.pop();
+          this.#popContext();
         }
         if (!insideTemplate && this.#path.at(-1) === node) {
-          if (contextDepth !== void 0 && this.context.length > contextDepth) {
-            this.context.length = contextDepth;
+          if (contextDepth !== void 0) {
+            this.#truncateContext(contextDepth);
           }
           this.#path.pop();
           try {
@@ -17103,6 +19678,42 @@ function TSRXPlugin(config) {
           this.next();
         }
         return content;
+      }
+      /**
+       * Where a `<script>` body ends: at `</script`, optional whitespace, then
+       * `>`. HTML ends a script at any `</script` followed by whitespace, `/`, or
+       * `>`, in any letter case, and reads the rest as markup, so every other
+       * `</script` in the body is reported, whatever follows it. Writing it
+       * `<\/script` keeps the same code (a string, a regular expression, or
+       * JSON) and doesn't end the script.
+       *
+       * @param {number} contentStart the offset after the opening tag's `>`
+       * @returns {{ start: number, end: number } | null} the closing tag's span,
+       *   or `null` when the body is unclosed
+       */
+      #findScriptBodyEnd(contentStart) {
+        const input = this.input;
+        regex_script_end_tag_start.lastIndex = contentStart;
+        let match;
+        while (match = regex_script_end_tag_start.exec(input)) {
+          const start = match.index;
+          const written = match[0];
+          if (written === "</script") {
+            let index = start + written.length;
+            while (index < input.length && is_html_whitespace(input.charCodeAt(index))) {
+              index++;
+            }
+            if (input.charCodeAt(index) === CharCode.greaterThan) {
+              return { start, end: index + 1 };
+            }
+          }
+          this.#report_recoverable_error_range(
+            start,
+            start + written.length,
+            TSRX_ERRORS.SCRIPT_END_TAG_IN_BODY(written)
+          );
+        }
+        return null;
       }
       /**
        * Whether the first non-whitespace character after an opening tag is
@@ -17148,47 +19759,23 @@ function TSRXPlugin(config) {
         node.children = [parsedCss];
       }
       /**
-       * Parse a `<script>` element as a raw-text element, exactly like `<style>`:
-       * the body is captured verbatim as `node.content`, letting authors write real
-       * JS/TS (with `<`, `{`, `}`) and letting the editor treat the body as an
-       * embedded TypeScript/JavaScript document.
+       * Parse a `<script>` element as a raw-text element, like `<style>`: the
+       * body is everything up to the closing tag, kept as written on
+       * `node.content`. None of JSX text's rules apply to it: it has no comments,
+       * no character references, and no `{…}` expressions, and its line breaks
+       * stay. So authors write real JS/TS (with `<`, `{`, `}`), and the editor
+       * treats the body as an embedded TypeScript/JavaScript document.
        *
-       * Mirroring `JSXStyleElement` (raw `css` string + parsed children), the body
-       * is exposed twice: verbatim on `content`, and as a single `JSXText` child so
-       * generic element paths (factory targets, static hoisting, printers) emit the
-       * body without knowing about raw-text elements. Consumers that handle
-       * `content` directly (target transforms, the Prettier plugin) must skip
-       * the children instead of emitting both.
+       * The element has no children: `content` is its only body, and each target
+       * prints it in the form that renders it exactly.
        *
        * @param {ESTreeJSX.TSRXJSXOpeningElement & AST.NodeWithLocation} open
        * @param {AST.TSRXJSXElement} node
        * @param {number} [contextDepth] see #parseRawTextElement
        */
       #parseScriptElement(open, node, contextDepth) {
-        const content = this.#parseRawTextElement(open, node, "script", contextDepth);
-        node.content = content;
+        node.content = this.#parseRawTextElement(open, node, "script", contextDepth);
         node.children = [];
-        if (content.length > 0) {
-          const bodyStartInfo = get_line_info(this, open.end);
-          const text = (
-            /** @type {ESTreeJSX.JSXText} */
-            this.startNodeAt(open.end, new Position(bodyStartInfo.line, bodyStartInfo.column))
-          );
-          text.value = content;
-          text.raw = content;
-          const bodyEnd = open.end + content.length;
-          const bodyEndInfo = get_line_info(this, bodyEnd);
-          this.finishNodeAt(
-            text,
-            "JSXText",
-            bodyEnd,
-            new Position(bodyEndInfo.line, bodyEndInfo.column)
-          );
-          node.children = [
-            /** @type {AST.Node} */
-            text
-          ];
-        }
       }
       #parseNativeTemplateExpressionContainer() {
         const allow_trailing_semicolon = this.#allowExpressionContainerTrailingSemicolon;
@@ -17241,12 +19828,38 @@ function TSRXPlugin(config) {
         }
         const context_index = this.context.lastIndexOf(tstc.tc_expr);
         if (context_index !== -1) {
-          this.context.length = context_index;
+          this.#truncateContext(context_index);
         }
       }
       #popTemplateLiteralTokenContext() {
         while (this.curContext()?.token === "`") {
-          this.context.pop();
+          this.#popContext();
+        }
+      }
+      /**
+       * Pop the token context stack's top. acorn-typescript parses some
+       * values speculatively (a `<` in `parseMaybeAssign` first tries an
+       * element), recording what the parse changes so that a failed attempt
+       * can be undone. It treats the stack as append-only unless a shortening
+       * goes through `parseEffects`, and a failed attempt that finds the stack
+       * shorter than it recorded throws its own error in place of the syntax
+       * error. Outside an attempt, this is a plain pop.
+       * @returns {Parse.Parser['context'][number] | undefined}
+       */
+      #popContext() {
+        return this.parseEffects ? this.parseEffects.pop(this.context) : this.context.pop();
+      }
+      /**
+       * Shorten the token context stack to `length`, if it is longer, as
+       * `#popContext` does.
+       * @param {number} length
+       */
+      #truncateContext(length) {
+        if (length >= this.context.length) return;
+        if (this.parseEffects) {
+          this.parseEffects.truncate(this.context, length);
+        } else {
+          this.context.length = length;
         }
       }
       /**
@@ -17368,10 +19981,9 @@ function TSRXPlugin(config) {
       /**
        * @param {number} position
        * @param {number} end
-       * @param {string} message
-       * @param {string} [code]
+       * @param {ReportedError} message
        */
-      #report_recoverable_error_range(position, end, message, code) {
+      #report_recoverable_error_range(position, end, message) {
         const start = Math.max(0, Math.min(position, this.input.length));
         const range_end = Math.max(start, Math.min(end, this.input.length));
         const start_loc = get_line_info(this, start);
@@ -17388,28 +20000,24 @@ function TSRXPlugin(config) {
               end: end_loc
             }
           },
-          this.#collect ? this.#errors : void 0,
-          void 0,
-          code
+          this.#collect ? this.#errors : void 0
         );
       }
       /**
        * @param {number} position
-       * @param {string} message
-       * @param {string} [code]
+       * @param {ReportedError} message
        */
-      #report_recoverable_error(position, message, code) {
-        this.#report_recoverable_error_range(position, position + 1, message, code);
+      #report_recoverable_error(position, message) {
+        this.#report_recoverable_error_range(position, position + 1, message);
       }
       /**
        * @param {number} position
-       * @param {string} message
-       * @param {string} [code]
+       * @param {Diagnostic} message
        */
-      #report_broken_markup_error(position, message, code = DIAGNOSTIC_CODES.UNCLOSED_TAG) {
+      #report_broken_markup_error(position, message) {
         if (this.#loose) return;
         if (this.#collect) {
-          this.#report_recoverable_error(position, message, code);
+          this.#report_recoverable_error(position, message);
           return;
         }
         this.raise(position, message);
@@ -17443,8 +20051,7 @@ function TSRXPlugin(config) {
             node.start ?? this.start,
             /** @type {AST.NodeWithLocation} */
             node.end ?? this.start + 1,
-            TSRX_RETURN_STATEMENT_ERROR,
-            DIAGNOSTIC_CODES.TEMPLATE_RETURN_STATEMENT
+            TSRX_ERRORS.TEMPLATE_RETURN_STATEMENT
           );
           return;
         }
@@ -17475,18 +20082,652 @@ function TSRXPlugin(config) {
         }
       }
       /**
-       * When collecting, keep parsing after duplicate declaration diagnostics so
-       * editor tooling can continue producing AST and mappings.
+       * When collecting, record a checker-level error (`CHECKER_LEVEL_ERRORS`) and
+       * keep parsing, so editor tooling and the formatter still get an AST.
        * @param {number} position
-       * @param {string | { message?: string }} message
+       * @param {string | Diagnostic | ((values: { modifier: string }) => string)} message
+       *   TSRX's own error, or acorn's or acorn-typescript's message
+       * @returns {never}
+       */
+      raise(position, message) {
+        let kind = typeof message === "function" ? void 0 : error_kind(message);
+        if (typeof message === "function") {
+          message = message({
+            modifier: this.input.slice(this.lastTokStart, this.lastTokEnd)
+          });
+          position = this.lastTokStart;
+          kind = error_kind(message);
+        } else if (kind === UPSTREAM_ERRORS.DUPLICATE_MODIFIER || kind === TS_ERRORS.ACCESSIBILITY_MODIFIER_ALREADY_SEEN) {
+          position = this.lastTokStart;
+        } else if (kind === TS_ERRORS.PARAMETER_PROPERTY_OUTSIDE_CONSTRUCTOR) {
+          position = this.#assignableListItemStart;
+        } else if (kind === TS_ERRORS.KEYWORD_ESCAPE_SEQUENCE && message === TS_ERRORS.KEYWORD_ESCAPE_SEQUENCE("asserts").message) {
+          message = kind = TS_ERRORS.KEYWORD_ESCAPE;
+        } else if (kind === TS_ERRORS.UNEXPECTED_LEADING_DECORATOR && this.#dropLeadingDecorators(position)) {
+          return (
+            /** @type {never} */
+            void 0
+          );
+        } else if (message === NESTED_IMPORT_EXPORT) {
+          this.#raiseCheckerError(position, nested_import_export_error(this.input, position));
+          return (
+            /** @type {never} */
+            void 0
+          );
+        }
+        const error2 = to_diagnostic(message, kind);
+        if (this.#collectCheckerLevelError(position, error2, kind)) {
+          return (
+            /** @type {never} */
+            void 0
+          );
+        }
+        return this.#throwError(position, error2);
+      }
+      /**
+       * Throw acorn's error for `error` at `position`, with its code: TSRX's
+       * own, or TypeScript's for a mistake TypeScript also reports.
+       * @param {number} position
+       * @param {ReportedError} error
+       * @returns {never}
+       */
+      #throwError(position, error2) {
+        try {
+          return super.raise(position, error2.message);
+        } catch (thrown) {
+          thrown.code = error2.code;
+          throw thrown;
+        }
+      }
+      /**
+       * @param {number} position
+       * @param {string | { message?: string }} message acorn's or
+       *   acorn-typescript's message
        */
       raiseRecoverable(position, message) {
-        const error_message = typeof message === "string" ? message : typeof message?.message === "string" ? message.message : String(message);
-        if (error_message.includes("has already been declared") || error_message === "Argument name clash") {
-          this.#report_recoverable_error(position, error_message);
+        const text = get_error_message(message);
+        const kind = error_kind(text);
+        const fallback = to_diagnostic(text, kind);
+        const redeclaration = kind === UPSTREAM_ERRORS.REDECLARED ? this.#redeclaration : null;
+        const error2 = redeclaration && !(redeclaration.table && !this.#collect && this.#declaresFunctionLater(position)) ? redeclaration.error : fallback;
+        if (this.#collectCheckerLevelError(position, error2, kind)) {
+          if (redeclaration?.table) {
+            const records = block_scoped_redeclarations.get(redeclaration.table) ?? [];
+            block_scoped_redeclarations.set(redeclaration.table, records);
+            this.parseEffects?.willAppend(records);
+            records.push({ name: redeclaration.name, pos: position, fallback });
+          }
           return;
         }
-        return super.raiseRecoverable(position, error_message);
+        if (kind === UPSTREAM_ERRORS.REDECLARED || kind === TS_ERRORS.ARGUMENT_NAME_CLASH) {
+          this.#report_recoverable_error(position, error2);
+          return;
+        }
+        return this.#throwError(position, error2);
+      }
+      /**
+       * Record `error` in `errors` when collecting and it is a checker-level
+       * error (`CHECKER_LEVEL_ERRORS`).
+       * @param {number} position
+       * @param {ReportedError} error
+       * @param {unknown} kind Its kind, from `error_kind`
+       * @returns {boolean} Whether the error was recorded, and parsing goes on
+       */
+      #collectCheckerLevelError(position, error2, kind) {
+        if (!this.#collect || !CHECKER_LEVEL_ERRORS.has(kind)) return false;
+        if (kind === TS_ERRORS.REST_ELEMENT_TRAILING_COMMA && this.type === tt.comma) {
+          if (this.#isAmbientRestParameterTrailingComma()) return false;
+          const next = this.lookaheadCharCode();
+          if (next !== CharCode.closeParen && next !== CharCode.closeBracket && next !== CharCode.closeBrace) {
+            return this.#readArrowParametersPastRestElement(position);
+          }
+          this.#recordCheckerLevelError(position, position + 1, error2);
+          this.next();
+          return true;
+        }
+        if (kind === UPSTREAM_ERRORS.LET_BINDING && this.#errors?.some((error3) => error3.pos === position)) {
+          return true;
+        }
+        if (kind === TS_ERRORS.MODIFIER_MUST_PRECEDE || kind === TS_ERRORS.MODIFIER_CANNOT_BE_USED_WITH) {
+          position = this.lastTokStart;
+        }
+        this.#recordCheckerLevelError(position, position + 1, error2);
+        return true;
+      }
+      /**
+       * Whether the current token is a comma between a rest parameter and `)` in
+       * an ambient context, which TypeScript allows and acorn-typescript skips.
+       */
+      #isAmbientRestParameterTrailingComma() {
+        return this.isAmbientContext && this.type === tt.comma && this.lookaheadCharCode() === CharCode.closeParen;
+      }
+      /**
+       * Record a checker-level error once: acorn checks an assignment target
+       * both when converting it and when validating it. An error recorded while
+       * acorn-typescript tries a parse that it then abandons is dropped with the
+       * rest of that parse's effects.
+       * @param {number} start
+       * @param {number} end
+       * @param {ReportedError} error
+       */
+      #recordCheckerLevelError(start, end, error2) {
+        if (this.#errors) {
+          if (this.#errors.some((other) => other.pos === start && other.message === error2.message)) {
+            return;
+          }
+          this.parseEffects?.willAppend(this.#errors);
+        }
+        this.#report_recoverable_error_range(start, end, error2);
+      }
+      /**
+       * A private name outside any class, which TypeScript reports as TS18016.
+       * A strict parse throws it where acorn raises its own error. When
+       * collecting, private-field checks are off (see the constructor), and it
+       * is recorded.
+       * @type {Parse.Parser['parsePrivateIdent']}
+       */
+      parsePrivateIdent() {
+        const outside_class = this.privateNameStack.length === 0;
+        if (outside_class && this.options.checkPrivateFields) {
+          this.raise(this.start, TS_ERRORS.PRIVATE_IDENTIFIER_OUTSIDE_CLASS);
+        }
+        const node = super.parsePrivateIdent();
+        if (outside_class && this.#collect) {
+          this.#recordCheckerLevelError(
+            /** @type {number} */
+            node.start,
+            /** @type {number} */
+            node.end,
+            TS_ERRORS.PRIVATE_IDENTIFIER_OUTSIDE_CLASS
+          );
+        }
+        return node;
+      }
+      /**
+       * `#x in obj` outside any class, which acorn fails at `#x` as an unexpected
+       * token before `parsePrivateIdent` reads it. A strict parse throws
+       * TypeScript's TS18016 instead, as for any other private name there.
+       * @type {Parse.Parser['parseMaybeUnary']}
+       */
+      parseMaybeUnary(refDestructuringErrors, sawUnary, incDec, forInit) {
+        if (!sawUnary && !forInit && this.type === tt.privateId && this.privateNameStack.length === 0 && this.options.checkPrivateFields) {
+          this.raise(this.start, TS_ERRORS.PRIVATE_IDENTIFIER_OUTSIDE_CLASS);
+        }
+        return super.parseMaybeUnary(refDestructuringErrors, sawUnary, incDec, forInit);
+      }
+      /**
+       * TypeScript reports a name its binder declares twice in one symbol table
+       * as TS2451 where the first declaration bound is a `let`, `const`, or
+       * `using` one, and otherwise as TS2300, which acorn's `Identifier '…' has
+       * already been declared` stands for. Its binder binds the function
+       * declarations of a list that aren't exported before the other
+       * statements. acorn keeps the names of `let`, `const`, and `using`
+       * declarations with those of classes (`lexical`), and a module's or
+       * function's function declarations with its `var`s, so the parser keeps
+       * the kinds apart, and has `raiseRecoverable` report TypeScript's code
+       * (see `#redeclarationError`).
+       * @type {Parse.Parser['declareName']}
+       */
+      declareName(name, bindingType, pos) {
+        const scope = this.currentScope();
+        const kind = this.#declaration?.scope === scope && (bindingType === BINDING_TYPES.BIND_LEXICAL || bindingType === BINDING_TYPES.BIND_VAR) ? this.#declaration.kind : null;
+        const outer = this.#redeclaration;
+        this.#redeclaration = this.#redeclarationError(name, bindingType, kind);
+        try {
+          super.declareName(name, bindingType, pos);
+        } finally {
+          this.#redeclaration = outer;
+        }
+        if (kind === "function") {
+          const names = function_names_of(scope);
+          this.parseEffects?.willAppend(names);
+          names.push(name);
+          this.#reportRedeclarationsBeforeFunction(scope, name);
+        } else if (kind !== null && kind !== "var" && kind !== "class") {
+          const names = block_scoped_names_of(scope);
+          this.parseEffects?.willAppend(names);
+          names.push(name);
+        }
+      }
+      /**
+       * The error TypeScript reports for declaring `name` with `bindingType`
+       * here, where acorn finds it declared already, when its code isn't
+       * acorn's TS2300: TS2567 when an enum is either declaration, TS2492 for a
+       * `let`, `const`, or `using` declaration of the parameter of the `catch`
+       * clause whose block it's in, TS2481 for a `var` in a block below one that
+       * declares the name with those, and TS2451 for a variable or class that
+       * redeclares such a name in the same symbol table, unless a function
+       * declaration of the name comes first there.
+       * @param {string} name
+       * @param {number} bindingType
+       * @param {string | null} kind The kind of declaration (see `#declaration`)
+       * @returns {{ name: string, error: Diagnostic, table: Parse.Scope | null } | null}
+       */
+      #redeclarationError(name, bindingType, kind) {
+        if (bindingType & BIND_FLAGS_TS_ENUM2) {
+          return { name, error: TS_ERRORS.ENUM_REDECLARED, table: null };
+        }
+        if (kind === null) return null;
+        const found = this.#findDeclaringScope(name, bindingType);
+        if (!found) return null;
+        const { scope, table } = found;
+        if (scope.enums?.includes(name)) {
+          return { name, error: TS_ERRORS.ENUM_REDECLARED, table: null };
+        }
+        const block_scoped = kind !== "var" && kind !== "class" && kind !== "function";
+        if (block_scoped && catch_parameter_names.get(scope)?.includes(name)) {
+          return { name, error: TS_ERRORS.CATCH_PARAMETER_REDECLARED(name), table: null };
+        }
+        if (kind === "function" || !block_scoped_names_of(scope).includes(name)) return null;
+        if (!table) {
+          return kind === "var" ? { name, error: TS_ERRORS.OUTER_SCOPED_VARIABLE_INITIALIZED(name, name), table: null } : null;
+        }
+        if (function_names_of(scope).includes(name)) return null;
+        return { name, error: TS_ERRORS.BLOCK_SCOPED_VARIABLE_REDECLARED(name), table: scope };
+      }
+      /**
+       * The scope where acorn finds `name` declared when it declares it with
+       * `bindingType` here, and whether that scope is the symbol table the
+       * declaration goes in: the current scope, or for a `var`-style one the
+       * first from there up to its symbol table whose lexical names have it.
+       * @param {string} name
+       * @param {number} bindingType
+       * @returns {{ scope: Parse.Scope, table: boolean } | null}
+       */
+      #findDeclaringScope(name, bindingType) {
+        if (bindingType !== BINDING_TYPES.BIND_VAR) {
+          return { scope: this.currentScope(), table: true };
+        }
+        for (let i2 = this.scopeStack.length - 1; i2 >= 0; i2--) {
+          const scope = this.scopeStack[i2];
+          const table = this.#isSymbolTable(i2);
+          if (scope.lexical.includes(name)) return { scope, table };
+          if (table) return null;
+        }
+        return null;
+      }
+      /**
+       * When collecting, a function declaration of `name` in `scope` comes first
+       * in TypeScript's binder, so the redeclarations of the name recorded
+       * there as TS2451 are TS2300, acorn's error.
+       * @param {Parse.Scope} scope
+       * @param {string} name
+       */
+      #reportRedeclarationsBeforeFunction(scope, name) {
+        const records = block_scoped_redeclarations.get(scope);
+        if (!records || !this.#errors) return;
+        for (const record of records) {
+          if (record.name !== name) continue;
+          const error2 = this.#errors.find(
+            (error3) => error3.pos === record.pos && error3.code === TS_ERRORS.BLOCK_SCOPED_VARIABLE_REDECLARED.code
+          );
+          if (!error2) continue;
+          this.parseEffects?.willSet(error2, "code");
+          this.parseEffects?.willSet(error2, "message");
+          error2.code = record.fallback.code;
+          error2.message = record.fallback.message;
+        }
+      }
+      /**
+       * Whether a strict parse throwing TS2451 at `position` has a function
+       * declaration of the name later in the list, which TypeScript binds
+       * first, so that it's TS2300. Only a parse of the rest can tell: it
+       * collects the errors of the input, which `#reportRedeclarationsBeforeFunction`
+       * corrects, and gives the code it records at `position`. It's needed only
+       * where a `function` keyword follows, which can't be written with an
+       * escape; a comment or an escaped name can come between it and the name.
+       * @param {number} position
+       */
+      #declaresFunctionLater(position) {
+        if (!/\bfunction\b/.test(this.input.slice(position))) return false;
+        const errors = [];
+        try {
+          /** @type {unknown} */
+          this.constructor.parse(
+            this.input,
+            /** @type {acorn.Options} */
+            {
+              sourceType: this.options.sourceType,
+              ecmaVersion: this.options.ecmaVersion,
+              allowReturnOutsideFunction: this.options.allowReturnOutsideFunction,
+              locations: true,
+              preserveParens: this.options.preserveParens,
+              tsrxOptions: { filename: this.#filename, collect: true, errors }
+            }
+          );
+        } catch {
+        }
+        return errors.find((error2) => error2.pos === position)?.code === UPSTREAM_ERRORS.REDECLARED.code;
+      }
+      /**
+       * Whether the scope at `index` in `scopeStack` is a symbol table of its own
+       * in TypeScript's binder, where a `var` in a block below it is declared: a
+       * module, a function, a class static block, or a namespace's body.
+       * @param {number} index
+       */
+      #isSymbolTable(index) {
+        const flags = this.scopeStack[index].flags;
+        if (flags & TABLE_SCOPE_FLAGS) return true;
+        return flags === TS_SCOPE_OTHER2 && index > 0 && (this.scopeStack[index - 1].flags & TS_SCOPE_TS_MODULE2) !== 0;
+      }
+      /**
+       * acorn throws `Unexpected token` for a `const` without an initializer
+       * outside an ambient context. TypeScript parses it and reports TS1155 from
+       * the checker. When collecting, `parseVarStatement` and `parseVar` (a `for`
+       * head) let `const` declarators omit the initializer, and `parseVarId`
+       * records the error for a name, or throws acorn's error for a pattern.
+       * @template T
+       * @param {string} kind
+       * @param {boolean | undefined} allowMissingInitializer
+       * @param {(allowMissingInitializer: boolean) => T} parse
+       * @returns {T}
+       */
+      #parseConstWithoutInitializer(kind, allowMissingInitializer, parse5) {
+        const outer = this.#collectingConstWithoutInitializer;
+        this.#collectingConstWithoutInitializer = this.#collect && kind === "const" && !allowMissingInitializer && !this.isAmbientContext;
+        try {
+          return parse5(!!allowMissingInitializer || this.#collectingConstWithoutInitializer);
+        } finally {
+          this.#collectingConstWithoutInitializer = outer;
+        }
+      }
+      /**
+       * acorn-typescript's `parseVarStatement` calls acorn's `parseVar` itself
+       * (`super.parseVar`), not the `parseVar` below, so the two never apply to
+       * the same declaration.
+       * @param {AST.VariableDeclaration} node
+       * @param {string} kind
+       * @param {boolean} [allowMissingInitializer]
+       */
+      parseVarStatement(node, kind, allowMissingInitializer) {
+        if (this.#collect && (kind === "const" || kind === "var") && this.#isEmptyDeclarationList()) {
+          return this.#parseEmptyVarStatement(node, kind);
+        }
+        return this.#parseConstWithoutInitializer(
+          kind,
+          allowMissingInitializer,
+          (allow) => super.parseVarStatement(node, kind, allow)
+        );
+      }
+      /**
+       * Whether no declarator follows the `const` or `var` at the current token
+       * where TypeScript's parser ends an empty declaration list: the next token
+       * can't start a declarator, and it is `;`, `}`, or the end of the input,
+       * or a line break comes before it (`isVariableDeclaratorListTerminator`).
+       */
+      #isEmptyDeclarationList() {
+        const next = this.lookahead();
+        if (Parser4.acornTypeScript.tokenIsIdentifier(next.type) || next.type === tt.braceL || next.type === tt.bracketL || next.type === tt.privateId) {
+          return false;
+        }
+        return next.type === tt.semi || next.type === tt.braceR || next.type === tt.eof || regex_line_break.test(this.input.slice(this.end, next.start));
+      }
+      /**
+       * Whether no declarator follows the `var`, `let`, or `const` of a `for`
+       * head at the current token, where TypeScript's parser ends an empty
+       * declaration list: as in a statement (`#isEmptyDeclarationList`), before
+       * `in`, or before `of` when a name and `)` follow it
+       * (`canFollowContextualOfKeyword`), as in `for (const of x)`. Otherwise
+       * `of` is the declarator's name, as in `for (const of of x)`.
+       */
+      #isEmptyForDeclarationList() {
+        if (this.#isEmptyDeclarationList()) return true;
+        const next = this.lookahead();
+        return next.type === tt._in || this.isContextualWithState("of", next) && Parser4.acornTypeScript.tokenIsIdentifier(this.lookahead(2).type) && this.lookahead(3).type === tt.parenR;
+      }
+      /**
+       * acorn reads a declarator right after `const` or `var`, and throws
+       * `Unexpected token` when none follows, as while a declaration is being
+       * typed. TypeScript parses an empty declaration list and reports TS1123
+       * from the checker. When collecting, finish the declaration with no
+       * declarators, as acorn-typescript's `parseVarStatement` would.
+       * @param {AST.VariableDeclaration} node
+       * @param {'const' | 'var'} kind
+       */
+      #parseEmptyVarStatement(node, kind) {
+        this.#parseEmptyDeclarationList(node, kind);
+        this.semicolon();
+        return this.finishNode(node, "VariableDeclaration");
+      }
+      /**
+       * Read the keyword of a declaration that has no declarators, and record
+       * TS1123 right after it, where TypeScript reports it.
+       * @param {AST.VariableDeclaration} node
+       * @param {AST.VariableDeclaration['kind']} kind
+       */
+      #parseEmptyDeclarationList(node, kind) {
+        this.next();
+        node.declarations = [];
+        node.kind = kind;
+        this.#recordCheckerLevelError(
+          this.lastTokEnd,
+          this.lastTokEnd,
+          TS_ERRORS.VARIABLE_DECLARATION_LIST_EMPTY
+        );
+      }
+      /**
+       * @param {AST.VariableDeclaration} node
+       * @param {boolean} isFor
+       * @param {string} kind
+       * @param {boolean} [allowMissingInitializer]
+       */
+      parseVar(node, isFor, kind, allowMissingInitializer) {
+        return this.#parseConstWithoutInitializer(
+          kind,
+          allowMissingInitializer,
+          (allow) => super.parseVar(node, isFor, kind, allow)
+        );
+      }
+      /**
+       * @param {AST.VariableDeclarator} decl
+       * @param {AST.VariableDeclaration['kind']} kind
+       */
+      parseVarId(decl, kind) {
+        const outer = this.#declaration;
+        this.#declaration = { kind, scope: this.currentScope() };
+        try {
+          super.parseVarId(decl, kind);
+        } finally {
+          this.#declaration = outer;
+        }
+        if (!this.#collectingConstWithoutInitializer || this.type === tt.eq || this.type === tt._in || this.isContextual("of")) {
+          return;
+        }
+        if (decl.id.type !== "Identifier") this.unexpected();
+        const start = (
+          /** @type {number} */
+          decl.id.start
+        );
+        this.#recordCheckerLevelError(
+          start,
+          start + decl.id.name.length,
+          TS_ERRORS.DECLARATION_NOT_INITIALIZED("const")
+        );
+      }
+      /**
+       * Records the list's closing token for `parseBindingListItem`: `)` for
+       * parameters, `]` for an array pattern.
+       * @type {Parse.Parser['parseBindingList']}
+       */
+      parseBindingList(close, allowEmpty, allowTrailingComma, allowModifiers) {
+        if (this.#collect && close === tt.parenR && allowModifiers === void 0) {
+          allowModifiers = false;
+        }
+        const outer = this.#bindingListClose;
+        const outer_generic_arrow = this.#readingGenericArrowParameters;
+        this.#bindingListClose = close;
+        this.#readingGenericArrowParameters = close === tt.parenR && this.#genericArrowFunction?.parametersStart === this.lastTokStart;
+        try {
+          return this.#collect ? this.#parseBindingListPastRestElement(
+            close,
+            allowEmpty,
+            allowTrailingComma,
+            allowModifiers
+          ) : super.parseBindingList(close, allowEmpty, allowTrailingComma, allowModifiers);
+        } finally {
+          this.#bindingListClose = outer;
+          this.#readingGenericArrowParameters = outer_generic_arrow;
+        }
+      }
+      /**
+       * acorn ends a binding list at its rest element: it raises for a comma
+       * after it and expects the list to close. TypeScript parses the elements
+       * after a rest element and reports them from the checker (TS1014, TS2462).
+       * When collecting, record acorn's error at the comma and keep parsing the
+       * list; this is acorn's `parseBindingList` with that one change.
+       * @type {Parse.Parser['parseBindingList']}
+       */
+      #parseBindingListPastRestElement(close, allowEmpty, allowTrailingComma, allowModifiers) {
+        const elements = [];
+        let first = true;
+        while (!this.eat(close)) {
+          if (first) first = false;
+          else this.expect(tt.comma);
+          if (allowEmpty && this.type === tt.comma) {
+            elements.push(
+              /** @type {AST.Pattern} */
+              /** @type {unknown} */
+              null
+            );
+          } else if (allowTrailingComma && this.afterTrailingComma(close)) {
+            break;
+          } else if (this.type === tt.ellipsis) {
+            const rest2 = this.parseRestBinding();
+            this.parseBindingListItem(rest2);
+            elements.push(rest2);
+            if (this.type === tt.comma && !this.#isAmbientRestParameterTrailingComma()) {
+              this.#recordCheckerLevelError(
+                this.start,
+                this.start + 1,
+                TS_ERRORS.REST_ELEMENT_TRAILING_COMMA
+              );
+            }
+          } else {
+            elements.push(this.parseAssignableListItem(allowModifiers));
+          }
+        }
+        return elements;
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#136): remove once a release includes the fix
+      // UPSTREAM(sveltejs/acorn-typescript#89)
+      /**
+       * The parameters of a function or constructor type, or of a method, call,
+       * or construct signature. TypeScript's parser reads parameter property
+       * modifiers before them too, and its checker reports them (TS2369).
+       * acorn-typescript reads them with acorn's `parseBindingList`, past
+       * `parseBindingList` above, with no `allowModifiers`, so `public` failed as
+       * a reserved word and the name after `readonly` as unexpected. When
+       * collecting, read them through `parseBindingList`, which reads the
+       * modifiers there and records TS2369 at the first one, as for a function's
+       * parameters. A strict parse still fails.
+       *
+       * TypeScript's parser reads a default there too, and its checker reports it
+       * (TS2371). acorn-typescript rejected the `AssignmentPattern` with its own
+       * message, in every mode. Raise TS2371 at the parameter instead, which
+       * `raise` records when collecting, keeping the default as typescript-estree
+       * does. A strict parse throws it. So is a rest parameter's default (see
+       * `#readRestParameterDefault`), after TS1048.
+       *
+       * This is acorn-typescript's method with those changes. Its check of each
+       * parameter looks through a parameter property to its parameter. A strict
+       * parse reads the list through `parseBindingList` too, for
+       * `parseBindingListItem` to know it's a parameter list.
+       * @type {Parse.Parser['tsParseBindingListForSignature']}
+       */
+      tsParseBindingListForSignature() {
+        return this.parseBindingList(tt.parenR, true, true).map((item) => {
+          const node = (
+            /** @type {AST.Node} */
+            item
+          );
+          const parameter = (
+            /** @type {AST.Node & AST.NodeWithLocation} */
+            node.type === "TSParameterProperty" ? node.parameter : node
+          );
+          if (parameter.type === "AssignmentPattern" || this.#isRestParameterWithDefault(parameter)) {
+            this.raise(parameter.start, TS_ERRORS.SIGNATURE_PARAMETER_INITIALIZER);
+          } else if (parameter.type !== "Identifier" && parameter.type !== "RestElement" && parameter.type !== "ObjectPattern" && parameter.type !== "ArrayPattern") {
+            this.raise(parameter.start, TS_ERRORS.SIGNATURE_PARAMETER_NAME(parameter.type));
+          }
+          return item;
+        });
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#139): remove once a release includes the fix
+      /**
+       * Whether a parameter starts at the current token, for the lookahead that
+       * tells a function type from a parenthesized type. TypeScript's
+       * `skipParameterStart` skips modifiers first, so
+       * `(public x: number) => void` is a function type, with TS2369 from its
+       * checker. When collecting, skip parameter property modifiers too, so
+       * that `tsParseBindingListForSignature` reads them. A strict parse still
+       * reads `(public x` as a parenthesized type and fails at `x`.
+       * @type {Parse.Parser['tsSkipParameterStart']}
+       */
+      tsSkipParameterStart() {
+        if (this.#collect) {
+          this.tsParseModifiers({ modified: {}, allowedModifiers: PARAMETER_MODIFIERS });
+        }
+        return super.tsSkipParameterStart();
+      }
+      /**
+       * acorn-typescript gives a namespace body acorn's class static block scope
+       * flag, so acorn reads `await` there as an identifier and throws `Cannot use
+       * await in class static initialization block`. TypeScript parses an `await`
+       * expression, `for await` loop, or `await using` declaration there and
+       * reports it from the checker (TS1308, TS1103, TS2852). When collecting,
+       * look through namespaces as TypeScript does; `finishNode` records the error.
+       * UPSTREAM(sveltejs/acorn-typescript#89)
+       */
+      get canAwait() {
+        const can_await = super.canAwait;
+        if (can_await || !this.#collect) return can_await;
+        return this.#awaitContext() === "namespace";
+      }
+      /**
+       * Whether `await` may be used here, going by acorn's `canAwait` with
+       * namespace scopes looked through.
+       * @returns {'none' | 'allowed' | 'namespace'} `namespace` when it may be
+       * used only because a namespace scope was looked through
+       */
+      #awaitContext() {
+        let in_namespace = false;
+        for (let i2 = this.scopeStack.length - 1; i2 >= 0; i2--) {
+          const { flags } = this.scopeStack[i2];
+          if (flags & TS_SCOPE_TS_MODULE2) {
+            in_namespace = true;
+          } else if (flags & (SCOPE_CLASS_STATIC_BLOCK2 | SCOPE_CLASS_FIELD_INIT2)) {
+            return "none";
+          } else if (flags & SCOPE_FUNCTION2) {
+            return !(flags & SCOPE_ASYNC2) ? "none" : in_namespace ? "namespace" : "allowed";
+          }
+        }
+        const allowed = this.inModule && this.options.ecmaVersion >= 13 || this.options.allowAwaitOutsideFunction;
+        return !allowed ? "none" : in_namespace ? "namespace" : "allowed";
+      }
+      /**
+       * Record TypeScript's error for an `await` that only parses because
+       * `canAwait` looks through namespaces.
+       * @param {AST.Node} node
+       */
+      #reportAwaitInNamespace(node) {
+        let error2 = null;
+        if (node.type === "AwaitExpression") {
+          error2 = TS_ERRORS.AWAIT_EXPRESSION_NOT_ALLOWED;
+        } else if (node.type === "ForOfStatement" && node.await) {
+          error2 = TS_ERRORS.FOR_AWAIT_NOT_ALLOWED;
+        } else if (node.type === "VariableDeclaration" && node.kind === "await using") {
+          error2 = TS_ERRORS.AWAIT_USING_NOT_ALLOWED;
+        }
+        if (error2 === null || this.#awaitContext() !== "namespace") return;
+        const start = node.type === "ForOfStatement" ? skip_space_and_comments_from(
+          this.input,
+          /** @type {number} */
+          node.start + 3
+        ) : (
+          /** @type {number} */
+          node.start
+        );
+        this.#recordCheckerLevelError(start, start + "await".length, error2);
       }
       /**
        * Override to allow single-parameter generic arrow functions without trailing comma.
@@ -17498,12 +20739,7 @@ function TSRXPlugin(config) {
        */
       reportReservedArrowTypeParam(node) {
         if (this.#collect && node.params.length === 1 && node.extra?.trailingComma === void 0 && !node.params[0].constraint && !node.params[0].default) {
-          error(
-            "This syntax is reserved in files with the .mts or .cts extension. Add a trailing comma, as in `<T,>() => ...`.",
-            this.#filename,
-            node,
-            this.#errors
-          );
+          error(TS_ERRORS.RESERVED_ARROW_TYPE_PARAMETER, this.#filename, node, this.#errors);
         }
       }
       /**
@@ -17522,12 +20758,7 @@ function TSRXPlugin(config) {
           return;
         }
         if (this.#collect) {
-          error(
-            "'readonly' type modifier is only permitted on array and tuple literal types.",
-            this.#filename,
-            typeAnnotation,
-            this.#errors
-          );
+          error(TS_ERRORS.READONLY_TYPE_MODIFIER, this.#filename, typeAnnotation, this.#errors);
         }
       }
       /**
@@ -17539,8 +20770,25 @@ function TSRXPlugin(config) {
        */
       #readTagStartAsTypeParameterStart() {
         if (this.type !== tstt.jsxTagStart) return;
-        this.context.length -= this.#currentTokenContextCount();
+        this.#truncateContext(this.context.length - this.#currentTokenContextCount());
         this.finishToken(tt.relational, "<");
+      }
+      /**
+       * The same where a tag can't start but type arguments can: after a
+       * superclass, and after a class or function expression on its line. A
+       * closing tag's `</` stays a tag start, so an error stays at it, but not
+       * a comment right after the `<` (`</* c *\/ T>`, `<// c`), as for a `</`
+       * after an operand (see `getTokenFromCode`). Returns whether the token is
+       * now `<`.
+       */
+      #readTagStartAsTypeArgumentStart() {
+        if (this.type !== tstt.jsxTagStart) return false;
+        if (this.input.charCodeAt(this.start + 1) === CharCode.slash) {
+          const after_slash = this.input.charCodeAt(this.start + 2);
+          if (after_slash !== CharCode.slash && after_slash !== CharCode.asterisk) return false;
+        }
+        this.#readTagStartAsTypeParameterStart();
+        return true;
       }
       /**
        * @type {Parse.Parser['tsTryParseTypeParameters']}
@@ -17548,6 +20796,2028 @@ function TSRXPlugin(config) {
       tsTryParseTypeParameters(parseModifiers) {
         this.#readTagStartAsTypeParameterStart();
         return super.tsTryParseTypeParameters(parseModifiers);
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#119): remove once a release includes the fix
+      /**
+       * Records the node whose modifiers are being read, so that
+       * `tsParseModifier` can tell whether it has already read `static`.
+       * @type {Parse.Parser['tsParseModifiers']}
+       */
+      tsParseModifiers(options) {
+        const outer = this.#modifiersNode;
+        this.#modifiersNode = options.modified;
+        try {
+          return super.tsParseModifiers(options);
+        } finally {
+          this.#modifiersNode = outer;
+        }
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#119): remove once a release includes the fix
+      // UPSTREAM(sveltejs/acorn-typescript#147): remove once a release includes the fix
+      /**
+       * `static` is a modifier even when the next token is on a later line, as
+       * in TypeScript (`nextTokenCanFollowModifier`) and acorn: `static` with
+       * `count = 0` on the next line is one static field. acorn-typescript
+       * requires the token after every modifier to be on the same line, so it
+       * read `static` as a field name and made the next member an instance
+       * member. Other modifiers keep that rule (`readonly` with `x` on the next
+       * line is two fields). As in TypeScript, `static` after a `static`
+       * modifier is a name, so `static` / `static` / `a() {}` on three lines
+       * is a static field named `static` and an instance method
+       * (sveltejs/acorn-typescript#119).
+       *
+       * A modifier written with an escape is still one: TypeScript's parser
+       * reads it where it reads the modifier and reports TS1260 `Keywords
+       * cannot contain escape characters.` at it. acorn-typescript read it as
+       * a name, so `static` in `class A { \u0073tatic x = 1; }` was a field
+       * name followed by an unexpected `x` (sveltejs/acorn-typescript#147).
+       * @type {Parse.Parser['tsParseModifier']}
+       */
+      tsParseModifier(allowedModifiers, stopOnStartOfClassStaticBlock) {
+        if (this.containsEsc && Parser4.acornTypeScript.tokenIsIdentifier(this.type) && allowedModifiers.includes(
+          /** @type {string} */
+          this.value
+        )) {
+          const start = this.start;
+          const parser = (
+            /** @type {Parse.Parser} */
+            this
+          );
+          parser.containsEsc = false;
+          const modifier = this.tsParseModifier(allowedModifiers, stopOnStartOfClassStaticBlock);
+          if (modifier !== void 0) this.raise(start, TS_ERRORS.KEYWORD_ESCAPE);
+          parser.containsEsc = true;
+          return void 0;
+        }
+        if (!this.isContextual("static") || !allowedModifiers.includes("static")) {
+          return super.tsParseModifier(allowedModifiers, stopOnStartOfClassStaticBlock);
+        }
+        if (this.#modifiersNode?.static) return void 0;
+        if (stopOnStartOfClassStaticBlock && this.tsIsStartOfStaticBlocks()) return void 0;
+        const is_modifier = this.tsTryParse(() => {
+          this.next(true);
+          return this.type === tt.bracketL || this.type === tt.braceL || this.type === tt.star || this.type === tt.ellipsis || this.type === tt.privateId || this.isLiteralPropertyName();
+        });
+        return is_modifier ? "static" : void 0;
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#120): remove once a release includes the fix
+      /**
+       * Reads the token after an interface's `{` inside the type, like the
+       * tokens of later members. acorn-typescript enters the type only after
+       * `{`, so with JSX the `<` of a generic call signature that is the first
+       * member (`interface I { <T>(x: T): T }`) was read as a tag start. The
+       * token after the closing `}` is still read outside the type, as
+       * acorn-typescript does.
+       * @type {Parse.Parser['tsParseInterfaceBody']}
+       */
+      tsParseInterfaceBody() {
+        const members = this.tsInType(() => {
+          this.expect(tt.braceL);
+          return this.tsParseList("TypeMembers", this.tsParseTypeMember.bind(this));
+        });
+        this.expect(tt.braceR);
+        return members;
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#110): remove once a release includes the fix
+      // UPSTREAM(sveltejs/acorn-typescript#113): remove once a release includes the fix
+      /**
+       * Two fixes to the class name, each with the AST of its upstream fix:
+       *
+       * - A class can be named after a TypeScript contextual keyword
+       *   (`class global {}`, `class type {}`), as in TypeScript and acorn.
+       *   acorn-typescript gives these words their own token types, which
+       *   acorn's `parseClassId` doesn't take as a name, so read the word as a
+       *   plain name (sveltejs/acorn-typescript#110).
+       * - Where the name is optional, `implements` starts the heritage clause
+       *   and the class has no name (`id: null`). acorn-typescript checked for
+       *   that only in a class expression, so acorn read `implements` as the
+       *   name of `export default class implements I {}`, whose name is also
+       *   optional (`'nullableID'`), and rejected it as reserved. A class
+       *   statement still rejects it (sveltejs/acorn-typescript#113).
+       *
+       * The rest stays with acorn-typescript, including type parameters.
+       * @type {Parse.Parser['parseClassId']}
+       */
+      parseClassId(node, isStatement) {
+        if (isStatement !== true && this.isContextual("implements")) {
+          node.id = null;
+          return;
+        }
+        if (this.type !== tt.name && Parser4.acornTypeScript.tokenIsIdentifier(this.type)) {
+          this.type = tt.name;
+        }
+        const outer = this.#declaration;
+        if (isStatement === true) {
+          this.#declaration = { kind: "class", scope: this.currentScope() };
+        }
+        try {
+          super.parseClassId(node, isStatement);
+        } finally {
+          this.#declaration = outer;
+        }
+      }
+      /**
+       * A function declaration that isn't exported: TypeScript binds it before
+       * the other statements of its list (see `declareName`). One after
+       * `export default` (`FUNC_NULLABLE_ID`) or `export` is exported.
+       * @type {Parse.Parser['parseFunction']}
+       */
+      parseFunction(node, statement, allowExpressionBody, isAsync, forInit) {
+        const outer = this.#declaration;
+        if (statement & FUNC_STATEMENT3 && !(statement & FUNC_NULLABLE_ID3) && node.start !== this.#exportedDeclarationStart) {
+          this.#declaration = { kind: "function", scope: this.currentScope() };
+        }
+        try {
+          return super.parseFunction(node, statement, allowExpressionBody, isAsync, forInit);
+        } finally {
+          this.#declaration = outer;
+        }
+      }
+      /**
+       * A superclass's type arguments belong to the class heading, as in
+       * TypeScript, whatever follows them and on whichever line they start:
+       *
+       * - A `<` that starts its own line reads as a tag start (see
+       *   `getTokenFromCode`), but after the superclass only type arguments can
+       *   follow (`class A extends B` with `<T> {}` on the next line), so the
+       *   heading stopped before the `<`. Read it again as `<`, then the type
+       *   arguments and the `implements` clause as acorn-typescript does.
+       * - acorn-typescript reads the superclass with the subscript parser, which
+       *   makes `Base<T>` an instantiation expression when a line break follows
+       *   it (`class D extends Base<T>` with the `{` or `implements` on the next
+       *   line), so the class had no `superTypeParameters`. Take an
+       *   unparenthesized one apart, as acorn-typescript's `parseNew` does for
+       *   `new A<T>`: the heading then has the AST it has on one line
+       *   (sveltejs/acorn-typescript#131).
+       * @type {Parse.Parser['parseClassSuper']}
+       */
+      parseClassSuper(node) {
+        super.parseClassSuper(node);
+        const heading = (
+          /** @type {AST.ClassDeclaration | AST.ClassExpression} */
+          node
+        );
+        if (this.containsEsc && this.type === tt.name && this.value === "implements") {
+          this.raise(this.start, TS_ERRORS.KEYWORD_ESCAPE);
+        }
+        const superClass = heading.superClass;
+        if (!superClass) return;
+        if (this.type === tstt.jsxTagStart && superClass.type !== "TSInstantiationExpression" && !heading.superTypeParameters && !heading.implements && this.#readTagStartAsTypeArgumentStart()) {
+          heading.superTypeParameters = this.tsParseTypeArgumentsInExpression();
+          if (this.eatContextual("implements")) {
+            heading.implements = this.tsParseHeritageClause("implements");
+          }
+        }
+        if (superClass.type === "TSInstantiationExpression" && !superClass.metadata?.parenthesized && !heading.superTypeParameters) {
+          heading.superClass = superClass.expression;
+          heading.superTypeParameters = superClass.typeArguments;
+        }
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#137): remove once a release includes the fix
+      /**
+       * TypeScript reads `abstract` as a modifier only before a token on the same
+       * line. acorn-typescript's check for an abstract class ignored a line break
+       * after `abstract`, so `export default abstract` with `class A {}` on the
+       * next line parsed as one abstract class, the default export, where
+       * TypeScript exports the value of `abstract` and declares the class `A`
+       * on its own. After decorators (`canHaveLeadingDecorator`), such as
+       * `@dec abstract` with the class on the next line, the decorators went to
+       * the class, where TypeScript reports TS1146 `Declaration expected.`.
+       * @type {Parse.Parser['isAbstractClass']}
+       */
+      isAbstractClass() {
+        return super.isAbstractClass() && !this.#lineBreakAfter(this.end);
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#137): remove once a release includes the fix
+      /**
+       * `declare`, and `abstract` after it, are modifiers only before a token on
+       * the same line too. acorn-typescript's check, which only
+       * `canHaveLeadingDecorator` uses, ignored line breaks, so `@dec declare`
+       * with `class A {}` on the next line gave the decorators to the class,
+       * where TypeScript reports TS1146.
+       * @type {Parse.Parser['isDeclareClass']}
+       */
+      isDeclareClass() {
+        if (!super.isDeclareClass() || this.#lineBreakAfter(this.end)) return false;
+        const next = this.nextTokenStart();
+        return this.input.startsWith("class", next) || !this.#lineBreakAfter(next + "abstract".length);
+      }
+      /**
+       * Whether a line break comes between `end` and the next token, which
+       * ends a modifier: TypeScript reads a word as one only before a token on
+       * the same line.
+       * @param {number} end
+       */
+      #lineBreakAfter(end) {
+        return regex_line_break.test(this.input.slice(end, this.nextTokenStartSince(end)));
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#143): remove once a release includes the fix
+      /**
+       * Decorators can come before `abstract declare class A {}`, as before
+       * `declare abstract class A {}` (see `tsParseDeclaration`).
+       * @type {Parse.Parser['canHaveLeadingDecorator']}
+       */
+      canHaveLeadingDecorator() {
+        return super.canHaveLeadingDecorator() || this.#isAbstractDeclareClass();
+      }
+      /**
+       * Whether the current token is `abstract` before `declare class` on its
+       * line (see `tsParseDeclaration`).
+       */
+      #isAbstractDeclareClass() {
+        if (this.type !== tstt.abstract || this.containsEsc || this.#lineBreakAfter(this.end)) {
+          return false;
+        }
+        const declaration2 = this.#declarationAfterModifier(1);
+        return declaration2?.length === 2 && declaration2[0] === "declare" && declaration2[1] === "class";
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#143): remove once a release includes the fix
+      // UPSTREAM(sveltejs/acorn-typescript#147): remove once a release includes the fix
+      /**
+       * TypeScript's parser reads `abstract` as a modifier before any
+       * declaration that it reads after one on the same line (`isDeclaration`),
+       * and reports it from its checker (TS1242 `'abstract' modifier can only
+       * appear on a class, method, or property declaration.`) unless that's a
+       * class. acorn-typescript's `tsParseAbstractDeclaration` took only a class
+       * or an interface after it: it gave the interface `abstract` without an
+       * error (`abstract interface I {}`), rejected `abstract declare class A {}`,
+       * which is valid, and before anything else raised `Unexpected token`, or
+       * declined, in every mode (`abstract function f() {}`,
+       * `export abstract let x = 1;`) (sveltejs/acorn-typescript#143).
+       *
+       * Read `abstract` at the start of a statement, after `export` (see also
+       * `#checkExportDeclarationStart`) and after `declare` (see also
+       * `tsTryParseDeclare`) as TypeScript does:
+       *
+       * - before a class, or before `declare` and a class, it makes the class
+       *   abstract;
+       * - before any other declaration it's TS1242, a checker error (see
+       *   `CHECKER_LEVEL_ERRORS`): a strict parse throws it, and a collecting
+       *   one records it and parses the declaration without the modifier,
+       *   which the formatter then refuses;
+       * - written with an escape, before a declaration, it's TypeScript's
+       *   parser error TS1260 `Keywords cannot contain escape characters.`, in
+       *   every mode. acorn-typescript read `\u0061bstract class A {}` as an
+       *   abstract class (sveltejs/acorn-typescript#147).
+       *
+       * Before anything else, a repeated modifier (`abstract abstract class A
+       * {}`), or a modifier this parser doesn't keep on a declaration
+       * (`abstract public class A {}`), acorn-typescript's reading stays.
+       * @type {Parse.Parser['tsParseDeclaration']}
+       */
+      tsParseDeclaration(node, value, next) {
+        if (value !== "abstract") return super.tsParseDeclaration(node, value, next);
+        const start = next ? this.start : this.lastTokStart;
+        const escaped = next ? this.containsEsc : this.#lastWordEscaped();
+        const after_declare = next && this.input.slice(this.lastTokStart, this.lastTokEnd) === "declare";
+        if (!this.tsCheckLineTerminator(next)) return void 0;
+        let declaration2 = this.#declarationAfterModifier(0);
+        if (declaration2?.includes("abstract") || after_declare && declaration2?.[0] === "declare") {
+          declaration2 = null;
+        }
+        if (declaration2 === null) {
+          return Parser4.acornTypeScript.tokenIsIdentifier(this.type) ? this.tsParseAbstractDeclaration(node) : void 0;
+        }
+        if (escaped) this.raise(start, TS_ERRORS.KEYWORD_ESCAPE);
+        const abstract_class = (
+          /** @type {AST.ClassDeclaration} */
+          node
+        );
+        if (declaration2.length === 1 && declaration2[0] === "class") {
+          abstract_class.abstract = true;
+          return this.parseClass(abstract_class, true);
+        }
+        if (declaration2.length === 2 && declaration2[1] === "class") {
+          abstract_class.abstract = true;
+          this.next();
+          return this.tsTryParseDeclare(abstract_class);
+        }
+        this.#declarationAfterAbstractStart = this.start;
+        const statement = this.parseStatement(null, this.#atTopLevel());
+        this.raise(start, TS_ERRORS.ABSTRACT_MODIFIER_NOT_ALLOWED);
+        return statement;
+      }
+      /**
+       * Whether the statement being read is at the top level of the module or
+       * of a namespace's body, where acorn reads an import declaration: acorn's
+       * `parseTopLevel` and acorn-typescript's `tsParseModuleBlock` pass
+       * `topLevel` to `parseStatement`.
+       */
+      #atTopLevel() {
+        if (this.scopeStack.length === 1) return true;
+        const parent = (
+          /** @type {Parse.Scope} */
+          this.scopeStack.at(-2)
+        );
+        return this.currentScope().flags === TS_SCOPE_OTHER2 && (parent.flags & TS_SCOPE_TS_MODULE2) !== 0;
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#143): remove once a release includes the fix
+      // UPSTREAM(sveltejs/acorn-typescript#147): remove once a release includes the fix
+      /**
+       * Reads the declaration after `declare` at the start of a statement, as
+       * acorn-typescript does, and reports what TypeScript reports there:
+       *
+       * - `abstract` before a declaration other than a class
+       *   (`declare abstract function f(): void;`), TS1242, as in
+       *   `tsParseDeclaration`. acorn-typescript's `tsParseDeclaration` read
+       *   `abstract`, declined, and failed with `Unexpected token`, or gave the
+       *   interface `abstract` without an error
+       *   (sveltejs/acorn-typescript#143).
+       * - `declare` written with an escape before a declaration, TS1260:
+       *   TypeScript's parser reads it as the modifier. acorn-typescript read
+       *   `\u0064eclare class A {}` as an ambient class without an error
+       *   (sveltejs/acorn-typescript#147). So is `enum` or `interface` after
+       *   `declare` (see `#checkEscapedDeclarationKeyword`).
+       * @type {Parse.Parser['tsTryParseDeclare']}
+       */
+      tsTryParseDeclare(node) {
+        this.#checkEscapedDeclarationKeyword();
+        if (this.#lastWordEscaped() && !this.hasPrecedingLineBreak() && this.#declarationAfterModifier(0) !== null) {
+          this.raise(this.lastTokStart, TS_ERRORS.KEYWORD_ESCAPE);
+        }
+        if (this.type === tstt.abstract && !this.#lineBreakAfter(this.end)) {
+          const declaration2 = this.#declarationAfterModifier(1);
+          if (declaration2 !== null && declaration2.at(-1) !== "class" && !declaration2.includes("abstract") && !declaration2.includes("declare")) {
+            const start = this.start;
+            if (this.containsEsc) this.raise(start, TS_ERRORS.KEYWORD_ESCAPE);
+            this.next();
+            const declared = super.tsTryParseDeclare(node);
+            this.raise(start, TS_ERRORS.ABSTRACT_MODIFIER_NOT_ALLOWED);
+            return declared;
+          }
+        }
+        return super.tsTryParseDeclare(node);
+      }
+      /**
+       * What TypeScript's parser reads from the token `ahead` tokens on (the
+       * current one for 0), after a modifier on the same line: TypeScript's
+       * `isDeclaration`, for the modifiers this parser keeps on a declaration
+       * that isn't a class member (`abstract`, `declare`, and `async` before
+       * `function`). Returns those modifiers and the word that starts the
+       * declaration (`['declare', 'class']`), or `null` where TypeScript reads
+       * no declaration, or another modifier (`public`) comes first.
+       * @param {number} ahead
+       * @returns {string[] | null}
+       */
+      #declarationAfterModifier(ahead) {
+        const is_identifier = Parser4.acornTypeScript.tokenIsIdentifier;
+        const token = ahead === 0 ? this.getCurLookaheadState() : this.lookahead(ahead);
+        switch (token.type) {
+          case tt._class:
+          case tt._function:
+          case tt._var:
+          case tt._const:
+            return [
+              /** @type {string} */
+              token.type.keyword
+            ];
+          case tt._import: {
+            const after = this.lookahead(ahead + 1).type;
+            return after === tt.string || after === tt.star || after === tt.braceL || after.keyword !== void 0 || is_identifier(after) ? ["import"] : null;
+          }
+        }
+        if (!is_identifier(token.type)) return null;
+        const word = (
+          /** @type {string} */
+          token.value
+        );
+        const next = this.lookahead(ahead + 1);
+        const same_line = !regex_line_break.test(this.input.slice(token.end, next.start));
+        switch (word) {
+          case "let":
+          case "enum":
+            return [word];
+          case "interface":
+          case "type":
+          case "namespace":
+          case "using":
+            return same_line && is_identifier(next.type) ? [word] : null;
+          case "module":
+            return same_line && (is_identifier(next.type) || next.type === tt.string) ? [word] : null;
+          case "global":
+            return next.type === tt.braceL ? [word] : null;
+          case "await": {
+            if (!same_line || next.type !== tt.name || next.value !== "using") return null;
+            const after = this.lookahead(ahead + 2);
+            return !regex_line_break.test(this.input.slice(next.end, after.start)) && is_identifier(after.type) ? ["await"] : null;
+          }
+          case "async":
+            return same_line && next.type === tt._function ? [word, "function"] : null;
+          case "abstract":
+          case "declare": {
+            if (!same_line) return null;
+            const declaration2 = this.#declarationAfterModifier(ahead + 1);
+            return declaration2 && [word, ...declaration2];
+          }
+        }
+        return null;
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#155): remove once a release includes the fix
+      /**
+       * The modifiers TypeScript's parser reads before a declaration from the
+       * token `ahead` tokens on (`isDeclaration`, `parseModifiers`), and the
+       * word that starts the declaration (see `#declarationAfterModifier`), or
+       * `null` where it reads no declaration: the words in
+       * `DECLARATION_MODIFIERS` on the line of the next token (`static` on any
+       * line), and `export` other than before `=`, `*`, `as`, decorators or
+       * the braces of an export. After `export`, `default` is one before a
+       * class, a function or an interface, or `abstract class` or
+       * `async function` on one line (`nextTokenCanFollowDefaultKeyword`).
+       * After a second `static` TypeScript reads no modifier but expects a
+       * declaration there (TS1146), whose position this gives.
+       * @param {number} ahead
+       * @returns {DeclarationModifiers | null}
+       */
+      #readDeclarationModifiers(ahead) {
+        const is_identifier = Parser4.acornTypeScript.tokenIsIdentifier;
+        const modifiers = [];
+        let declaration_expected = -1;
+        for (; ; ) {
+          const token = ahead === 0 ? this.getCurLookaheadState() : this.lookahead(ahead);
+          const word = is_identifier(token.type) ? (
+            /** @type {string} */
+            token.value
+          ) : "";
+          if (DECLARATION_MODIFIERS.has(word)) {
+            if (word === "static") {
+              if (declaration_expected === -1 && modifiers.some((m) => m.value === "static")) {
+                declaration_expected = /** @type {Parse.LookaheadState} */
+                modifiers.at(-1).end;
+              }
+            } else if (this.#lineBreakAfter(token.end)) {
+              return null;
+            }
+            if (declaration_expected === -1) modifiers.push(token);
+            ahead++;
+            continue;
+          }
+          if (token.type === tt._export) {
+            const next = this.lookahead(ahead + 1);
+            if (next.type === tt._default) {
+              const exported = this.#defaultExportedDeclaration(ahead + 2);
+              if (exported === null) return null;
+              modifiers.push(token, next, ...exported.modifiers);
+              return { modifiers, declaration: exported.declaration, declaration_expected };
+            }
+            const after = next.type === tstt.type ? this.lookahead(ahead + 2) : next;
+            if (after.type === tt.eq || after.type === tt.star || after.type === tt.braceL || after.type === tstt.at || after.type === tt.name && after.value === "as") {
+              return null;
+            }
+            if (declaration_expected === -1) modifiers.push(token);
+            ahead++;
+            continue;
+          }
+          if (modifiers.length === 0) return null;
+          const declaration2 = this.#declarationAfterModifier(ahead);
+          return declaration2?.length === 1 ? { modifiers, declaration: declaration2[0], declaration_expected } : null;
+        }
+      }
+      /**
+       * The declaration TypeScript's parser reads after `export default` with
+       * modifiers (`nextTokenCanFollowDefaultKeyword`), from the token `ahead`
+       * tokens on: a class, a function or an interface, or `abstract` before
+       * `class` or `async` before `function` on one line, which are modifiers.
+       * @param {number} ahead
+       * @returns {{ modifiers: Parse.LookaheadState[], declaration: string } | null}
+       */
+      #defaultExportedDeclaration(ahead) {
+        const token = this.lookahead(ahead);
+        if (token.type === tt._class || token.type === tt._function || token.type === tstt.interface) {
+          return { modifiers: [], declaration: (
+            /** @type {string} */
+            token.value
+          ) };
+        }
+        const next = this.lookahead(ahead + 1);
+        if (!this.#lineBreakAfter(token.end) && (token.type === tstt.abstract && next.type === tt._class || token.type === tt.name && token.value === "async" && next.type === tt._function)) {
+          return { modifiers: [token], declaration: (
+            /** @type {string} */
+            next.value
+          ) };
+        }
+        return null;
+      }
+      /**
+       * Whether to read the modifiers `read` gives with
+       * `#parseModifiedDeclaration`, after `export` (`exported`) or not: they
+       * include a modifier only a class member takes, a repeated one, `export`
+       * after another one, `async` anywhere but right before `function`, `async`
+       * with `declare`, `declare` before an import or a `using` declaration, or
+       * a second `static`. acorn-typescript reads none of these, and the
+       * other modifiers keep its reading and the overrides above.
+       *
+       * Not read here: modifiers before a namespace, a module, a global
+       * augmentation or an import inside a block, where TypeScript reports
+       * something else first; and where the tree has no place for them,
+       * `export default` after another `export`, outside the module's top
+       * level, or with `declare` (which the tree would print after `default`),
+       * and `export` before an import (which `parseExport` would read as an
+       * import alias).
+       * @param {DeclarationModifiers} read
+       * @param {boolean} exported
+       */
+      #readsModifiedDeclaration(read, exported) {
+        const values = read.modifiers.map((modifier) => (
+          /** @type {string} */
+          modifier.value
+        ));
+        if (exported) values.unshift("export");
+        const word = read.declaration;
+        if ((word === "namespace" || word === "module" || word === "global" || word === "import") && !this.#atTopLevel()) {
+          return false;
+        }
+        if (word === "import" && values.includes("export")) return false;
+        if (values.includes("default") && (values.indexOf("export") !== values.lastIndexOf("export") || this.scopeStack.length !== 1 || values.includes("declare"))) {
+          return false;
+        }
+        const async_index = values.indexOf("async");
+        return read.declaration_expected !== -1 || new Set(values).size !== values.length || values.some((value) => CLASS_MEMBER_MODIFIERS.has(value)) || values.lastIndexOf("export") > 0 || async_index !== -1 && (word !== "function" || async_index !== values.length - 1 || values.includes("declare")) || values.includes("declare") && (word === "import" || word === "using" || word === "await");
+      }
+      /**
+       * The modifiers at the current token that `#parseModifiedDeclaration`
+       * reads, after `export` (`exported`) or at the start of a statement, or
+       * `null`.
+       * @param {boolean} exported
+       */
+      #readModifiedDeclaration(exported) {
+        const starts_modifier = Parser4.acornTypeScript.tokenIsIdentifier(this.type) && DECLARATION_MODIFIERS.has(
+          /** @type {string} */
+          this.value
+        ) || exported && this.type === tt._export;
+        if (!starts_modifier) return null;
+        const read = this.#readDeclarationModifiers(0);
+        return read && this.#readsModifiedDeclaration(read, exported) ? read : null;
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#155): remove once a release includes the fix
+      /**
+       * TypeScript's parser reads the modifiers before a declaration greedily
+       * (`isDeclaration`, `parseModifiers`), whatever they are, and its checker
+       * reports the ones the declaration can't take (`checkGrammarModifiers`):
+       * a class member's modifier (`public class A {}`, TS1044; TS1024 for
+       * `readonly`, TS1275 for `accessor`), a repeated one
+       * (`declare declare class A {}`, TS1030), one out of order
+       * (`abstract export class A {}`, TS1029), `async` on anything but a
+       * function (TS1042) or with `declare` (TS1040), `declare` on an import
+       * (TS1079), and in a block any but `abstract` on a class or `async` on a
+       * function (TS1184). acorn-typescript reads only `abstract` and `declare`
+       * there, each once and in that order, and before these the statement
+       * failed to parse in every mode (sveltejs/acorn-typescript#155).
+       *
+       * Read the modifiers `#readsModifiedDeclaration` takes at the start of a
+       * statement. Before `export`, they go to `parseExport`, which reads the
+       * export, and `parseExportDeclaration` or
+       * `parseExportDefaultDeclaration` the declaration after it.
+       * @param {DeclarationModifiers} read
+       * @param {Record<string, boolean> | undefined} exports
+       * @returns {AST.Statement}
+       */
+      #parseModifiedStatement(read, exports) {
+        const context = this.#modifierContext();
+        this.#checkModifiersRead(read.modifiers, read.declaration_expected);
+        const export_index = read.modifiers.findIndex((modifier) => modifier.type === tt._export);
+        if (export_index === -1) {
+          const declaration2 = this.#parseModifiedDeclaration(
+            read.modifiers,
+            read.modifiers.length,
+            read.declaration,
+            false
+          );
+          this.#raiseModifierErrors(read.modifiers, declaration2, context, null);
+          return (
+            /** @type {AST.Statement} */
+            declaration2
+          );
+        }
+        const node = this.startNode();
+        for (let index = 0; index < export_index; index++) this.next();
+        this.#pendingModifiers = { read, context };
+        return (
+          /** @type {AST.Statement} */
+          /** @type {unknown} */
+          this.parseExport(node, exports)
+        );
+      }
+      /**
+       * Parse the declaration after `export` (or `export default`) when
+       * `#parseModifiedStatement` read modifiers before it, or when
+       * `#readModifiedDeclaration` reads some after it, and report them.
+       * @param {AST.ExportNamedDeclaration | null} node The export, unless it's a default one
+       * @returns {AST.Node | null}
+       */
+      #parseModifiedExport(node) {
+        const pending = this.#pendingModifiers;
+        this.#pendingModifiers = null;
+        let modifiers;
+        let read;
+        let context;
+        let skip;
+        if (pending) {
+          ({ read, context } = pending);
+          modifiers = read.modifiers;
+          const index = modifiers.findIndex((modifier) => modifier.type === tt._export);
+          skip = modifiers.length - index - (modifiers[index + 1]?.type === tt._default ? 2 : 1);
+        } else {
+          read = this.#readModifiedDeclaration(true);
+          if (!read) return null;
+          context = this.#modifierContext();
+          const exported = (
+            /** @type {Parse.LookaheadState} */
+            {
+              type: tt._export,
+              value: "export",
+              start: this.lastTokStart,
+              end: this.lastTokEnd,
+              containsEsc: false
+            }
+          );
+          this.#checkModifiersRead(read.modifiers, read.declaration_expected);
+          modifiers = [exported, ...read.modifiers];
+          skip = read.modifiers.length;
+        }
+        const declaration2 = this.#parseModifiedDeclaration(
+          modifiers,
+          skip,
+          read.declaration,
+          node === null
+        );
+        if (node && (declaration2.type === "TSInterfaceDeclaration" || declaration2.type === "TSTypeAliasDeclaration" || /** @type {{ declare?: boolean }} */
+        declaration2.declare)) {
+          node.exportKind = "type";
+        }
+        this.#raiseModifierErrors(modifiers, declaration2, context, pending ? "inner" : "outer");
+        return declaration2;
+      }
+      /**
+       * Where the statement being read is, for TypeScript's checks of its
+       * modifiers: inside a block rather than at the top level of the module or
+       * a namespace, and inside an ambient namespace or module.
+       * @returns {ModifierContext}
+       */
+      #modifierContext() {
+        return { block: !this.#atTopLevel(), ambient: this.isAmbientContext };
+      }
+      /**
+       * Report TypeScript's parser errors in the modifiers read, whichever comes
+       * first: TS1260 for one written with an escape, or TS1146
+       * `Declaration expected.` at a second `static`.
+       * @param {Parse.LookaheadState[]} modifiers
+       * @param {number} declaration_expected
+       */
+      #checkModifiersRead(modifiers, declaration_expected) {
+        const escaped = modifiers.find((modifier) => modifier.containsEsc);
+        if (escaped && (declaration_expected === -1 || escaped.start < declaration_expected)) {
+          this.raise(escaped.start, TS_ERRORS.KEYWORD_ESCAPE);
+        }
+        if (declaration_expected !== -1)
+          this.raise(declaration_expected, TS_ERRORS.DECLARATION_EXPECTED);
+      }
+      /**
+       * Read the last `skip` of `modifiers`, then the declaration that
+       * `declaration` starts, with the ones the tree keeps: `declare` (not on an
+       * import or a `using` declaration), `abstract` on a class and `async` on a
+       * function. The declaration starts at the first of these after `export`,
+       * or at its keyword, as when acorn-typescript reads them, and a class or
+       * function after `export default` needs no name.
+       * @param {Parse.LookaheadState[]} modifiers
+       * @param {number} skip
+       * @param {string} declaration
+       * @param {boolean} is_default
+       * @returns {AST.Node}
+       */
+      #parseModifiedDeclaration(modifiers, skip, declaration2, is_default) {
+        const has = (value) => modifiers.some((modifier) => modifier.value === value);
+        const declare = has("declare") && declaration2 !== "import" && declaration2 !== "using" && declaration2 !== "await";
+        const abstract = has("abstract") && declaration2 === "class";
+        const async2 = has("async") && declaration2 === "function";
+        let start = -1;
+        let start_loc = this.startLoc;
+        for (let index = 0; index < skip; index++) {
+          const value = this.value;
+          if (start === -1 && (value === "declare" && declare || value === "abstract" && abstract || value === "async" && async2)) {
+            start = this.start;
+            start_loc = this.startLoc;
+          }
+          this.next();
+        }
+        if (start === -1) {
+          start = this.start;
+          start_loc = this.startLoc;
+        }
+        const name = is_default ? "nullableID" : true;
+        if (declaration2 === "class") {
+          const node = (
+            /** @type {AST.ClassDeclaration} */
+            this.startNodeAt(start, start_loc)
+          );
+          if (abstract) node.abstract = true;
+          if (!declare) return this.parseClass(node, name);
+          node.declare = true;
+          return this.tsInAmbientContext(() => this.parseClass(node, name));
+        }
+        if (declaration2 === "function") {
+          const node = (
+            /** @type {AST.FunctionDeclaration} */
+            this.startNodeAt(start, start_loc)
+          );
+          if (declare) node.declare = true;
+          const parse5 = () => {
+            if (!is_default) return this.parseFunctionStatement(node, async2, true);
+            this.next();
+            return this.parseFunction(node, FUNC_STATEMENT3 | FUNC_NULLABLE_ID3, false, async2);
+          };
+          return declare ? this.tsInAmbientContext(parse5) : parse5();
+        }
+        if (is_default) {
+          this.#defaultExportInterfaceStart = this.start;
+          return (
+            /** @type {AST.Node} */
+            super.parseExportDefaultDeclaration()
+          );
+        }
+        if (declare) {
+          const node = this.startNodeAt(start, start_loc);
+          const ambient = this.tsTryParseDeclare(node);
+          if (!ambient) this.unexpected();
+          ambient.declare = true;
+          return (
+            /** @type {AST.Node} */
+            ambient
+          );
+        }
+        return this.parseStatement(null, this.#atTopLevel());
+      }
+      /**
+       * Report the modifiers of `declaration` as TypeScript's checker does, after
+       * it's parsed, as TypeScript reports syntax errors in it first. A strict
+       * parse throws the error TypeScript reports (`#modifierError`). A
+       * collecting parse records it, and for each modifier the tree leaves out
+       * the error TypeScript reports for that one once the first is fixed
+       * (`dropped_modifier_error`), so that the formatter refuses the code
+       * instead of printing it without the modifier.
+       *
+       * An exported global augmentation is TS2668 first, at the first modifier,
+       * as `parseExportDeclaration` reports it without modifiers. A statement
+       * that starts with `export` (`exported` is `'outer'`) inside a block has
+       * acorn's error for an export there already, which stands for TS1184 at
+       * `export`.
+       * @param {Parse.LookaheadState[]} modifiers
+       * @param {AST.Node} declaration
+       * @param {ModifierContext} context
+       * @param {'inner' | 'outer' | null} exported Where the export is, if any
+       */
+      #raiseModifierErrors(modifiers, declaration2, context, exported) {
+        const kind = modified_declaration_kind(declaration2);
+        let found = this.#modifierError(modifiers, kind, context);
+        if (exported && declaration2.type === "TSModuleDeclaration" && /** @type {AST.TSModuleDeclaration} */
+        declaration2.kind === "global") {
+          if (found && found.start <= modifiers[0].start) {
+            this.#raiseCheckerError(found.start, found.error);
+            found = null;
+          }
+          this.raise(modifiers[0].start, TS_ERRORS.EXPORT_MODIFIER_ON_AUGMENTATION);
+        }
+        if (exported === "outer" && context.block && found?.start === modifiers[0].start && found.error === TS_ERRORS.MODIFIERS_CANNOT_APPEAR_HERE) {
+          found = null;
+        }
+        if (found) this.#raiseCheckerError(found.start, found.error);
+        if (!this.#collect) return;
+        const kept = /* @__PURE__ */ new Set();
+        for (const modifier of modifiers) {
+          const value = (
+            /** @type {string} */
+            modifier.value
+          );
+          const keeps = !kept.has(value) && (value === "export" || value === "default" || value === "declare" && kind !== "import" && kind !== "using" && kind !== "await using" || value === "abstract" && kind === "class" || value === "async" && kind === "function");
+          if (keeps) {
+            kept.add(value);
+            continue;
+          }
+          const duplicate = modifiers.some(
+            (other) => other.start < modifier.start && other.value === value
+          );
+          this.#recordCheckerLevelError(
+            modifier.start,
+            modifier.start + 1,
+            dropped_modifier_error(value, kind, context.block, duplicate)
+          );
+        }
+      }
+      /**
+       * Raise a checker error (see `CHECKER_LEVEL_ERRORS`) at `position`: a
+       * strict parse throws it, and a collecting one records it. Unlike `raise`,
+       * this keeps the position of the modifier errors that `raise` moves for
+       * acorn-typescript.
+       * @param {number} position
+       * @param {Diagnostic} error
+       */
+      #raiseCheckerError(position, error2) {
+        if (!this.#collect) this.#throwError(position, error2);
+        this.#recordCheckerLevelError(position, position + 1, error2);
+      }
+      /**
+       * The error TypeScript's checker reports for the modifiers of a
+       * declaration of `kind` (`checkGrammarModifiers`), for the modifiers this
+       * parser reads before one, or `null`.
+       * @param {Parse.LookaheadState[]} modifiers
+       * @param {ModifiedDeclarationKind} kind
+       * @param {ModifierContext} context
+       * @returns {{ start: number, error: Diagnostic } | null}
+       */
+      #modifierError(modifiers, kind, { block: block2, ambient }) {
+        if (block2 && kind !== "module" && kind !== "import") {
+          const allowed = kind === "class" ? "abstract" : kind === "function" ? "async" : "";
+          if (modifiers[0].value !== allowed) {
+            return { start: modifiers[0].start, error: TS_ERRORS.MODIFIERS_CANNOT_APPEAR_HERE };
+          }
+        }
+        const flags = /* @__PURE__ */ new Set();
+        let last_declare;
+        let last_async;
+        for (const modifier of modifiers) {
+          const value = (
+            /** @type {string} */
+            modifier.value
+          );
+          const at2 = (error2) => ({ start: modifier.start, error: error2 });
+          const precedes = (...others) => others.find((other) => flags.has(other));
+          switch (value) {
+            case "public":
+            case "protected":
+            case "private": {
+              if (precedes("public", "protected", "private")) {
+                return at2(TS_ERRORS.ACCESSIBILITY_MODIFIER_ALREADY_SEEN);
+              }
+              const other = precedes("static", "accessor", "readonly", "async");
+              if (other) return at2(TS_ERRORS.MODIFIER_MUST_PRECEDE(value, other));
+              if (!block2) return at2(TS_ERRORS.MODIFIER_ON_MODULE_ELEMENT(value));
+              if (flags.has("abstract")) {
+                return at2(
+                  (value === "private" ? TS_ERRORS.MODIFIER_CANNOT_BE_USED_WITH : TS_ERRORS.MODIFIER_MUST_PRECEDE)(value, "abstract")
+                );
+              }
+              break;
+            }
+            case "static": {
+              const other = precedes("readonly", "async", "accessor");
+              if (other) return at2(TS_ERRORS.MODIFIER_MUST_PRECEDE(value, other));
+              if (!block2) return at2(TS_ERRORS.MODIFIER_ON_MODULE_ELEMENT(value));
+              if (flags.has("abstract"))
+                return at2(TS_ERRORS.MODIFIER_CANNOT_BE_USED_WITH(value, "abstract"));
+              break;
+            }
+            case "accessor": {
+              if (flags.has("accessor")) return at2(TS_ERRORS.MODIFIER_ALREADY_SEEN(value));
+              const other = precedes("readonly", "declare");
+              if (other) return at2(TS_ERRORS.MODIFIER_CANNOT_BE_USED_WITH(value, other));
+              return at2(TS_ERRORS.ACCESSOR_MODIFIER_NOT_ALLOWED);
+            }
+            case "readonly":
+              return at2(
+                flags.has("readonly") ? TS_ERRORS.MODIFIER_ALREADY_SEEN(value) : TS_ERRORS.READONLY_MODIFIER_NOT_ALLOWED
+              );
+            case "export": {
+              if (flags.has("export")) return at2(TS_ERRORS.MODIFIER_ALREADY_SEEN(value));
+              const other = precedes("declare", "abstract", "async");
+              if (other) return at2(TS_ERRORS.MODIFIER_MUST_PRECEDE(value, other));
+              if (kind === "using" || kind === "await using") {
+                return at2(using_modifier_error(kind, value));
+              }
+              break;
+            }
+            case "declare":
+              if (flags.has("declare")) return at2(TS_ERRORS.MODIFIER_ALREADY_SEEN(value));
+              if (flags.has("async")) return at2(TS_ERRORS.MODIFIER_IN_AMBIENT_CONTEXT("async"));
+              if (kind === "using" || kind === "await using") {
+                return at2(using_modifier_error(kind, value));
+              }
+              if (ambient && !block2) return at2(TS_ERRORS.DECLARE_MODIFIER_IN_AMBIENT_CONTEXT);
+              if (flags.has("accessor"))
+                return at2(TS_ERRORS.MODIFIER_CANNOT_BE_USED_WITH(value, "accessor"));
+              last_declare = modifier;
+              break;
+            case "abstract":
+              if (flags.has("abstract")) return at2(TS_ERRORS.MODIFIER_ALREADY_SEEN(value));
+              if (kind !== "class") return at2(TS_ERRORS.ABSTRACT_MODIFIER_NOT_ALLOWED);
+              break;
+            case "async":
+              if (flags.has("async")) return at2(TS_ERRORS.MODIFIER_ALREADY_SEEN(value));
+              if (flags.has("declare") || ambient)
+                return at2(TS_ERRORS.MODIFIER_IN_AMBIENT_CONTEXT(value));
+              if (flags.has("abstract"))
+                return at2(TS_ERRORS.MODIFIER_CANNOT_BE_USED_WITH(value, "abstract"));
+              last_async = modifier;
+              break;
+          }
+          flags.add(value);
+        }
+        if (kind === "import" && last_declare) {
+          return { start: last_declare.start, error: TS_ERRORS.MODIFIER_ON_IMPORT("declare") };
+        }
+        if (last_async && kind !== "function") {
+          return {
+            start: last_async.start,
+            error: TS_ERRORS.MODIFIER_CANNOT_BE_USED_HERE("async")
+          };
+        }
+        return null;
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#151): remove once a release includes the fix
+      /**
+       * A TypeScript word in parentheses at the start of a statement is an
+       * expression, as in TypeScript: `(abstract) class A {}` is the
+       * expression `(abstract)` with a missing `;` (TS1005) before `class`.
+       * acorn-typescript's `parseExpressionStatement` passes any statement
+       * whose expression is a name to this method, and without
+       * `preserveParens` acorn gives the name in `(abstract)` itself, so the
+       * word was read as the keyword: `(abstract) class A {}` compiled as an
+       * abstract class, `(declare) class A {}` as an ambient one, and
+       * `(type) T = 1;` as a type alias, where a collecting parse (which
+       * keeps the parentheses) failed. A parenthesized name starts after the
+       * statement does.
+       * @type {Parse.Parser['tsParseExpressionStatement']}
+       */
+      tsParseExpressionStatement(node, expr) {
+        if (expr.start !== node.start) return void 0;
+        return super.tsParseExpressionStatement(node, expr);
+      }
+      /**
+       * Whether the last token, a word, was written with an escape.
+       */
+      #lastWordEscaped() {
+        return this.input.slice(this.lastTokStart, this.lastTokEnd).includes("\\");
+      }
+      /**
+       * Report TS1260 `Keywords cannot contain escape characters.` at the word
+       * just read, if it was written with an escape: TypeScript's parser reads
+       * an escaped keyword as the keyword and reports it.
+       */
+      #checkKeywordJustRead() {
+        if (this.#lastWordEscaped()) this.raise(this.lastTokStart, TS_ERRORS.KEYWORD_ESCAPE);
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#147): remove once a release includes the fix
+      // UPSTREAM(sveltejs/acorn-typescript#152): remove once a release includes the fix
+      /**
+       * The word `intrinsic` right after the alias's `=` is the `intrinsic`
+       * keyword (`TSIntrinsicKeyword`), unless a `.` follows, as in
+       * TypeScript's `parseTypeAliasDeclaration`; written with an escape, it's
+       * TS1260 `Keywords cannot contain escape characters.`. acorn-typescript
+       * checked for the `interface` token there instead, so
+       * `type T = intrinsic;` was a reference to a type named `intrinsic`, and
+       * `type T = interface;` the keyword, which compiled to
+       * `type T = intrinsic;` (sveltejs/acorn-typescript#152). This is
+       * acorn-typescript's method with that check changed.
+       *
+       * `type` before a type alias's name, written with an escape, is
+       * TypeScript's TS1260 (see `#checkKeywordJustRead`). acorn-typescript
+       * read `\u0074ype T = 1;` as a type alias without an error.
+       * @type {Parse.Parser['tsParseTypeAliasDeclaration']}
+       */
+      tsParseTypeAliasDeclaration(node) {
+        this.#checkKeywordJustRead();
+        const alias = (
+          /** @type {AST.TSTypeAliasDeclaration} */
+          node
+        );
+        alias.id = this.parseIdent();
+        this.checkLValSimple(
+          alias.id,
+          /** @type {Parse.BindingType[keyof Parse.BindingType]} */
+          BIND_TS_TYPE2
+        );
+        this.maybeExportDefined(this.currentScope(), alias.id.name);
+        alias.typeAnnotation = this.tsInType(() => {
+          alias.typeParameters = this.tsTryParseTypeParameters(
+            this.tsParseInOutModifiers.bind(this)
+          );
+          this.expect(tt.eq);
+          if (this.type === tt.name && this.value === "intrinsic" && this.lookahead().type !== tt.dot) {
+            if (this.containsEsc) this.raise(this.start, TS_ERRORS.KEYWORD_ESCAPE);
+            const keyword = this.startNode();
+            this.next();
+            return (
+              /** @type {AST.TypeNode} */
+              this.finishNode(
+                keyword,
+                /** @type {AST.TSIntrinsicKeyword['type']} */
+                "TSIntrinsicKeyword"
+              )
+            );
+          }
+          return this.tsParseType();
+        });
+        this.semicolon();
+        return (
+          /** @type {AST.TSTypeAliasDeclaration} */
+          this.finishNode(
+            alias,
+            /** @type {AST.TSTypeAliasDeclaration['type']} */
+            "TSTypeAliasDeclaration"
+          )
+        );
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#147): remove once a release includes the fix
+      /**
+       * `module` or `namespace` before a name, written with an escape, is
+       * TypeScript's TS1260 (see `#checkKeywordJustRead`). acorn-typescript
+       * read `n\u0061mespace N {}` as a namespace without an error.
+       * @type {Parse.Parser['tsParseModuleOrNamespaceDeclaration']}
+       */
+      tsParseModuleOrNamespaceDeclaration(node, nested) {
+        if (!nested) this.#checkKeywordJustRead();
+        return super.tsParseModuleOrNamespaceDeclaration(node, nested);
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#147): remove once a release includes the fix
+      /**
+       * `module` before a string, written with an escape, is TypeScript's
+       * TS1260 (see `#checkKeywordJustRead`); acorn-typescript read
+       * `\u006dodule "m" {}` without an error. `global` is the declaration's
+       * name, which TypeScript reads as an identifier, so an escape there is
+       * no error, where acorn-typescript rejected `declare \u0067lobal {}`.
+       * @type {Parse.Parser['tsParseAmbientExternalModuleDeclaration']}
+       */
+      tsParseAmbientExternalModuleDeclaration(node) {
+        if (this.type === tt.string) {
+          this.#checkKeywordJustRead();
+        } else if (this.type === tstt.global) {
+          this.containsEsc = false;
+        }
+        return super.tsParseAmbientExternalModuleDeclaration(node);
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#144): remove once a release includes the fix
+      /**
+       * After `export default`, TypeScript reads `interface` as the start of an
+       * interface declaration wherever the name is (`nextTokenCanFollowDefaultKeyword`),
+       * as `interface` is a reserved word there. acorn-typescript's
+       * `tsParseInterfaceDeclaration` declines `interface` before a line break,
+       * which is TypeScript's rule at the start of a statement, and
+       * `export default interface` with `I {}` on the next line failed with
+       * `The keyword 'interface' is reserved`. `parseExportDefaultDeclaration`
+       * marks that `interface`, for which there's no line break to check.
+       * @type {Parse.Parser['hasFollowingLineBreak']}
+       */
+      hasFollowingLineBreak() {
+        return this.start !== this.#defaultExportInterfaceStart && super.hasFollowingLineBreak();
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#147): remove once a release includes the fix
+      /**
+       * `as` or `satisfies` after an operand, written with an escape, is
+       * TypeScript's TS1260: its parser reads the operator and reports the
+       * escape. acorn-typescript read a name there, which failed as
+       * `Unexpected token` at it.
+       * @type {Parse.Parser['parseExprOp']}
+       */
+      parseExprOp(left, leftStartPos, leftStartLoc, minPrec, forInit) {
+        if (this.containsEsc && this.type === tt.name && (this.value === "as" || this.value === "satisfies") && /** @type {number} */
+        tt._in.binop > minPrec && !this.hasPrecedingLineBreak()) {
+          this.raise(this.start, TS_ERRORS.KEYWORD_ESCAPE);
+        }
+        return super.parseExprOp(left, leftStartPos, leftStartLoc, minPrec, forInit);
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#147): remove once a release includes the fix
+      /**
+       * `keyof`, `readonly`, `unique` or `infer` where a type starts, written
+       * with an escape, is TypeScript's TS1260: its parser reads the operator
+       * and reports the escape. acorn-typescript read a type name there, and
+       * failed at the type after it.
+       * @type {Parse.Parser['tsParseTypeOperatorOrHigher']}
+       */
+      tsParseTypeOperatorOrHigher() {
+        if (this.containsEsc && (Parser4.acornTypeScript.tokenIsTSTypeOperator(this.type) || this.type === tt.name && this.value === "infer")) {
+          this.raise(this.start, TS_ERRORS.KEYWORD_ESCAPE);
+        }
+        return super.tsParseTypeOperatorOrHigher();
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#147): remove once a release includes the fix
+      /**
+       * A keyword type written with an escape (`\u0073tring`) is TypeScript's
+       * TS1260, unless a `.` follows, where it's the start of a type name.
+       * acorn-typescript read the keyword type without an error.
+       * @type {Parse.Parser['tsParseNonArrayType']}
+       */
+      tsParseNonArrayType() {
+        if (this.containsEsc && this.type === tt.name && KEYWORD_TYPES.has(
+          /** @type {string} */
+          this.value
+        ) && this.lookaheadCharCode() !== CharCode.dot) {
+          this.raise(this.start, TS_ERRORS.KEYWORD_ESCAPE);
+        }
+        return super.tsParseNonArrayType();
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#147): remove once a release includes the fix
+      /**
+       * `is` after a type predicate's name, written with an escape, is
+       * TypeScript's TS1260: its parser reads the predicate and reports the
+       * escape. acorn-typescript read the name as the type, then failed at `is`
+       * with `Unexpected token`.
+       * @type {Parse.Parser['tsParseTypePredicatePrefix']}
+       */
+      tsParseTypePredicatePrefix() {
+        const name = super.tsParseTypePredicatePrefix();
+        if (name === void 0) this.#checkEscapedPredicateIs();
+        return name;
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#147): remove once a release includes the fix
+      /**
+       * `is` after `this` in a type, written with an escape, is TypeScript's
+       * TS1260, as after a name (see `tsParseTypePredicatePrefix`).
+       * @type {Parse.Parser['tsParseThisTypeOrThisTypePredicate']}
+       */
+      tsParseThisTypeOrThisTypePredicate() {
+        const type = super.tsParseThisTypeOrThisTypePredicate();
+        if (type.type === "TSThisType") this.#checkEscapedPredicateIs();
+        return type;
+      }
+      /**
+       * Report TS1260 at the current token if it's `is` written with an escape,
+       * on the line of a type predicate's name or `this`, which acorn-typescript
+       * has read.
+       */
+      #checkEscapedPredicateIs() {
+        if (this.containsEsc && this.type === tt.name && this.value === "is" && !this.hasPrecedingLineBreak()) {
+          this.raise(this.start, TS_ERRORS.KEYWORD_ESCAPE);
+        }
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#158): remove once a release gives the body as a node
+      /**
+       * An enum's members in a `TSEnumBody` that spans its braces, as in
+       * typescript-estree and Babel 8. acorn-typescript keeps them on the
+       * declaration, Babel 7's shape.
+       * @type {Parse.Parser['tsParseEnumDeclaration']}
+       */
+      tsParseEnumDeclaration(node, properties) {
+        const declaration2 = (
+          /** @type {any} */
+          super.tsParseEnumDeclaration(node, properties)
+        );
+        regex_space_and_comments.lastIndex = declaration2.id.end;
+        const start = declaration2.id.end + /** @type {RegExpExecArray} */
+        regex_space_and_comments.exec(this.input)[0].length;
+        const body = (
+          /** @type {any} */
+          this.startNodeAt(start, this.#positionAt(start))
+        );
+        body.members = declaration2.members;
+        delete declaration2.members;
+        declaration2.body = this.finishNodeAt(
+          body,
+          "TSEnumBody",
+          declaration2.end,
+          declaration2.loc.end
+        );
+        return declaration2;
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#7): remove once a release gives the name as a node
+      /**
+       * A type parameter's name (`T` in `<T>`, a mapped type's key, `infer U`)
+       * as the `Identifier` acorn-typescript reads, with its position, as in
+       * typescript-estree. acorn-typescript keeps only its string, Babel 7's
+       * shape (#873).
+       * @type {Parse.Parser['tsParseTypeParameterName']}
+       */
+      tsParseTypeParameterName() {
+        return (
+          /** @type {any} */
+          this.parseIdent()
+        );
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#147): remove once a release includes the fix
+      /**
+       * `as` after a mapped type's type parameter, written with an escape, is
+       * TypeScript's TS1260: its parser reads the `as` clause. acorn-typescript
+       * failed at `as` with `Unexpected token`.
+       * @type {Parse.Parser['tsParseMappedTypeParameter']}
+       */
+      tsParseMappedTypeParameter() {
+        const parameter = super.tsParseMappedTypeParameter();
+        if (this.containsEsc && this.type === tt.name && this.value === "as") {
+          this.raise(this.start, TS_ERRORS.KEYWORD_ESCAPE);
+        }
+        return parameter;
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#147): remove once a release includes the fix
+      /**
+       * `abstract` before `new` in a type, written with an escape, is
+       * TypeScript's TS1260: its parser reads an abstract constructor type.
+       * acorn-typescript read a type named `abstract` and failed at `new`.
+       * @type {Parse.Parser['isAbstractConstructorSignature']}
+       */
+      isAbstractConstructorSignature() {
+        if (this.type === tstt.abstract && this.containsEsc && this.lookahead().type === tt._new) {
+          this.raise(this.start, TS_ERRORS.KEYWORD_ESCAPE);
+        }
+        return super.isAbstractConstructorSignature();
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#147): remove once a release includes the fix
+      /**
+       * `require` before `(` in an import-equals declaration, written with an
+       * escape, is TypeScript's TS1260: its parser reads an external module
+       * reference. acorn-typescript read a name and failed at `(`.
+       * @type {Parse.Parser['tsIsExternalModuleReference']}
+       */
+      tsIsExternalModuleReference() {
+        if (this.containsEsc && this.type === tt.name && this.value === "require" && this.lookaheadCharCode() === CharCode.openParen) {
+          this.raise(this.start, TS_ERRORS.KEYWORD_ESCAPE);
+        }
+        return super.tsIsExternalModuleReference();
+      }
+      /**
+       * Report TS1260 at `enum`, or at `interface` before a name on its line,
+       * written with an escape where a statement starts, or after `const`:
+       * TypeScript's parser reads the keyword there, where acorn reported a
+       * reserved word or acorn-typescript `Unexpected token` at it
+       * (sveltejs/acorn-typescript#147).
+       */
+      #checkEscapedDeclarationKeyword() {
+        if (this.type === tt._const) {
+          regex_escaped_word.lastIndex = this.nextTokenStart();
+          if (!regex_escaped_word.test(this.input)) return;
+          const next = this.lookahead();
+          if (next.type === tstt.enum) this.raise(next.start, TS_ERRORS.KEYWORD_ESCAPE);
+          return;
+        }
+        if (this.containsEsc && (this.type === tstt.enum || this.type === tstt.interface && this.#declarationAfterModifier(0) !== null)) {
+          this.raise(this.start, TS_ERRORS.KEYWORD_ESCAPE);
+        }
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#113): remove once a release includes the fix
+      // UPSTREAM(sveltejs/acorn-typescript#124): remove once a release includes the fix
+      /**
+       * A class after `export default` is a declaration whose name is optional,
+       * with or without `abstract` and decorators, as in TypeScript:
+       *
+       * - `export default abstract class {}`: acorn-typescript parsed the
+       *   abstract class with a required name (sveltejs/acorn-typescript#113,
+       *   also in #110).
+       * - `export default @dec class B {}` and
+       *   `export default @dec abstract class {}`: acorn-typescript left the `@`
+       *   to acorn, which parses an expression there, so the class became a
+       *   class expression, and `abstract` an identifier followed by an
+       *   unexpected `class`. Read the decorators first, as `parseStatement`
+       *   does, then parse the class declaration, which takes them and starts at
+       *   the first one (sveltejs/acorn-typescript#124).
+       *
+       * A class after `export default (` stays an expression, and so do the
+       * at-sign constructs (`export default @if (a) { … }`), which aren't
+       * decorators (see `parseExprAtom`).
+       *
+       * `interface` starts an interface declaration there wherever its name is
+       * (see `hasFollowingLineBreak`, sveltejs/acorn-typescript#144).
+       * `interface`, and `abstract` before a class, written with an escape, are
+       * TypeScript's TS1260 `Keywords cannot contain escape characters.`: its
+       * parser reads them as the keywords, where acorn-typescript failed at the
+       * name or the class (sveltejs/acorn-typescript#147).
+       *
+       * After decorators, `declare`, with `abstract` before or after it, is a
+       * modifier of an ambient class on its line, whose name is optional:
+       * `export default @dec declare class A {}`, as TypeScript reads it
+       * (after `export default`, `@` starts a declaration, and its modifiers
+       * follow the decorators). It failed at `class`, as acorn-typescript read
+       * `declare` as the exported expression (sveltejs/acorn-typescript#156).
+       * Without decorators, `declare` there is the exported value, as in
+       * TypeScript.
+       * @type {Parse.Parser['parseExportDefaultDeclaration']}
+       */
+      parseExportDefaultDeclaration() {
+        if (this.#pendingModifiers) {
+          return (
+            /** @type {AST.Declaration} */
+            this.#parseModifiedExport(null)
+          );
+        }
+        const decorated = this.type === tstt.at && !this.#isCodeBlockStart(this.start) && !this.#isJSXControlFlowDirectiveStart();
+        const parse5 = () => {
+          if (decorated) {
+            this.#readingDefaultExportDecorators = true;
+            this.parseDecorators();
+          }
+          if (this.type === tstt.interface) {
+            if (this.containsEsc) this.raise(this.start, TS_ERRORS.KEYWORD_ESCAPE);
+            this.#defaultExportInterfaceStart = this.start;
+          } else if (this.type === tstt.abstract && this.containsEsc && this.lookahead().type === tt._class && !this.#lineBreakAfter(this.end)) {
+            this.raise(this.start, TS_ERRORS.KEYWORD_ESCAPE);
+          }
+          if (this.isAbstractClass()) {
+            const node = (
+              /** @type {AST.ClassDeclaration} */
+              this.startNode()
+            );
+            this.next();
+            node.abstract = true;
+            return this.parseClass(node, "nullableID");
+          }
+          if (decorated && this.type === tt._class) {
+            return this.parseClass(this.startNode(), "nullableID");
+          }
+          if (decorated && (this.isDeclareClass() || this.#isAbstractDeclareClass())) {
+            const node = (
+              /** @type {AST.ClassDeclaration} */
+              this.startNode()
+            );
+            while (this.type !== tt._class) {
+              if (this.type === tstt.abstract) node.abstract = true;
+              this.next();
+            }
+            node.declare = true;
+            return this.tsInAmbientContext(() => this.parseClass(node, "nullableID"));
+          }
+          return super.parseExportDefaultDeclaration();
+        };
+        return decorated && this.#collect ? this.#parseDecoratedStatement(parse5) : parse5();
+      }
+      /**
+       * TypeScript's parser takes decorators before any declaration and reports
+       * those before something other than a class from its checker (TS1206,
+       * whatever `experimentalDecorators` says): `@dec function f() {}`,
+       * `@dec const x = 1;`, `export @dec function f() {}`,
+       * `export default @dec function f() {}`, `@dec export function f() {}`.
+       * acorn-typescript throws `Leading decorators must be attached to a class
+       * declaration.` for them. When collecting and a declaration follows, `raise`
+       * records it at the decorators instead and takes them off the decorator
+       * stack, so that no later class takes them, and the statement is parsed
+       * without them. Before anything else it still throws, as TypeScript's
+       * parser expects a declaration there: `#parseDecoratedStatement` throws it
+       * if the statement after all isn't one (`@dec type;`). Decorators in an
+       * expression (`const y = @dec 1;`) still throw.
+       * UPSTREAM(sveltejs/acorn-typescript#89)
+       * @type {Parse.Parser['parseDecorators']}
+       */
+      parseDecorators(allowExport) {
+        const outer = this.#leadingDecoratorsStart;
+        const leading = allowExport || this.#readingDefaultExportDecorators;
+        this.#readingDefaultExportDecorators = false;
+        this.#leadingDecoratorsStart = this.#collect && leading ? this.start : -1;
+        try {
+          super.parseDecorators(allowExport);
+          this.#checkDecoratorsBeforeExport();
+        } finally {
+          this.#leadingDecoratorsStart = outer;
+        }
+      }
+      /**
+       * An at-sign construct (`@{ … }`, `@if`, `@for`, `@switch`, `@try`) after
+       * `export` isn't a declaration, though acorn-typescript takes any `@` there
+       * for the decorators of one. It's then `Unexpected token`, as any other
+       * token that starts neither a declaration nor the braces of an export
+       * (`export foo`), and after `export declare` acorn-typescript's error for
+       * a missing ambient declaration. It used to be parsed as a statement, and
+       * the parser crashed with a TypeError when `parseExport` read its `id`.
+       *
+       * `global` before `{` starts a global augmentation, which TypeScript's
+       * parser reads after `export` (or `export declare`), and reports from its
+       * checker (see `parseExportDeclaration`). acorn-typescript didn't take
+       * `global` for the start of a declaration, and failed at it
+       * (sveltejs/acorn-typescript#146).
+       * @type {Parse.Parser['shouldParseExportStatement']}
+       */
+      shouldParseExportStatement() {
+        if (this.type === tstt.at && (this.#isCodeBlockStart(this.start) || this.#isJSXControlFlowDirectiveStart())) {
+          return false;
+        }
+        if (this.type === tstt.global && this.lookahead().type === tt.braceL) return true;
+        if (this.#pendingModifiers || this.#readModifiedDeclaration(true)) return true;
+        return super.shouldParseExportStatement();
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#132): remove once a release includes the fix
+      // UPSTREAM(sveltejs/acorn-typescript#137): remove once a release includes the fix
+      /**
+       * What follows `export` has to be a declaration. Where TypeScript's parser
+       * finds none, report its error, TS1128 `Declaration or statement
+       * expected.` at `export`:
+       *
+       * - `abstract`, `module`, `namespace` or `type` before a line break
+       *   (`export abstract` with `class A {}` on the next line), or before a
+       *   token that starts no declaration (`export abstract;`).
+       *   acorn-typescript's `shouldParseExportStatement` takes these words for
+       *   the start of one, but its `tsParseDeclaration` declines them, as
+       *   TypeScript does. `parseExportDeclaration` then parsed a statement,
+       *   which read the word as an expression, and `parseExport` crashed with
+       *   a TypeError reading that statement's `id`
+       *   (sveltejs/acorn-typescript#132).
+       * - `export declare` with a declaration on the next line, which
+       *   acorn-typescript read as an ambient declaration: TypeScript reads a
+       *   word as a modifier only before a token on the same line (see
+       *   `isAbstractClass`), so `declare` is an expression there
+       *   (sveltejs/acorn-typescript#137).
+       *
+       * `#checkExportDeclarationStart` reports the second before
+       * acorn-typescript reads `declare`, and the words that the declaration
+       * after them used to lose.
+       *
+       * A global augmentation after `export` (see `shouldParseExportStatement`)
+       * is TypeScript's checker error TS2668 `'export' modifier cannot be
+       * applied to ambient modules and module augmentations since they are
+       * always visible.`: a strict parse throws it, and a collecting one records
+       * it and keeps the export, as Prettier's `typescript` parser does
+       * (sveltejs/acorn-typescript#146). An export of an ambient declaration
+       * whose `declare` follows `abstract` (`export abstract declare class A
+       * {}`) is a type export, as after `export declare`
+       * (sveltejs/acorn-typescript#143).
+       * @type {Parse.Parser['parseExportDeclaration']}
+       */
+      parseExportDeclaration(node) {
+        const modified = this.#parseModifiedExport(
+          /** @type {AST.ExportNamedDeclaration} */
+          node
+        );
+        if (modified) return (
+          /** @type {AST.Declaration} */
+          modified
+        );
+        const export_start = this.lastTokStart;
+        this.#checkExportDeclarationStart(export_start);
+        const outer_exported_start = this.#exportedDeclarationStart;
+        this.#exportedDeclarationStart = this.start;
+        let declaration2;
+        try {
+          declaration2 = super.parseExportDeclaration(node);
+        } finally {
+          this.#exportedDeclarationStart = outer_exported_start;
+        }
+        if (declaration2?.type !== "VariableDeclaration" && !/** @type {{ id?: unknown } | null} */
+        declaration2?.id) {
+          this.raise(export_start, TS_ERRORS.DECLARATION_OR_STATEMENT_EXPECTED);
+        }
+        if (
+          /** @type {{ declare?: boolean }} */
+          declaration2.declare
+        ) {
+          node.exportKind = "type";
+        }
+        const module = (
+          /** @type {AST.Node} */
+          declaration2
+        );
+        if (module.type === "TSModuleDeclaration" && module.kind === "global") {
+          this.raise(export_start, TS_ERRORS.EXPORT_MODIFIER_ON_AUGMENTATION);
+        }
+        return declaration2;
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#132): remove once a release includes the fix
+      // UPSTREAM(sveltejs/acorn-typescript#137): remove once a release includes the fix
+      /**
+       * Report `export declare` before a line break (see
+       * `parseExportDeclaration`) before acorn-typescript reads `declare` as a
+       * modifier.
+       *
+       * acorn-typescript's `tsParseDeclaration` reads `abstract`, `module`,
+       * `namespace` or `type` after `export` (or `export declare`) before it
+       * checks what follows on the same line. When that isn't a class or a name
+       * (or a string after `module`), it declines, and `parseExportDeclaration`
+       * parses the rest as a statement without the word: `export abstract
+       * function f() {}`, `export type const x = 1;` and `export namespace
+       * class A {}` gave the plain exported declaration. Report the word
+       * before it's lost, as TypeScript's parser does:
+       *
+       * - `abstract` before a declaration is a modifier of that declaration,
+       *   which `tsParseDeclaration` reads, reporting TS1242 from TypeScript's
+       *   checker unless it's a class.
+       * - `type` after `declare`, or before `default` or `@`, starts a type
+       *   alias, whose name is missing (TS1003, or TS1359 for a reserved word),
+       *   or on the next line (TS1142). Before `=` or `as`, TypeScript expects
+       *   the braces of `export type { … }` (TS1005), where acorn-typescript
+       *   read a type alias named `as` (sveltejs/acorn-typescript#145).
+       * - `namespace` before a string starts a namespace without a name
+       *   (TS1003).
+       * - Otherwise the word starts no declaration (TS1128).
+       *
+       * Where TypeScript reads the word as the keyword, the word written with
+       * an escape is TS1260 first (sveltejs/acorn-typescript#147); before a
+       * name, `tsParseTypeAliasDeclaration` and
+       * `tsParseModuleOrNamespaceDeclaration` report it. A word before any
+       * other line break starts no declaration either, which
+       * `parseExportDeclaration` reports.
+       * @param {number} export_start
+       */
+      #checkExportDeclarationStart(export_start) {
+        const is_identifier = Parser4.acornTypeScript.tokenIsIdentifier;
+        let ahead = 0;
+        let word = this.getCurLookaheadState();
+        const declared = word.type === tstt.declare && !word.containsEsc;
+        if (declared) {
+          if (this.#lineBreakAfter(word.end)) {
+            this.raise(export_start, TS_ERRORS.DECLARATION_OR_STATEMENT_EXPECTED);
+          }
+          word = this.lookahead(++ahead);
+        }
+        const value = word.value;
+        if (!is_identifier(word.type) || value !== "abstract" && value !== "type" && value !== "namespace" && value !== "module") {
+          return;
+        }
+        const next = this.lookahead(++ahead);
+        const line_break = regex_line_break.test(this.input.slice(word.end, next.start));
+        if (value === "type") {
+          const braces = !declared && (next.type === tt.eq || next.type === tt.braceL || next.type === tt.star || next.type === tt.name && next.value === "as");
+          const alias = declared || next.type === tt._default || next.type === tstt.at;
+          if ((braces || alias) && word.containsEsc)
+            this.raise(word.start, TS_ERRORS.KEYWORD_ESCAPE);
+          if (braces) this.raise(next.start, TS_ERRORS.TOKEN_EXPECTED("{"));
+          if (alias && line_break) this.raise(next.start, TS_ERRORS.LINE_BREAK_NOT_PERMITTED);
+          if (alias && !is_identifier(next.type)) this.#raiseIdentifierExpected(next);
+        }
+        if (line_break) return;
+        if (value === "abstract") {
+          const declaration2 = this.#declarationAfterModifier(ahead);
+          if (declaration2 === null || declaration2.includes("abstract") || declared && declaration2[0] === "declare") {
+            if (is_identifier(next.type)) return;
+            this.raise(export_start, TS_ERRORS.DECLARATION_OR_STATEMENT_EXPECTED);
+          }
+          if (word.containsEsc) this.raise(word.start, TS_ERRORS.KEYWORD_ESCAPE);
+          return;
+        }
+        if (is_identifier(next.type) || value === "module" && next.type === tt.string) return;
+        if (value === "namespace" && next.type === tt.string) {
+          if (word.containsEsc) this.raise(word.start, TS_ERRORS.KEYWORD_ESCAPE);
+          this.#raiseIdentifierExpected(next);
+        }
+        this.raise(export_start, TS_ERRORS.DECLARATION_OR_STATEMENT_EXPECTED);
+      }
+      /**
+       * Report TypeScript's error for a missing name at `token`: TS1359 for a
+       * reserved word, TS1003 for anything else.
+       * @param {Parse.LookaheadState} token
+       */
+      #raiseIdentifierExpected(token) {
+        this.raise(
+          token.start,
+          token.type.keyword ? TS_ERRORS.RESERVED_WORD_AS_IDENTIFIER(String(token.value)) : TS_ERRORS.IDENTIFIER_EXPECTED
+        );
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#125): remove once a release includes the fix
+      /**
+       * Decorators written before `export` decorate the class it exports, so
+       * only a class declaration can follow: `@dec export class A {}`,
+       * `@dec export default abstract class {}`. acorn-typescript checks what
+       * follows other leading decorators, but accepted any export after them,
+       * and the next class parsed took them: the class expression in
+       * `@dec export default (class {})` or `@dec export const A = class {}`.
+       * With no class, as in `@dec export function f() {}`, they were dropped.
+       * Report them at the exported declaration with acorn-typescript's error
+       * for leading decorators before something else (TypeScript's TS1206).
+       */
+      #checkDecoratorsBeforeExport() {
+        if (this.type !== tt._export) return;
+        let ahead = 1;
+        let next = this.lookahead(ahead);
+        const is_default = next.type === tt._default;
+        if (is_default) next = this.lookahead(++ahead);
+        const declaration_start = next.start;
+        if (next.type === tstt.at && !this.#isCodeBlockStart(declaration_start) && !this.#isJSXControlFlowDirectiveAt(declaration_start)) {
+          return;
+        }
+        const modifies = (modifier) => !modifier.containsEsc && !this.#lineBreakAfter(modifier.end);
+        const declared = !is_default && next.type === tstt.declare && modifies(next);
+        if (declared) next = this.lookahead(++ahead);
+        if (next.type === tstt.abstract && modifies(next)) {
+          next = this.lookahead(++ahead);
+          if (!declared && !is_default && next.type === tstt.declare && modifies(next)) {
+            next = this.lookahead(++ahead);
+          }
+        }
+        if (next.type !== tt._class) {
+          this.raise(declaration_start, TS_ERRORS.UNEXPECTED_LEADING_DECORATOR);
+        }
+      }
+      /**
+       * When the decorators before a statement are being read, collecting, and
+       * a declaration follows them, record their error at the first decorator,
+       * as TypeScript does, and take them off the decorator stack (see
+       * `parseDecorators`). An at-sign construct after `export`
+       * (`@dec export @if (a) { … }`) is no declaration.
+       * @param {number} position Where acorn-typescript raises the error
+       * @returns {boolean} Whether the error was recorded, and parsing goes on
+       */
+      #dropLeadingDecorators(position) {
+        const start = this.#leadingDecoratorsStart;
+        if (start === -1 || !this.#atDeclarationKeyword() || this.#isCodeBlockStart(position) || this.#isJSXControlFlowDirectiveAt(position)) {
+          return false;
+        }
+        this.#recordCheckerLevelError(start, start + 1, TS_ERRORS.UNEXPECTED_LEADING_DECORATOR);
+        this.#droppedDecoratorsError = { position, error: TS_ERRORS.UNEXPECTED_LEADING_DECORATOR };
+        const index = this.decoratorStack.length - 1;
+        this.parseEffects?.willSet(this.decoratorStack, String(index));
+        this.decoratorStack[index] = [];
+        return true;
+      }
+      /**
+       * Whether the current token starts a declaration in TypeScript's parser
+       * after decorators (`parseDeclarationWorker`, and the modifiers
+       * `parseModifiers` reads before one). Some of these words start an
+       * expression here (`type;`), which `#parseDecoratedStatement` checks.
+       */
+      #atDeclarationKeyword() {
+        switch (this.type) {
+          case tt._var:
+          case tt._const:
+          case tt._function:
+          case tt._class:
+          case tt._import:
+          case tt._export:
+            return true;
+        }
+        return Parser4.acornTypeScript.tokenIsIdentifier(this.type) && !this.containsEsc && DECLARATION_KEYWORDS.has(
+          /** @type {string} */
+          this.value
+        );
+      }
+      /**
+       * Parse a statement, or the declaration after `export default`, that
+       * starts with decorators, when collecting, and throw the error
+       * `#dropLeadingDecorators` recorded for them, where acorn-typescript
+       * raises it, unless it is a declaration.
+       * @template {{ type: string }} T
+       * @param {() => T} parse
+       * @returns {T}
+       */
+      #parseDecoratedStatement(parse5) {
+        const outer = this.#droppedDecoratorsError;
+        this.#droppedDecoratorsError = null;
+        try {
+          const node = parse5();
+          const dropped = (
+            /** @type {{ position: number, error: Diagnostic } | null} */
+            this.#droppedDecoratorsError
+          );
+          if (dropped && !DECORATED_DECLARATION_TYPES.has(node.type)) {
+            this.#throwError(dropped.position, dropped.error);
+          }
+          return node;
+        } finally {
+          this.#droppedDecoratorsError = outer;
+        }
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#126): remove once a release includes the fix
+      // UPSTREAM(sveltejs/acorn-typescript#133): remove once a release includes the fix
+      /**
+       * Only a parameter can have decorators. acorn-typescript read them on the
+       * elements of an array pattern too (`const [@dec x] = y;`), since acorn
+       * parses those with this method, and they were dropped from the output.
+       * TypeScript rejects them (TS1181), so a decorator there is
+       * `Unexpected token`, as in an object pattern, before a rest element too
+       * (sveltejs/acorn-typescript#133).
+       *
+       * A rest parameter can have decorators, as in TypeScript:
+       * `m(@dec ...rest: T[]) {}`. TypeScript's parser reads them like the
+       * decorators of any other parameter, which this parser takes too, and
+       * its checker decides whether they are allowed (TS1206 unless
+       * `experimentalDecorators` allows parameter decorators). acorn's
+       * `parseBindingList` checks for `...` before it calls this method, where
+       * acorn-typescript reads the decorators, so a `...` after them reached
+       * `parseMaybeDefault`, which rejects it. Read the decorators here, and
+       * before `...` hang them off the `RestElement`, as typescript-estree
+       * does. Like other parameters, the element's range leaves them out. The
+       * list takes the rest element for an ordinary one, so report a comma
+       * after it here as acorn does (TS1013, TS1014), recording it when
+       * collecting as `parseBindingList` does. Modifiers before a rest parameter
+       * are `#parseRestParameterProperty`'s.
+       * @type {Parse.Parser['parseAssignableListItem']}
+       */
+      parseAssignableListItem(allowModifiers) {
+        if (this.type !== tstt.at) return this.#parseAssignableListItem(allowModifiers);
+        if (this.#bindingListClose === tt.bracketR) this.unexpected();
+        const decorators = [];
+        while (this.type === tstt.at) decorators.push(this.parseDecorator());
+        if (this.type !== tt.ellipsis) {
+          const item = this.#parseAssignableListItem(allowModifiers);
+          const node = (
+            /** @type {AST.Node} */
+            item
+          );
+          const decorated = (
+            /** @type {AST.Node & { decorators?: AST.Decorator[] }} */
+            node.type === "TSParameterProperty" ? node.parameter : node
+          );
+          decorated.decorators = decorators;
+          return item;
+        }
+        const rest2 = (
+          /** @type {AST.RestElement & { decorators?: AST.Decorator[] }} */
+          this.parseRestBinding()
+        );
+        this.parseBindingListItem(rest2);
+        rest2.decorators = decorators;
+        this.#reportCommaAfterRestParameter();
+        return rest2;
+      }
+      /**
+       * acorn-typescript's `parseAssignableListItem`, after any decorators, or
+       * the rest element after parameter property modifiers
+       * (`#parseRestParameterProperty`). Records where the item starts for
+       * `raise`.
+       *
+       * acorn-typescript raises TS1187 for a parameter property whose parameter
+       * is a binding pattern, but not for one with a default
+       * (`constructor(public [a] = [1])`), whose output then keeps the pattern
+       * after the modifier. TypeScript's checker reports both. Raise it for the
+       * pattern before the default too, at the same place.
+       * @param {boolean | undefined} allowModifiers
+       * @returns {AST.Pattern}
+       */
+      #parseAssignableListItem(allowModifiers) {
+        this.#assignableListItemStart = this.start;
+        const item = (
+          /** @type {AST.Node} */
+          this.#collect && allowModifiers !== void 0 && this.#parseRestParameterProperty(allowModifiers) || super.parseAssignableListItem(allowModifiers)
+        );
+        if (item.type === "TSParameterProperty" && item.parameter.type === "AssignmentPattern" && item.parameter.left.type !== "Identifier") {
+          this.raise(
+            /** @type {number} */
+            item.start,
+            TS_ERRORS.PATTERN_PARAMETER_PROPERTY
+          );
+        }
+        return (
+          /** @type {AST.Pattern} */
+          item
+        );
+      }
+      /**
+       * TypeScript's parser reads parameter property modifiers before a rest
+       * parameter too (`constructor(public ...rest: T[]) {}`), and its checker
+       * reports TS1317. acorn-typescript reads the modifiers and then a name or
+       * a pattern, and fails at the `...`. When collecting, read the rest
+       * element after the modifiers, record TS1317 at them, and keep the rest
+       * element as the parameter, without them: typescript-estree rejects a rest
+       * parameter property, so there is no node to mirror. A strict parse still
+       * fails at the `...`. Returns `null`, having read nothing, when no rest
+       * element follows the modifiers. On a function's parameter
+       * (`allowModifiers` is `false`), the modifiers are TS2369 too.
+       * UPSTREAM(sveltejs/acorn-typescript#89)
+       * @param {boolean} allowModifiers
+       * @returns {AST.RestElement | null}
+       */
+      #parseRestParameterProperty(allowModifiers) {
+        if (!PARAMETER_MODIFIERS.includes(
+          /** @type {string} */
+          this.value
+        )) return null;
+        const start = this.start;
+        const modifiers_end = this.tsTryParse(() => {
+          this.tsParseModifiers({ modified: {}, allowedModifiers: PARAMETER_MODIFIERS });
+          return this.type === tt.ellipsis && this.lastTokEnd;
+        });
+        if (modifiers_end === void 0) return null;
+        this.#recordCheckerLevelError(start, modifiers_end, TS_ERRORS.REST_PARAMETER_PROPERTY);
+        if (!allowModifiers) {
+          this.#recordCheckerLevelError(
+            start,
+            start + 1,
+            TS_ERRORS.PARAMETER_PROPERTY_OUTSIDE_CONSTRUCTOR
+          );
+        }
+        const rest2 = this.parseRestBinding();
+        this.parseBindingListItem(rest2);
+        this.#reportCommaAfterRestParameter();
+        return rest2;
+      }
+      /**
+       * A rest element that `parseAssignableListItem` reads is an ordinary
+       * element to the list, so report a comma after it here as acorn does
+       * (TS1013, TS1014), recording it when collecting as `parseBindingList`
+       * does. A trailing comma is allowed in an ambient context.
+       */
+      #reportCommaAfterRestParameter() {
+        if (this.type !== tt.comma || this.#isAmbientRestParameterTrailingComma()) return;
+        if (this.#collect) {
+          this.#recordCheckerLevelError(
+            this.start,
+            this.start + 1,
+            TS_ERRORS.REST_ELEMENT_TRAILING_COMMA
+          );
+        } else {
+          this.raise(this.start, TS_ERRORS.REST_ELEMENT_TRAILING_COMMA);
+        }
+      }
+      /**
+       * acorn-typescript takes a `?` after any element of a binding list and
+       * raises TS2463's message for anything but a name. TypeScript's parser
+       * takes it only after a parameter:
+       *
+       * - A parameter that is a binding pattern can be optional (`{ a }?: T`).
+       *   acorn-typescript raises TS2463 for it while it reads the parameter,
+       *   before it knows whether a body follows, so an overload signature got
+       *   the error too. Accept the `?` as sveltejs/acorn-typescript#110 does,
+       *   with the same AST; `parseFunctionBody` reports it for a function with a
+       *   body.
+       * - An optional rest parameter (`...a?: T[]`) is TypeScript's TS1047, from
+       *   its checker. Report that where acorn-typescript raised TS2463's message
+       *   (not in a type or an ambient context), at the `?`, and keep the node
+       *   #110 gives it (`optional: true`).
+       * - An element of an array pattern (`[a?]`, `[{ a }?]`, `[...a?]`) takes no
+       *   `?`: TypeScript's parser expects a `,` there, and this throws acorn's
+       *   `Unexpected token` at the `?` in every mode
+       *   (sveltejs/acorn-typescript#130, where #110 accepts it with no error).
+       *
+       * A rest parameter can have a default in TypeScript's parser too
+       * (`function f(...a = []) {}`), and its checker reports TS1048 at the
+       * parameter's name. acorn expects the list to close after a rest element,
+       * and failed at the `=`. Raise TS1048 there, which `raise` records when
+       * collecting, and read the default (see `#readRestParameterDefault`). A
+       * strict parse throws it. `parseFunctionBody` raises it for an arrow
+       * function, after its `=>`. An array pattern's rest element can have one
+       * too, TS1186 (see `#readRestElementDefault`).
+       * @type {Parse.Parser['parseBindingListItem']}
+       */
+      parseBindingListItem(param) {
+        const item = this.#parseBindingListItem(param);
+        if (item.type === "RestElement" && this.type === tt.eq) {
+          if (this.#bindingListClose === tt.parenR) {
+            if (!this.#readingGenericArrowParameters) {
+              this.raise(
+                /** @type {number} */
+                item.argument.start,
+                TS_ERRORS.REST_PARAMETER_INITIALIZER
+              );
+            }
+            this.#readRestParameterDefault(item);
+          } else if (this.#bindingListClose === tt.bracketR) {
+            this.#readRestElementDefault(item);
+          }
+        }
+        return item;
+      }
+      /**
+       * `parseBindingListItem`, before any default of a rest parameter.
+       * @type {Parse.Parser['parseBindingListItem']}
+       */
+      #parseBindingListItem(param) {
+        if (this.type === tt.question) {
+          if (this.#bindingListClose === tt.bracketR) {
+            this.unexpected();
+          }
+          if (this.#bindingListClose === tt.parenR) {
+            const optional = (
+              /** @type {AST.Pattern & { optional?: boolean }} */
+              param
+            );
+            if (param.type === "ObjectPattern" || param.type === "ArrayPattern") {
+              this.next();
+              optional.optional = true;
+            } else if (param.type === "RestElement" && !this.isAmbientContext && !this.inType) {
+              const question = this.start;
+              this.next();
+              optional.optional = true;
+              if (!this.#readingGenericArrowParameters) {
+                this.raise(question, TS_ERRORS.OPTIONAL_REST_PARAMETER);
+              }
+            }
+          }
+        }
+        return super.parseBindingListItem(param);
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#159): remove once a release includes the fix
+      /**
+       * Reads the default after a rest parameter, from its `=`: TypeScript's
+       * parser reads one, and its checker reports TS1048. The rest element's
+       * argument becomes an `AssignmentPattern`, as for a rest element's
+       * default (`#readRestElementDefault`), so the tree keeps the default. Its
+       * `?` and type annotation move to the pattern's target, where a
+       * parameter with a default has them (`a?: T = 1`), for them to print
+       * before the default. The errors are reported where the rest element is
+       * known to be a parameter's (see `parseFunctionBody` and
+       * `tsParseBindingListForSignature`).
+       * @param {AST.Node} rest The rest parameter, a `RestElement`, or the
+       * `SpreadElement` that becomes one
+       */
+      #readRestParameterDefault(rest2) {
+        const node = (
+          /** @type {AST.Node & { argument: AST.Node & AST.NodeWithLocation, optional?: boolean, typeAnnotation?: AST.TSTypeAnnotation }} */
+          rest2
+        );
+        const argument = (
+          /** @type {AST.Node & AST.NodeWithLocation & { optional?: boolean, typeAnnotation?: AST.TSTypeAnnotation }} */
+          node.argument
+        );
+        if (node.optional) {
+          this.#restParameterQuestions.set(
+            rest2,
+            skip_space_and_comments_from(this.input, argument.end)
+          );
+          argument.optional = true;
+          delete node.optional;
+        }
+        if (node.typeAnnotation) {
+          argument.typeAnnotation = node.typeAnnotation;
+          delete node.typeAnnotation;
+        }
+        if (argument.optional || argument.typeAnnotation) {
+          this.resetEndLocation(argument);
+        }
+        node.argument = /** @type {AST.Node & AST.NodeWithLocation} */
+        this.parseMaybeDefault(
+          argument.start,
+          argument.loc?.start,
+          /** @type {any} */
+          argument
+        );
+        this.resetEndLocation(rest2);
+      }
+      /**
+       * Whether `node` is a rest parameter with a default
+       * (`#readRestParameterDefault`).
+       * @param {AST.Node} node
+       */
+      #isRestParameterWithDefault(node) {
+        return node.type === "RestElement" && node.argument.type === "AssignmentPattern";
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#159): remove once a release includes the fix
+      /**
+       * Reads the default after the rest element of an array or object binding
+       * pattern, from its `=` (`const [...a = 1] = b`, `const { ...a = 1 } =
+       * b`). acorn expects the pattern to end after a rest element, and failed
+       * at the `=`. TypeScript's parser reads the default, and its checker
+       * reports TS1186 at the `=`: record it there when collecting, while a
+       * strict parse throws it. The rest element's argument becomes an
+       * `AssignmentPattern`, as acorn and typescript-estree make it for
+       * `[...a = 1] = b`, so the tree keeps the default (see
+       * `checkLValInnerPattern`).
+       * @param {AST.RestElement} rest
+       */
+      #readRestElementDefault(rest2) {
+        this.#raiseCheckerError(this.start, TS_ERRORS.REST_ELEMENT_INITIALIZER);
+        const argument = (
+          /** @type {AST.Pattern & AST.NodeWithLocation} */
+          rest2.argument
+        );
+        rest2.argument = this.parseMaybeDefault(argument.start, argument.loc?.start, argument);
+        this.resetEndLocation(rest2);
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#159): remove once a release includes the fix
+      /**
+       * A rest element with a default (`#readRestElementDefault`,
+       * `#toRestElementWithDefault`): acorn checks a rest element's argument as
+       * a target, which an `AssignmentPattern` isn't (`Binding rvalue`). Check
+       * it as a pattern's element instead, which checks its target.
+       * @type {Parse.Parser['checkLValInnerPattern']}
+       */
+      checkLValInnerPattern(expr, bindingType, checkClashes) {
+        if (expr.type === "RestElement" && expr.argument.type === "AssignmentPattern") {
+          expr = expr.argument;
+        }
+        super.checkLValInnerPattern(expr, bindingType, checkClashes);
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#121): remove once a release includes the fix
+      // UPSTREAM(sveltejs/acorn-typescript#147): remove once a release includes the fix
+      /**
+       * `assert` starts import assertions only on the line the import or
+       * export ends on, as in TypeScript and the import assertions grammar.
+       * After a line break it starts the next statement: `import "x"` with
+       * `assert(ok)` on the next line is an import and a call. `with` has no
+       * such rule (sveltejs/acorn-typescript#121).
+       *
+       * `assert` written with an escape is TypeScript's TS1260 `Keywords cannot
+       * contain escape characters.`: its parser reads it as the keyword, where
+       * acorn-typescript read the assertions without an error
+       * (sveltejs/acorn-typescript#147).
+       * @type {Parse.Parser['parseMaybeImportAttributes']}
+       */
+      parseMaybeImportAttributes(node) {
+        if (this.type === tstt.assert) {
+          if (this.hasPrecedingLineBreak()) return;
+          if (this.containsEsc) this.raise(this.start, TS_ERRORS.KEYWORD_ESCAPE);
+        }
+        super.parseMaybeImportAttributes(node);
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#116): remove once a release includes the fix
+      /**
+       * Reads the entries of import attributes, `with { … }`, comparing keys by
+       * their value, as ECMAScript and acorn do: `'type'` is the same key as
+       * `type`. acorn-typescript compared `key.name`, which a quoted key doesn't
+       * have, so a second quoted key was a duplicate and `type` never matched
+       * `'type'`. Otherwise this is acorn-typescript's method, as fixed in
+       * sveltejs/acorn-typescript#116 (and #110), error message included.
+       * @type {Parse.Parser['parseWithEntries']}
+       */
+      parseWithEntries() {
+        const attributes = [];
+        const keys = /* @__PURE__ */ new Set();
+        do {
+          if (this.type === tt.braceR) break;
+          const node = this.startNode();
+          const attribute = (
+            /** @type {AST.ImportAttribute} */
+            /** @type {unknown} */
+            node
+          );
+          attribute.key = this.type === tt.string ? this.parseLiteral(this.value) : this.parseIdent(true);
+          this.next();
+          const key2 = attribute.key.type === "Literal" ? attribute.key.value : attribute.key.name;
+          if (keys.has(key2)) {
+            this.raise(this.pos, TSRX_ERRORS.DUPLICATED_ATTRIBUTE_KEY);
+          }
+          keys.add(key2);
+          if (this.type !== tt.string) {
+            this.raise(this.pos, TS_ERRORS.ONLY_STRING_ATTRIBUTE_VALUE);
+          }
+          attribute.value = this.parseLiteral(this.value);
+          this.finishNode(
+            node,
+            /** @type {AST.Node['type']} */
+            /** @type {string} */
+            "ImportAttribute"
+          );
+          attributes.push(attribute);
+        } while (this.eat(tt.comma));
+        return attributes;
       }
       /**
        * Override parsePropertyValue to support TypeScript generic methods in object literals.
@@ -17560,17 +22830,21 @@ function TSRXPlugin(config) {
           this.#readTagStartAsTypeParameterStart();
         }
         if (!isPattern && !isGenerator && !isAsync && this.type === tt.relational && this.value === "<") {
-          const typeParameters = this.tsTryParseTypeParameters();
+          const typeParameters = this.tsTryParseTypeParameters(this.tsParseConstModifier);
           if (typeParameters && this.type === tt.parenL) {
             prop2.method = true;
             prop2.kind = "init";
             prop2.value = this.parseMethod(false, false);
             /** @type {AST.Property} */
             prop2.value.typeParameters = typeParameters;
+            this.#startMethodAtTypeParameters(
+              /** @type {AST.Property} */
+              prop2
+            );
             return;
           }
         }
-        return super.parsePropertyValue(
+        super.parsePropertyValue(
           prop2,
           isPattern,
           isGenerator,
@@ -17580,6 +22854,33 @@ function TSRXPlugin(config) {
           refDestructuringErrors,
           containsEsc
         );
+        this.#startMethodAtTypeParameters(
+          /** @type {AST.Property} */
+          prop2
+        );
+      }
+      /**
+       * Like typescript-estree, an object method's function starts at its type
+       * parameters, not at its `(`, so that they lie inside it: a comment in
+       * them (`m</* c *\/ T>() {}`) leads or trails a type parameter rather than
+       * the whole function or the key before it. A class method keeps its type
+       * parameters on the method definition instead.
+       * @param {AST.Property} prop
+       */
+      #startMethodAtTypeParameters(prop2) {
+        const value = (
+          /** @type {AST.FunctionExpression} */
+          prop2.value
+        );
+        const typeParameters = (
+          /** @type {AST.Node | undefined} */
+          value?.typeParameters
+        );
+        if (value?.type === "FunctionExpression" && typeParameters && /** @type {AST.NodeWithLocation} */
+        typeParameters.start < /** @type {AST.NodeWithLocation} */
+        value.start) {
+          this.resetStartLocationFromNode(value, typeParameters);
+        }
       }
       /**
        * Acorn expects `this.context` to always contain at least one tokContext.
@@ -17589,50 +22890,12 @@ function TSRXPlugin(config) {
        */
       nextToken() {
         while (this.context.length && this.context[this.context.length - 1] == null) {
-          this.context.pop();
+          this.#popContext();
         }
         if (this.context.length === 0) {
           this.context.push(b_stat);
         }
         return super.nextToken();
-      }
-      /**
-       * @returns {Parse.CommentMetaData | null}
-       */
-      #createCommentMetadata() {
-        if (this.#path.length === 0) {
-          return null;
-        }
-        const container = this.#path[this.#path.length - 1];
-        if (!this.#isNativeTemplateNode(container)) {
-          return null;
-        }
-        const container_children = (
-          /** @type {{ children?: unknown }} */
-          container.children
-        );
-        const children = Array.isArray(container_children) ? (
-          /** @type {AST.Node[]} */
-          container_children
-        ) : [];
-        const hasMeaningfulChildren = children.some(
-          (child) => child && !isWhitespaceTextNode(child)
-        );
-        if (hasMeaningfulChildren) {
-          return null;
-        }
-        container.metadata ??= { path: [] };
-        if (container.metadata.commentContainerId === void 0) {
-          container.metadata.commentContainerId = ++this.#commentContextId;
-        }
-        return (
-          /*** @type {Parse.CommentMetaData} */
-          {
-            containerId: container.metadata.commentContainerId,
-            childIndex: children.length,
-            beforeMeaningfulChild: !hasMeaningfulChildren
-          }
-        );
       }
       /**
        * Helper method to get the element name from a JSX identifier or member expression
@@ -17658,67 +22921,158 @@ function TSRXPlugin(config) {
         return !!name && typeof name !== "string" && name.type === "JSXExpressionContainer" && name.isDynamic === true;
       }
       /**
-       * Dynamic tag expressions must be able to resolve to an element name:
-       * an identifier, member access, static string, or a runtime expression
-       * composed of those. Constructed values (calls, spreads, concatenation,
-       * interpolation, object/array literals) and static non-string literals
-       * can never be valid tag names.
-       * @param {AST.Node | null | undefined} expression
-       * @returns {boolean}
-       */
-      #isValidDynamicTagExpression(expression) {
-        let node = expression;
-        while (node && is_dynamic_tag_wrapper(node)) {
-          node = node.expression;
-        }
-        if (!node || node.type.startsWith("JSX")) return false;
-        if (node.type === "Identifier") return node.name !== "undefined";
-        if (node.type === "Literal") return typeof node.value === "string";
-        if (node.type === "UnaryExpression" && node.operator === "void") return false;
-        return !this.#containsDisallowedDynamicTagSyntax(node);
-      }
-      /**
-       * Walks every property of the tag expression, so it receives whatever the
-       * AST holds — nodes, arrays of nodes, and the primitives in between.
-       * @param {unknown} node
-       * @param {Set<unknown>} [seen]
-       * @returns {boolean}
-       */
-      #containsDisallowedDynamicTagSyntax(node, seen = /* @__PURE__ */ new Set()) {
-        if (!node || typeof node !== "object" || seen.has(node)) return false;
-        seen.add(node);
-        if (Array.isArray(node)) {
-          return node.some((child) => this.#containsDisallowedDynamicTagSyntax(child, seen));
-        }
-        const ast_node = (
-          /** @type {AST.Node} */
-          node
-        );
-        if (DYNAMIC_TAG_DISALLOWED_TYPES.has(ast_node.type) || ast_node.type === "TemplateLiteral" && ast_node.expressions.length > 0 || ast_node.type === "BinaryExpression" && ast_node.operator === "+") {
-          return true;
-        }
-        for (const key2 of Object.keys(ast_node)) {
-          if (key2 === "loc" || key2 === "start" || key2 === "end" || key2 === "metadata") continue;
-          const value = (
-            /** @type {Record<string, unknown>} */
-            ast_node[key2]
-          );
-          if (this.#containsDisallowedDynamicTagSyntax(value, seen)) return true;
-        }
-        return false;
-      }
-      /**
        * Acorn allows an expression after a name only for `of` and `yield`.
        * Where `await` is a keyword (an async function, or the module top level),
        * it is a unary operator like `yield`, so the token after it starts an
        * expression: `await <div />` awaits an element instead of comparing.
+       *
+       * acorn-typescript takes a `/` right after a tag start for a closing tag's
+       * and drops the two contexts the tag start pushed. When an element attempt
+       * fails, `parseMaybeAssign` drops them itself and tries a generic arrow
+       * from the same `<`, which reads that `/` again: the second drop goes below
+       * the stack's start at the top of a statement (`x = </>;`), and the
+       * `RangeError` replaces the element attempt's syntax error. Without the
+       * tag start's `tc_oTag` on top, the `/` is no closing tag's and updates the
+       * context as acorn's does.
        * @type {Parse.Parser['updateContext']}
        */
       updateContext(prevType) {
+        if (this.type === tt.slash && prevType === tstt.jsxTagStart && this.curContext() !== tstc.tc_oTag) {
+          this.exprAllowed = true;
+          return;
+        }
         super.updateContext(prevType);
         if (this.type === tt.name && this.value === "await" && prevType !== tt.dot && prevType !== tt.questionDot && this.canAwait) {
           this.exprAllowed = true;
         }
+      }
+      /**
+       * Parse an import type, `import("./data.json", { with: { type: "json" } }).Data`.
+       * acorn-typescript expects the `)` right after the module specifier, so
+       * it rejects the import attributes TypeScript 5.3 allows as a second
+       * argument. They go on `options`, the name acorn's `ImportExpression` and
+       * typescript-estree use: the object expression, or `null` without one.
+       * TypeScript requires `{ with: … }` or `{ assert: … }` there (see
+       * `#parseImportTypeOptions`), and unlike `import()` it takes no trailing
+       * comma after either argument (microsoft/TypeScript#61489), so neither
+       * does this.
+       * @type {Parse.Parser['tsParseImportType']}
+       */
+      tsParseImportType() {
+        const node = (
+          /** @type {AST.TSImportType} */
+          this.startNode()
+        );
+        this.expect(tt._import);
+        this.expect(tt.parenL);
+        if (!this.match(tt.string)) {
+          this.raise(this.start, TS_ERRORS.TYPE_IMPORT_ARGUMENT);
+        }
+        node.argument = /** @type {AST.TSImportType['argument']} */
+        this.parseExprAtom();
+        node.options = null;
+        if (this.eat(tt.comma)) {
+          if (!this.match(tt.braceL)) this.raise(this.start, TS_ERRORS.TOKEN_EXPECTED("{"));
+          node.options = this.#parseImportTypeOptions();
+        }
+        this.expect(tt.parenR);
+        if (this.eat(tt.dot)) {
+          node.qualifier = this.tsParseEntityName();
+        }
+        if (this.tsMatchLeftRelational()) {
+          node.typeArguments = this.tsParseTypeArguments();
+        }
+        return this.finishNode(
+          node,
+          /** @type {AST.TSImportType['type']} */
+          "TSImportType"
+        );
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#153): remove once a release includes the fix
+      /**
+       * Read an import type's options, `{ with: { type: "json" } }`, as
+       * TypeScript's `parseImportType` does: `{`, then `with` or `assert`
+       * without an escape, `:`, the import attributes in braces (each a name or
+       * a string, `:`, and a value), an optional comma and `}`. Reports
+       * TypeScript's errors at its positions: TS1005 (`'with' expected.`,
+       * `':' expected.`, `'{' expected.`, `',' expected.`, `'}' expected.`),
+       * TS1478 `Identifier or string literal expected.` for another attribute
+       * name, and TS1260 for an escaped `with` or `assert`. They were read as
+       * any object literal, so `import("m", { foo: {} })`,
+       * `import("m", { with: {}, foo: 1 })` and `import("m", { ...o })`
+       * compiled to code TypeScript rejects. The tree is the object expression
+       * the object literal gave, as typescript-estree has it.
+       * @returns {AST.ObjectExpression}
+       */
+      #parseImportTypeOptions() {
+        const options = (
+          /** @type {AST.ObjectExpression} */
+          this.startNode()
+        );
+        options.properties = [];
+        this.next();
+        if (this.type !== tt._with && this.type !== tstt.assert) {
+          this.raise(this.start, TS_ERRORS.TOKEN_EXPECTED("with"));
+        }
+        if (this.containsEsc) this.raise(this.start, TS_ERRORS.KEYWORD_ESCAPE);
+        options.properties.push(
+          this.#parseImportTypeOption(() => {
+            const attributes = (
+              /** @type {AST.ObjectExpression} */
+              this.startNode()
+            );
+            attributes.properties = [];
+            this.#expectImportTypeToken(tt.braceL, TS_ERRORS.TOKEN_EXPECTED("{"));
+            const is_name = Parser4.acornTypeScript.tokenIsKeywordOrIdentifier;
+            while (this.type !== tt.braceR && this.type !== tt.eof) {
+              if (!is_name(this.type) && this.type !== tt.string) {
+                this.raise(this.start, TS_ERRORS.IDENTIFIER_OR_STRING_EXPECTED);
+              }
+              attributes.properties.push(
+                this.#parseImportTypeOption(() => this.parseMaybeAssign(false))
+              );
+              if (this.eat(tt.comma)) continue;
+              if (this.type !== tt.braceR && this.type !== tt.eof) {
+                this.raise(this.start, TS_ERRORS.TOKEN_EXPECTED(","));
+              }
+            }
+            this.#expectImportTypeToken(tt.braceR, TS_ERRORS.TOKEN_EXPECTED("}"));
+            return this.finishNode(attributes, "ObjectExpression");
+          })
+        );
+        this.eat(tt.comma);
+        this.#expectImportTypeToken(tt.braceR, TS_ERRORS.TOKEN_EXPECTED("}"));
+        return this.finishNode(options, "ObjectExpression");
+      }
+      /**
+       * Read a name or a string, `:` and what `parse_value` reads, as a
+       * property of an import type's options, as acorn reads a property of an
+       * object literal.
+       * @param {() => AST.Expression} parse_value
+       * @returns {AST.Property}
+       */
+      #parseImportTypeOption(parse_value) {
+        const property = (
+          /** @type {AST.Property} */
+          this.startNode()
+        );
+        property.method = false;
+        property.shorthand = false;
+        this.parsePropertyName(property);
+        this.#expectImportTypeToken(tt.colon, TS_ERRORS.TOKEN_EXPECTED(":"));
+        property.value = parse_value();
+        property.kind = "init";
+        return this.finishNode(property, "Property");
+      }
+      /**
+       * Read a token of an import type's options, or report TypeScript's
+       * error for it where it's missing.
+       * @param {acorn.TokenType} type
+       * @param {Diagnostic} error
+       */
+      #expectImportTypeToken(type, error2) {
+        if (this.type !== type) this.raise(this.start, error2);
+        this.next();
       }
       /**
        * The token after a type is read while still inside the type, where `<`
@@ -17801,16 +23155,17 @@ function TSRXPlugin(config) {
           this.pos++;
           return this.finishToken(tt.arrow);
         }
-        if (code === CharCode.slash && this.input.charCodeAt(this.pos + 1) === CharCode.greaterThan) {
+        if (code === CharCode.slash && this.input.charCodeAt(this.pos + 1) === CharCode.greaterThan && this.type !== tstt.jsxTagStart && (!this.exprAllowed || this.curContext() === tstc.tc_oTag)) {
           while (this.context.length > 0 && this.curContext() !== tstc.tc_oTag && this.curContext() !== tstc.tc_expr) {
-            this.context.pop();
+            this.#popContext();
           }
           if (this.curContext() !== tstc.tc_oTag) {
             this.context.push(tstc.tc_oTag);
           }
           this.exprAllowed = false;
         }
-        if ((code === CharCode.numberSign || code === CharCode.slash) && this.#functionBodyDepth === 0 && this.#jsxExpressionContainerDepth === 0 && !this.#readingJSXControlFlowHeader && this.#isNativeTemplateNode(this.#path.at(-1)) && !(code === CharCode.slash && (this.input.charCodeAt(this.pos - 1) === CharCode.lessThan || this.input.charCodeAt(this.pos + 1) === CharCode.greaterThan))) {
+        const template_parent = this.#path.at(-1);
+        if ((code === CharCode.numberSign || code === CharCode.slash) && this.#functionBodyDepth === 0 && this.#jsxExpressionContainerDepth === 0 && !this.#readingJSXControlFlowHeader && this.#isNativeTemplateNode(template_parent) && (!this.#openingNativeTemplateNode || this.#openingNativeTemplateNode === template_parent) && !(code === CharCode.slash && (this.input.charCodeAt(this.pos - 1) === CharCode.lessThan || this.input.charCodeAt(this.pos + 1) === CharCode.greaterThan))) {
           ++this.pos;
           return this.finishToken(tt.name, this.input.slice(this.start, this.pos));
         }
@@ -17819,6 +23174,13 @@ function TSRXPlugin(config) {
           const inNativeTemplate = this.#functionBodyDepth === 0 && this.#isNativeTemplateNode(parent);
           let prevNonWhitespaceChar = null;
           const nextChar = this.pos + 1 < this.input.length ? this.input.charCodeAt(this.pos + 1) : -1;
+          if (!this.exprAllowed && nextChar === CharCode.slash) {
+            const after_slash = this.input.charCodeAt(this.pos + 2);
+            if (after_slash !== CharCode.slash && after_slash !== CharCode.asterisk) {
+              ++this.pos;
+              return this.finishToken(tstt.jsxTagStart);
+            }
+          }
           const lookback = this.#previousNonSpaceTabIndex(this.pos);
           if (lookback >= 0) {
             const previous = this.#previousNonSpaceTabCommentIndex(this.pos);
@@ -17885,7 +23247,7 @@ function TSRXPlugin(config) {
               this.#report_recoverable_error_range(
                 first_position,
                 first_position + expr.name.length,
-                "Argument name clash"
+                TS_ERRORS.ARGUMENT_NAME_CLASH
               );
               reported_names.add(expr.name);
             }
@@ -17897,7 +23259,7 @@ function TSRXPlugin(config) {
               start,
               /** @type {number} */
               expr.end ?? start + expr.name.length,
-              "Argument name clash"
+              TS_ERRORS.ARGUMENT_NAME_CLASH
             );
             return;
           }
@@ -17914,11 +23276,34 @@ function TSRXPlugin(config) {
       /**
        * Override to track parenthesized expressions in metadata
        * This allows the prettier plugin to preserve parentheses where they existed
+       *
+       * The items can be an arrow function's parameters, and when they aren't,
+       * a `?` or a type annotation in them is an error (see
+       * `#checkParameterSyntax`).
        * @type {Parse.Parser['parseParenAndDistinguishExpression']}
        */
       parseParenAndDistinguishExpression(canBeArrow, forInit) {
         const startPos = this.start;
-        const expr = super.parseParenAndDistinguishExpression(canBeArrow, forInit);
+        const outer_list = this.#expressionList;
+        const list2 = canBeArrow ? { parameters: true, position: -1, error: null } : NON_PARAMETER_LIST;
+        this.#expressionList = list2;
+        let expr;
+        try {
+          expr = canBeArrow && this.#collect ? this.#parseArrowParameterList(
+            // `<T,>(`: type parameters make it an arrow function.
+            this.#typeParametersEnd === this.lastTokEnd,
+            () => super.parseParenAndDistinguishExpression(canBeArrow, forInit)
+          ) : super.parseParenAndDistinguishExpression(canBeArrow, forInit);
+        } finally {
+          this.#expressionList = outer_list;
+        }
+        if (list2.position !== -1 && expr.type !== "ArrowFunctionExpression") {
+          this.raise(
+            list2.position,
+            /** @type {Diagnostic} */
+            list2.error
+          );
+        }
         if (expr && /** @type {AST.NodeWithLocation} */
         expr.start > startPos) {
           expr.metadata ??= { path: [] };
@@ -17926,6 +23311,727 @@ function TSRXPlugin(config) {
           expr.metadata.paren_start = startPos;
         }
         return expr;
+      }
+      /**
+       * A subscript, which can start an async arrow function after `async`:
+       * the arguments of `async (…)` can be its parameters (see
+       * `#parseAsyncArguments`), and acorn-typescript reads `async <T,>(…) =>`
+       * as a generic one (see `#parseGenericArrowFunction`).
+       *
+       * acorn's `parseSubscripts` works out once, for the `async` identifier,
+       * whether a call can be an async arrow function's head, and passes that
+       * to every subscript in its loop. So an `=>` after a later call made the
+       * whole chain an async arrow function with that call's arguments for
+       * parameters, and `async(a)(b) => 1` compiled to `async (b) => 1`. Only
+       * the first subscript, while the base is still `async`, can be one, as in
+       * TypeScript, which fails at the `=>`.
+       * @type {Parse.Parser['parseSubscript']}
+       */
+      parseSubscript(base, startPos, startLoc, noCalls, maybeAsyncArrow, optionalChained, forInit) {
+        if (base.type !== "Identifier") maybeAsyncArrow = false;
+        if (maybeAsyncArrow && !noCalls) {
+          const parse5 = () => super.parseSubscript(
+            base,
+            startPos,
+            startLoc,
+            noCalls,
+            maybeAsyncArrow,
+            optionalChained,
+            forInit
+          );
+          if (this.type === tt.parenL) return this.#parseAsyncArguments(parse5);
+          if (this.tsMatchLeftRelational()) {
+            return this.#parseGenericArrowFunction(startPos, parse5);
+          }
+        }
+        return super.parseSubscript(
+          base,
+          startPos,
+          startLoc,
+          noCalls,
+          maybeAsyncArrow,
+          optionalChained,
+          forInit
+        );
+      }
+      /**
+       * Reads, with `parse`, `async (…)`, whose arguments can be an async arrow
+       * function's parameters (see `#parseArrowParameterProperty` and
+       * `parseSpread`). When no `=>` follows them, it fails at the first `?` or
+       * type annotation in them, which only a parameter can have (see
+       * `#checkParameterSyntax`).
+       * @param {() => AST.Expression} parse
+       * @returns {AST.Expression}
+       */
+      #parseAsyncArguments(parse5) {
+        const outer = this.#asyncArguments;
+        const async_arguments = { start: this.start, parameters: true, position: -1, error: null };
+        this.#asyncArguments = async_arguments;
+        try {
+          const node = this.#collect ? this.#parseArrowParameterList(false, parse5) : parse5();
+          if (async_arguments.position !== -1 && node.type !== "ArrowFunctionExpression") {
+            this.raise(
+              async_arguments.position,
+              /** @type {Diagnostic} */
+              async_arguments.error
+            );
+          }
+          return node;
+        } finally {
+          this.#asyncArguments = outer;
+        }
+      }
+      /**
+       * The list of expressions being read, for `#checkParameterSyntax`: the
+       * arguments of `async (…)` can be an async arrow function's parameters
+       * (see `#parseAsyncArguments`), and no other list that this reads can be.
+       * @type {Parse.Parser['parseExprList']}
+       */
+      parseExprList(close, allowTrailingComma, allowEmpty, refDestructuringErrors) {
+        const outer = this.#expressionList;
+        const async_arguments = this.#asyncArguments;
+        this.#expressionList = close === tt.parenR && async_arguments?.start === this.lastTokStart ? async_arguments : NON_PARAMETER_LIST;
+        try {
+          return super.parseExprList(close, allowTrailingComma, allowEmpty, refDestructuringErrors);
+        } finally {
+          this.#expressionList = outer;
+        }
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#109): remove once a release includes the fix
+      /**
+       * A decorator's arguments, read as acorn-typescript reads them, but with a
+       * trailing comma, as in any call (`@dec(a,)`): acorn-typescript passes
+       * `allowTrailingComma: false`. TypeScript and Babel accept it, and Prettier
+       * prints one when the arguments break.
+       * @param {AST.Expression} expr
+       * @returns {AST.Expression}
+       */
+      parseMaybeDecoratorArguments(expr) {
+        const typeArguments = this.tsMatchLeftRelational() || this.match(tt.bitShift) ? this.tsParseTypeArgumentsInExpression() : void 0;
+        if (this.eat(tt.parenL)) {
+          const node = (
+            /** @type {AST.CallExpression & { typeArguments?: unknown }} */
+            this.startNodeAtNode(expr)
+          );
+          node.callee = expr;
+          node.arguments = /** @type {AST.CallExpression['arguments']} */
+          this.parseExprList(tt.parenR, this.options.ecmaVersion >= 8);
+          if (typeArguments) node.typeArguments = typeArguments;
+          return this.finishNode(node, "CallExpression");
+        }
+        if (typeArguments) {
+          const node = (
+            /** @type {AST.TSInstantiationExpression} */
+            /** @type {unknown} */
+            this.startNodeAtNode(expr)
+          );
+          node.expression = expr;
+          node.typeArguments = typeArguments;
+          return (
+            /** @type {AST.Expression} */
+            /** @type {unknown} */
+            this.finishNode(
+              node,
+              /** @type {AST.TSInstantiationExpression['type']} */
+              "TSInstantiationExpression"
+            )
+          );
+        }
+        return expr;
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#140): remove once a release includes the fix
+      // UPSTREAM(sveltejs/acorn-typescript#149): remove once a release includes the fix
+      // UPSTREAM(sveltejs/acorn-typescript#150): remove once a release includes the fix
+      /**
+       * A spread among the arguments of `async (…)` can be an async arrow
+       * function's rest parameter. TypeScript's parser reads a `?` after it, as
+       * after any rest parameter, and its checker reports TS1047.
+       * acorn-typescript's `parseExprList` reads a type annotation after the
+       * spread there, but not the `?`, which failed as unexpected. Take it, as
+       * `parseParenItem` does for the items of a parenthesized list, so that
+       * the rest parameter is `optional` and `parseFunctionBody` reports TS1047
+       * (sveltejs/acorn-typescript#140).
+       *
+       * Read the type annotation here too, before `parseExprList` does, and move
+       * the spread's end past the `?` and the annotation, as a rest parameter's
+       * is elsewhere. acorn-typescript set the annotation without moving the
+       * end, so the rest parameter ended before it
+       * (sveltejs/acorn-typescript#150). A default can follow them
+       * (`#readRestParameterDefault`, #726).
+       *
+       * When no `=>` follows the arguments, `#parseAsyncArguments` fails at the
+       * `?` or the annotation. acorn-typescript read the annotation after a
+       * spread in any other list too, where it now fails
+       * (sveltejs/acorn-typescript#149, see `#checkParameterSyntax`).
+       * @type {Parse.Parser['parseSpread']}
+       */
+      parseSpread(refDestructuringErrors) {
+        const node = super.parseSpread(refDestructuringErrors);
+        const list2 = this.#expressionList;
+        const rest_parameter = list2 !== null && list2 === this.#asyncArguments;
+        if (rest_parameter && this.type === tt.question) {
+          this.#checkParameterSyntax(this.start, TS_ERRORS.UNEXPECTED_TOKEN);
+          this.next();
+          node.optional = true;
+          this.resetEndLocation(node);
+        }
+        if (this.maybeInArrowParameters && this.type === tt.colon) {
+          this.#checkParameterSyntax(this.start, TS_ERRORS.UNEXPECTED_TYPE_ANNOTATION);
+          node.typeAnnotation = this.tsParseTypeAnnotation();
+          this.resetEndLocation(node);
+        }
+        if (rest_parameter && this.type === tt.eq) this.#readRestParameterDefault(node);
+        return node;
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#149): remove once a release includes the fix
+      /**
+       * acorn-typescript reads a `?` and a type annotation after each item of a
+       * parenthesized expression, and of each list that `parseExprList` reads,
+       * for an arrow function's parameters, whose `optional` and
+       * `typeAnnotation` they become. When the list wasn't an arrow function's
+       * parameters, the item kept them: `(x: number)` crashed the compile, and
+       * `f(x?)` was printed back. TypeScript's parser rejects them there. See
+       * `#checkParameterSyntax`.
+       *
+       * TypeScript's parser reads a default after an arrow function's rest
+       * parameter too, `(...a = []) => a`, and its checker reports TS1048. acorn
+       * expects a parenthesized list to close after its rest element, and
+       * failed at the `=`. Where the list can be an arrow function's parameters,
+       * read it (`#readRestParameterDefault`), for `parseFunctionBody` to report
+       * TS1048 once the arrow function is read (#726). When no `=>` follows,
+       * the rest element still fails.
+       * @type {Parse.Parser['parseParenItem']}
+       */
+      parseParenItem(node) {
+        const question = this.type === tt.question ? this.start : -1;
+        let item = super.parseParenItem(node);
+        const type_cast = (
+          /** @type {string} */
+          item.type === "TSTypeCastExpression"
+        );
+        if (question !== -1) {
+          this.#checkParameterSyntax(question, TS_ERRORS.UNEXPECTED_TOKEN);
+        } else if (type_cast) {
+          const annotation = (
+            /** @type {{ typeAnnotation: AST.NodeWithLocation }} */
+            /** @type {unknown} */
+            item.typeAnnotation
+          );
+          this.#checkParameterSyntax(annotation.start, TS_ERRORS.UNEXPECTED_TYPE_ANNOTATION);
+        }
+        if (node.type === "RestElement" && this.type === tt.eq && this.#expressionList?.parameters) {
+          if (type_cast) item = this.typeCastToParameter(item);
+          this.#readRestParameterDefault(item);
+        }
+        return item;
+      }
+      /**
+       * A `?` or a type annotation after an item of the list being read, or a
+       * type annotation after a spread, at `position`. Only an arrow function's
+       * parameters can have them: TypeScript's parser rejects them anywhere
+       * else, and @babel/parser reports `error`. Raise it now when the list
+       * can't be an arrow function's parameters, and otherwise note the first
+       * one, for the list to raise when it isn't one (see
+       * `parseParenAndDistinguishExpression` and `#parseAsyncArguments`).
+       * @param {number} position
+       * @param {Diagnostic} error
+       */
+      #checkParameterSyntax(position, error2) {
+        const list2 = this.#expressionList;
+        if (list2 === null || !list2.parameters) {
+          this.raise(position, error2);
+        } else if (list2.position === -1) {
+          this.parseEffects?.willSet(list2, "position");
+          this.parseEffects?.willSet(list2, "error");
+          list2.position = position;
+          list2.error = error2;
+        }
+      }
+      /**
+       * `async (...a = []) => a`: acorn read the rest parameter's default as
+       * part of the spread's argument among the arguments of `async (…)`, and
+       * failed as it made them the parameters (`Rest elements cannot have a
+       * default value`). TypeScript's parser reads the default, and its checker
+       * reports TS1048. Make the assignment an `AssignmentPattern`, as
+       * `#readRestParameterDefault` does, for `parseFunctionBody` to report
+       * TS1048 (#726). A parenthesized assignment, `...(a = [])`, isn't a
+       * parameter.
+       * @type {Parse.Parser['parseSubscriptAsyncArrow']}
+       */
+      parseSubscriptAsyncArrow(startPos, startLoc, exprList, forInit) {
+        for (const item of exprList) {
+          if (item?.type !== "SpreadElement") continue;
+          const spread2 = (
+            /** @type {AST.SpreadElement} */
+            item
+          );
+          const argument = spread2.argument;
+          if (argument.type === "AssignmentExpression" && argument.operator === "=" && !argument.metadata?.parenthesized) {
+            spread2.argument = /** @type {AST.Expression} */
+            /** @type {unknown} */
+            this.toAssignable(argument, true);
+          }
+        }
+        return super.parseSubscriptAsyncArrow(startPos, startLoc, exprList, forInit);
+      }
+      /**
+       * Records where type parameters end: after them, a parenthesized list is
+       * an arrow function's parameters (`<T,>(public x: T) => x`), and the
+       * parameters of the generic arrow function that
+       * `#parseGenericArrowFunction` reads start there.
+       * @type {Parse.Parser['tsParseTypeParameters']}
+       */
+      tsParseTypeParameters(parseModifiers) {
+        const start = this.start;
+        const node = super.tsParseTypeParameters(parseModifiers);
+        this.#typeParametersEnd = this.lastTokEnd;
+        const arrow2 = this.#genericArrowFunction;
+        if (arrow2?.typeParametersStart === start) {
+          arrow2.parametersStart = this.start;
+          if (arrow2.arrowStart === -1) arrow2.arrowStart = this.start;
+        }
+        return node;
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#141): remove once a release includes the fix
+      /**
+       * Reads, with `parse`, an expression that can be a generic arrow
+       * function, and throws the arrow function's own error once it was read
+       * past its `=>`, where TypeScript reads an arrow function.
+       *
+       * acorn-typescript reads an expression that starts with `<` as an element
+       * first, then as a generic arrow function, and when both fail it throws
+       * the element's error (see `#parseMaybeAssign`). It reads
+       * `async <T,>(…) => …` in a `tsTryParseAndCatch` that takes any error to
+       * mean "not an arrow function", and reads `async < T` as a comparison
+       * instead (see `parseSubscript`). Either way, an error in the arrow
+       * function's parameters or body was reported as `Unexpected token` at its
+       * type parameters, or after them. `parseArrowExpression` records the error
+       * here, and it's thrown instead. An error before the `=>` is still
+       * acorn-typescript's.
+       * @param {number} arrowStart Where the arrow function starts: `async`, or
+       * -1 for its `(`, which comes after the type parameters at the current
+       * token
+       * @param {() => AST.Expression} parse
+       * @returns {AST.Expression}
+       */
+      #parseGenericArrowFunction(arrowStart, parse5) {
+        const outer = this.#genericArrowFunction;
+        const arrow2 = {
+          typeParametersStart: this.start,
+          parametersStart: -1,
+          arrowStart,
+          error: null
+        };
+        this.#genericArrowFunction = arrow2;
+        try {
+          const node = parse5();
+          if (arrow2.error) throw arrow2.error;
+          return node;
+        } catch (error2) {
+          throw arrow2.error && error2 instanceof SyntaxError ? arrow2.error : error2;
+        } finally {
+          this.#genericArrowFunction = outer;
+        }
+      }
+      /**
+       * Records the error that the generic arrow function
+       * `#parseGenericArrowFunction` reads throws after its `=>`.
+       * @type {Parse.Parser['parseArrowExpression']}
+       */
+      parseArrowExpression(node, params, isAsync, forInit) {
+        const arrow2 = this.#genericArrowFunction;
+        if (arrow2 === null || arrow2.arrowStart !== node.start) {
+          return super.parseArrowExpression(node, params, isAsync, forInit);
+        }
+        try {
+          return super.parseArrowExpression(node, params, isAsync, forInit);
+        } catch (error2) {
+          if (error2 instanceof SyntaxError) arrow2.error = error2;
+          throw error2;
+        }
+      }
+      /**
+       * Reads, with `parse`, a list that can be an arrow function's parameters,
+       * for `#parseArrowParameterProperty` and
+       * `#readArrowParametersPastRestElement`.
+       * @template T
+       * @param {boolean} generic Whether type parameters come before its `(`
+       * @param {() => T} parse
+       * @returns {T}
+       */
+      #parseArrowParameterList(generic, parse5) {
+        const outer = this.#arrowParameterList;
+        this.#arrowParameterList = { parenStart: this.start, generic, depth: 0, pastRest: null };
+        try {
+          return parse5();
+        } finally {
+          this.#arrowParameterList = outer;
+        }
+      }
+      /**
+       * Adds the parameters that `#readArrowParametersPastRestElement` read
+       * after a rest parameter to the arrow function's.
+       * @type {Parse.Parser['parseParenArrowList']}
+       */
+      parseParenArrowList(startPos, startLoc, exprList, forInit) {
+        const list2 = this.#arrowParameterList;
+        const past_rest = list2?.pastRest;
+        if (list2 && past_rest) {
+          list2.pastRest = null;
+          exprList.push(...past_rest.items);
+          this.checkPatternErrors(past_rest.refDestructuringErrors, false);
+        }
+        return super.parseParenArrowList(startPos, startLoc, exprList, forInit);
+      }
+      /**
+       * Tracks how deep the parser is in an item of the list that
+       * `#parseArrowParameterList` reads. acorn reads each item with
+       * `parseParenItem` after it; before one, read parameter property
+       * modifiers (`#parseArrowParameterProperty`).
+       * @type {Parse.Parser['parseMaybeAssign']}
+       */
+      parseMaybeAssign(forInit, refDestructuringErrors, afterLeftParse) {
+        const list2 = this.#arrowParameterList;
+        if (list2 === null) {
+          return this.#parseMaybeAssign(forInit, refDestructuringErrors, afterLeftParse);
+        }
+        if (list2.depth === 0 && afterLeftParse === this.parseParenItem) {
+          const item = this.#parseArrowParameterProperty(list2, refDestructuringErrors);
+          if (item) return item;
+        }
+        list2.depth++;
+        try {
+          return this.#parseMaybeAssign(forInit, refDestructuringErrors, afterLeftParse);
+        } finally {
+          list2.depth--;
+        }
+      }
+      /**
+       * acorn-typescript reads an expression that starts with `<` as an element
+       * first, then as a generic arrow function (see
+       * `#parseGenericArrowFunction`).
+       * @type {Parse.Parser['parseMaybeAssign']}
+       */
+      #parseMaybeAssign(forInit, refDestructuringErrors, afterLeftParse) {
+        if (this.type !== tstt.jsxTagStart && !this.tsMatchLeftRelational()) {
+          return super.parseMaybeAssign(forInit, refDestructuringErrors, afterLeftParse);
+        }
+        return this.#parseGenericArrowFunction(
+          -1,
+          () => super.parseMaybeAssign(forInit, refDestructuringErrors, afterLeftParse)
+        );
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#136): remove once a release includes the fix
+      /**
+       * TypeScript's parser reads parameter property modifiers before an arrow
+       * function's parameters too, and its checker reports them: TS2369, and
+       * TS1187 or TS1317 as for other parameters. acorn reads an arrow
+       * function's parameters as the items of a parenthesized expression, or as
+       * the arguments of `async (…)`, and makes them patterns once `=>` follows,
+       * so `public` failed as a reserved word and the name after `readonly` as
+       * unexpected.
+       *
+       * When collecting, where TypeScript reads the list as an arrow function's
+       * parameters with modifiers here (`#startsArrowParameterProperty`), read
+       * them before the item, record the errors, and build the
+       * `TSParameterProperty` that a function's parameter gets (see
+       * `parseBindingList`). Its parameter is an expression until `toAssignable`
+       * makes it a pattern. Before a rest element, keep the rest element without
+       * them, as `#parseRestParameterProperty` does, and record a comma after it
+       * as that does, for the list to go on. Anywhere else, return `null`,
+       * having read nothing, so that the item reads as before, and a strict
+       * parse fails as before.
+       * @param {ArrowParameterList} list
+       * @param {Parse.DestructuringErrors | undefined} refDestructuringErrors
+       * @returns {AST.Expression | null}
+       */
+      #parseArrowParameterProperty(list2, refDestructuringErrors) {
+        if (this.containsEsc || !PARAMETER_MODIFIERS.includes(
+          /** @type {string} */
+          this.value
+        ) || !Parser4.acornTypeScript.tokenIsIdentifier(this.type) || !this.#startsArrowParameterProperty(
+          !list2.generic && this.lastTokStart === list2.parenStart
+        )) {
+          return null;
+        }
+        const start = this.start;
+        const startLoc = this.startLoc;
+        const modified = {};
+        this.tsParseModifiers({ modified, allowedModifiers: PARAMETER_MODIFIERS });
+        if (this.type === tt.ellipsis) {
+          this.#recordCheckerLevelError(start, this.lastTokEnd, TS_ERRORS.REST_PARAMETER_PROPERTY);
+          this.#recordCheckerLevelError(
+            start,
+            start + 1,
+            TS_ERRORS.PARAMETER_PROPERTY_OUTSIDE_CONSTRUCTOR
+          );
+          const rest2 = this.parseParenItem(this.parseRestBinding());
+          this.#reportCommaAfterRestParameter();
+          return (
+            /** @type {AST.Expression} */
+            /** @type {unknown} */
+            rest2
+          );
+        }
+        this.#recordCheckerLevelError(
+          start,
+          start + 1,
+          TS_ERRORS.PARAMETER_PROPERTY_OUTSIDE_CONSTRUCTOR
+        );
+        let parameter;
+        list2.depth++;
+        try {
+          parameter = super.parseMaybeAssign(false, refDestructuringErrors, this.parseParenItem);
+        } finally {
+          list2.depth--;
+        }
+        if (is_pattern_parameter_expression(parameter)) {
+          this.#recordCheckerLevelError(start, start + 1, TS_ERRORS.PATTERN_PARAMETER_PROPERTY);
+        }
+        const node = (
+          /** @type {AST.TSParameterProperty} */
+          this.startNodeAt(start, startLoc)
+        );
+        if (modified.accessibility) node.accessibility = modified.accessibility;
+        if (modified.readonly) node.readonly = true;
+        if (modified.override) node.override = true;
+        node.parameter = /** @type {AST.TSParameterProperty['parameter']} */
+        /** @type {unknown} */
+        parameter;
+        return (
+          /** @type {AST.Expression} */
+          /** @type {unknown} */
+          this.finishNode(
+            node,
+            /** @type {AST.TSParameterProperty['type']} */
+            "TSParameterProperty"
+          )
+        );
+      }
+      /**
+       * Whether TypeScript reads the list as an arrow function's parameters, with
+       * parameter property modifiers from the current token: the rest of the
+       * list reads as parameters, the first of them with modifiers, and `=>`
+       * follows it (after a return type). At the list's first item, TypeScript
+       * reads `(` and a modifier as an arrow function's parameters only when a
+       * name other than `as` follows the modifier
+       * (`isParenthesizedArrowFunctionExpressionWorker`), and as a
+       * parenthesized expression otherwise, as in `(public [a]) => a`. After
+       * another item, or after type parameters, it reads parameters.
+       * @param {boolean} first Whether the item is the list's first, with no
+       * type parameters before the list
+       * @returns {boolean}
+       */
+      #startsArrowParameterProperty(first) {
+        if (first) {
+          const next = this.lookahead();
+          if (!Parser4.acornTypeScript.tokenIsIdentifier(next.type) || this.isContextualWithState("as", next)) {
+            return false;
+          }
+        }
+        const start = this.start;
+        return this.#readsAsArrowParameters(() => {
+          const [item] = (
+            /** @type {AST.Node[]} */
+            this.parseBindingList(tt.parenR, false, true, false)
+          );
+          return !!item && (item.type === "TSParameterProperty" || item.start !== start);
+        });
+      }
+      /**
+       * Whether the rest of the list reads as an arrow function's parameters:
+       * `read` reads them, up to the list's `)`, and returns whether they can
+       * be, and `=>` follows (after a return type). Reads nothing.
+       * @param {() => boolean} read
+       * @returns {boolean}
+       */
+      #readsAsArrowParameters(read) {
+        const errors = this.#errors;
+        const errors_length = errors?.length ?? 0;
+        try {
+          return this.tsLookAhead(() => {
+            try {
+              if (!read()) return false;
+              if (this.type === tt.colon) this.tsParseTypeOrTypePredicateAnnotation(tt.colon);
+              return this.type === tt.arrow && !this.canInsertSemicolon();
+            } catch {
+              return false;
+            }
+          });
+        } finally {
+          if (errors) errors.length = errors_length;
+        }
+      }
+      /**
+       * TypeScript's parser reads the parameters after an arrow function's rest
+       * parameter, `(...a, b) => 1`, and its checker reports TS1014. acorn's
+       * `parseParenAndDistinguishExpression` ends a parenthesized list at its
+       * rest element: it raises `Comma is not permitted after the rest element`
+       * at a comma after it and expects the `)`. A function's parameters, and
+       * an async arrow function's, which are a call's arguments, go on (see
+       * `#parseBindingListPastRestElement`).
+       *
+       * When collecting, at that comma in a list that can be an arrow function's
+       * parameters, where the rest of the list reads as parameters and `=>`
+       * follows it, record the error at the comma and read the items after it,
+       * as `#parseBindingListPastRestElement` does, for `parseParenArrowList` to
+       * add them to the parameters (#727). Otherwise the error is thrown, as
+       * before. It's raised in a strict parse.
+       * @param {number} position The comma
+       * @returns {boolean} Whether the items were read, and parsing goes on
+       */
+      #readArrowParametersPastRestElement(position) {
+        const list2 = this.#arrowParameterList;
+        if (list2 === null || list2.depth !== 0 || !this.#readsAsArrowParameters(() => {
+          this.next();
+          this.parseBindingList(tt.parenR, false, true, false);
+          return true;
+        })) {
+          return false;
+        }
+        this.#recordCheckerLevelError(
+          position,
+          position + 1,
+          TS_ERRORS.REST_ELEMENT_TRAILING_COMMA
+        );
+        const refDestructuringErrors = new /** @type {new () => Parse.DestructuringErrors} */
+        /** @type {unknown} */
+        DestructuringErrors4();
+        const items = [];
+        while (this.eat(tt.comma) && this.type !== tt.parenR) {
+          if (this.type === tt.ellipsis) {
+            items.push(
+              /** @type {AST.Expression} */
+              this.parseParenItem(this.parseRestBinding())
+            );
+            this.#reportCommaAfterRestParameter();
+          } else {
+            items.push(this.parseMaybeAssign(false, refDestructuringErrors, this.parseParenItem));
+          }
+        }
+        list2.pastRest = { items, refDestructuringErrors };
+        return true;
+      }
+      /**
+       * A parameter property that `#parseArrowParameterProperty` reads holds
+       * its parameter as an expression: make that a pattern, as for any other
+       * parameter of the arrow function. One that `parseBindingList` reads for
+       * a generic async arrow function holds a pattern already.
+       * UPSTREAM(sveltejs/acorn-typescript#136)
+       *
+       * A type assertion in the head of a `for…in` or `for…of` loop,
+       * `for ((a as T) of x)` or `for ([a!] of x)`, is an assignment target,
+       * which TypeScript accepts. acorn converts the head with `isBinding:
+       * false`, and acorn-typescript raised `Unexpected type cast in parameter
+       * position.` for an assertion then. The code comes from @babel/parser,
+       * whose flag means the opposite: it raises for an arrow function's
+       * parameters, which acorn converts with `isBinding: true`, as
+       * acorn-typescript does an assignment target. Convert the assertion's
+       * expression as acorn-typescript does for an assignment target, without
+       * the error, and keep the assertion where it keeps it. `checkLValPattern`
+       * rejects an assertion in an arrow function's parameters (#706).
+       * UPSTREAM(sveltejs/acorn-typescript#148): remove once a release includes the fix
+       * @type {Parse.Parser['toAssignable']}
+       */
+      toAssignable(node, isBinding, refDestructuringErrors, preserveTypeScriptWrapper) {
+        if (node?.type === "SpreadElement" && this.#toRestElementWithDefault(node, isBinding)) {
+          return (
+            /** @type {AST.Pattern} */
+            /** @type {unknown} */
+            node
+          );
+        }
+        if (!isBinding && node && TYPE_ASSERTIONS.has(node.type)) {
+          const assertion = (
+            /** @type {AST.Node & { expression: AST.Node }} */
+            /** @type {unknown} */
+            node
+          );
+          const expression = this.toAssignable(
+            assertion.expression,
+            isBinding,
+            refDestructuringErrors,
+            preserveTypeScriptWrapper
+          );
+          if (!preserveTypeScriptWrapper) return expression;
+          assertion.expression = /** @type {AST.Node} */
+          expression;
+          return (
+            /** @type {AST.Pattern} */
+            /** @type {unknown} */
+            node
+          );
+        }
+        if (node?.type !== "TSParameterProperty") {
+          return super.toAssignable(
+            node,
+            isBinding,
+            refDestructuringErrors,
+            preserveTypeScriptWrapper
+          );
+        }
+        let parameter = (
+          /** @type {AST.Node} */
+          /** @type {unknown} */
+          node.parameter
+        );
+        if (
+          /** @type {string} */
+          parameter.type === "TSTypeCastExpression"
+        ) {
+          parameter = this.typeCastToParameter(parameter);
+        }
+        node.parameter = /** @type {AST.TSParameterProperty['parameter']} */
+        /** @type {unknown} */
+        this.toAssignable(parameter, isBinding, refDestructuringErrors);
+        return (
+          /** @type {AST.Pattern} */
+          /** @type {unknown} */
+          node
+        );
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#159): remove once a release includes the fix
+      /**
+       * An array or object literal that becomes a destructuring pattern
+       * (`[...a = 1] = b`, `({ ...a = 1 } = b)`) holds a rest element's
+       * default as the spread's argument, an assignment. acorn raised `Rest
+       * elements cannot have a default value` at the assignment when making it
+       * the rest element. TypeScript's parser reads it, and its checker reports
+       * TS1186 at the `=`: record that there when collecting, while a strict
+       * parse throws it. Make the spread the rest element, with the assignment
+       * as an `AssignmentPattern`, as acorn does without the error. A
+       * parenthesized assignment, `...(a = 1)`, isn't a default.
+       * @param {AST.SpreadElement} spread
+       * @param {boolean | undefined} isBinding
+       * @returns {boolean} Whether the spread had a default and is converted
+       */
+      #toRestElementWithDefault(spread2, isBinding) {
+        const argument = spread2.argument;
+        if (
+          /** @type {string} */
+          argument.type === "AssignmentPattern"
+        ) {
+          spread2.type = "RestElement";
+          return true;
+        }
+        if (argument.type !== "AssignmentExpression" || argument.operator !== "=" || argument.metadata?.parenthesized) {
+          return false;
+        }
+        let position = (
+          /** @type {number} */
+          argument.left.end
+        );
+        for (; ; ) {
+          position = skip_space_and_comments_from(this.input, position);
+          if (this.input.charCodeAt(position) !== CharCode.closeParen) break;
+          position++;
+        }
+        this.#raiseCheckerError(position, TS_ERRORS.REST_ELEMENT_INITIALIZER);
+        spread2.type = "RestElement";
+        spread2.argument = /** @type {AST.Expression} */
+        /** @type {unknown} */
+        this.toAssignable(argument, isBinding);
+        return true;
       }
       /**
        * acorn-typescript unwraps TS expression wrappers in checkLValSimple,
@@ -17936,11 +24042,28 @@ function TSRXPlugin(config) {
        * "Assigning to rvalue". Unwrap here so wrapped patterns take the
        * pattern lane.
        *
+       * A binding is different: TypeScript's parser doesn't read a type
+       * assertion as an arrow function's parameter (`(x as number) => x`,
+       * `(x!) => x`, `async ([a satisfies number]) => a`), so it's a syntax
+       * error there (TS1005). acorn reads the parameters as expressions, and
+       * acorn-typescript's `toAssignable` accepted a type assertion in them where
+       * @babel/parser reports it, so the parameter kept the assertion. Raise
+       * @babel/parser's error at the assertion, in every mode. A binding type
+       * tells a parameter from an assignment target: acorn-typescript's
+       * `toAssignable` gets `isBinding` for an assignment target too.
+       *
        * @type {Parse.Parser['checkLValPattern']}
        */
       checkLValPattern(expr, bindingType, checkClashes) {
         let node = expr;
         while (node.type === "TSNonNullExpression" || node.type === "TSAsExpression" || node.type === "TSSatisfiesExpression" || node.type === "TSTypeAssertion") {
+          if (bindingType !== void 0 && bindingType !== BINDING_TYPES.BIND_NONE) {
+            this.raise(
+              /** @type {number} */
+              node.start,
+              TS_ERRORS.TYPE_CAST_IN_PARAMETER
+            );
+          }
           node = /** @type {AST.Node} */
           /** @type {{ expression: AST.Node }} */
           /** @type {unknown} */
@@ -17967,32 +24090,39 @@ function TSRXPlugin(config) {
         this.undefinedExports[name] = id2;
       }
       /**
-       * The names declared in `scope`, as a cached Set. Acorn only ever
-       * appends to a scope's `lexical` and `var` arrays during the scope's
-       * lifetime, so syncing from the last-seen lengths is enough to keep the
-       * Set current.
+       * The names declared in `scope`, as a cached Set: acorn's `lexical` and
+       * `var` names, and the ones acorn-typescript keeps apart, in `types`
+       * (type aliases and interfaces) and `exportOnlyBindings` (namespaces and
+       * top-level ambient functions). An export specifier can name any of them,
+       * as acorn-typescript's own `checkLocalExport` allows. Names are appended
+       * to these arrays as they are declared, so syncing from the last-seen
+       * lengths keeps the Set current.
        *
-       * @param {{ lexical: string[], var: string[] }} scope
+       * @param {Parse.Scope} scope
        * @returns {Set<string>}
        */
       #scopeDeclaredNames(scope) {
         let cached = this.#localExportNamesByScope.get(scope);
         if (!cached) {
-          cached = { names: /* @__PURE__ */ new Set(), lexicalLength: 0, varLength: 0 };
+          cached = { names: /* @__PURE__ */ new Set(), lengths: [0, 0, 0, 0] };
           this.#localExportNamesByScope.set(scope, cached);
         }
-        for (let i2 = cached.lexicalLength; i2 < scope.lexical.length; i2++) {
-          cached.names.add(scope.lexical[i2]);
+        const lists = [scope.lexical, scope.var, scope.types, scope.exportOnlyBindings];
+        for (let list2 = 0; list2 < lists.length; list2++) {
+          const declared = lists[list2];
+          for (let i2 = cached.lengths[list2]; i2 < declared.length; i2++) {
+            cached.names.add(declared[i2]);
+          }
+          cached.lengths[list2] = declared.length;
         }
-        for (let i2 = cached.varLength; i2 < scope.var.length; i2++) {
-          cached.names.add(scope.var[i2]);
-        }
-        cached.lexicalLength = scope.lexical.length;
-        cached.varLength = scope.var.length;
         return cached.names;
       }
       /** @type {Parse.Parser['parseForStatement']} */
       parseForStatement(node) {
+        if (this.#readingForDirective) {
+          this.#readingForDirective = false;
+          this.#forDirectiveLoops.add(node);
+        }
         this.next();
         let awaitAt = this.options.ecmaVersion >= 9 && this.canAwait && this.eatContextual("await") ? this.lastTokStart : -1;
         this.labels.push({ kind: "loop" });
@@ -18011,8 +24141,12 @@ function TSRXPlugin(config) {
             /** @type {AST.VariableDeclaration['kind']} */
             this.value
           );
-          this.next();
-          this.parseVar(init2, true, kind);
+          if (this.#collect && this.#isEmptyForDeclarationList()) {
+            this.#parseEmptyDeclarationList(init2, kind);
+          } else {
+            this.next();
+            this.parseVar(init2, true, kind);
+          }
           this.finishNode(init2, "VariableDeclaration");
           return this.parseForAfterInitWithIndex(
             /** @type {AST.ForInStatement | AST.ForOfStatement} */
@@ -18031,7 +24165,7 @@ function TSRXPlugin(config) {
           this.next();
           if (usingKind === "await using") {
             if (!this.canAwait) {
-              this.raise(this.start, "Await using cannot appear outside of async function");
+              this.raise(this.start, TS_ERRORS.AWAIT_USING_OUTSIDE_ASYNC);
             }
             this.next();
           }
@@ -18050,6 +24184,17 @@ function TSRXPlugin(config) {
         DestructuringErrors4();
         let initPos = this.start;
         let init_expr = awaitAt > -1 ? this.parseExprSubscripts(refDestructuringErrors, "await") : this.parseExpression(true, refDestructuringErrors);
+        if (awaitAt > -1 && !this.hasPrecedingLineBreak() && (this.isContextual("as") || this.isContextual("satisfies"))) {
+          init_expr = this.parseExprOp(
+            init_expr,
+            /** @type {number} */
+            init_expr.start,
+            /** @type {AST.NodeWithLocation} */
+            init_expr.loc.start,
+            -1,
+            "await"
+          );
+        }
         if (this.type === tt._in || (isForOf = this.options.ecmaVersion >= 6 && this.isContextual("of"))) {
           if (awaitAt > -1) {
             if (this.type === tt._in) this.unexpected(awaitAt);
@@ -18064,9 +24209,9 @@ function TSRXPlugin(config) {
             this.raise(
               /** @type {AST.NodeWithLocation} */
               init_expr.start,
-              "The left-hand side of a for-of loop may not start with 'let'."
+              TS_ERRORS.FOR_OF_LET
             );
-          const init2 = this.toAssignable(init_expr, false, refDestructuringErrors);
+          const init2 = this.toAssignable(init_expr, false, refDestructuringErrors, true);
           this.checkLValPattern(init2);
           return this.parseForInWithIndex(
             /** @type {AST.ForInStatement | AST.ForOfStatement} */
@@ -18081,9 +24226,13 @@ function TSRXPlugin(config) {
       }
       /** @type {Parse.Parser['parseForAfterInitWithIndex']} */
       parseForAfterInitWithIndex(node, init2, awaitAt) {
-        if ((this.type === tt._in || this.options.ecmaVersion >= 6 && this.isContextual("of")) && init2.declarations.length === 1) {
+        if ((this.type === tt._in || this.options.ecmaVersion >= 6 && this.isContextual("of")) && // When collecting, a declaration list can be empty (`parseForStatement`).
+        init2.declarations.length <= 1) {
           if (this.type === tt._in && (init2.kind === "using" || init2.kind === "await using") && !init2.declarations[0].init) {
-            this.raise(this.start, "Using declaration is not allowed in for-in loops");
+            this.raise(
+              this.start,
+              init2.kind === "using" ? TS_ERRORS.FOR_IN_USING : TS_ERRORS.FOR_IN_AWAIT_USING
+            );
           }
           if (this.options.ecmaVersion >= 9) {
             if (this.type === tt._in) {
@@ -18109,15 +24258,18 @@ function TSRXPlugin(config) {
       parseForInWithIndex(node, init2) {
         const isForIn = this.type === tt._in;
         this.next();
-        if (init2.type === "VariableDeclaration" && init2.declarations[0].init != null && (!isForIn || this.options.ecmaVersion < 8 || this.strict || init2.kind !== "var" || init2.declarations[0].id.type !== "Identifier")) {
+        if (init2.type === "VariableDeclaration" && init2.declarations[0]?.init != null && (!isForIn || this.options.ecmaVersion < 8 || this.strict || init2.kind !== "var" || init2.declarations[0].id.type !== "Identifier")) {
           this.raise(
             /** @type {AST.NodeWithLocation} */
             init2.start,
-            `${isForIn ? "for-in" : "for-of"} loop variable declaration may not have an initializer`
+            isForIn ? TS_ERRORS.FOR_IN_INITIALIZER : TS_ERRORS.FOR_OF_INITIALIZER
           );
         }
         node.left = init2;
         node.right = isForIn ? this.parseExpression() : this.parseMaybeAssign();
+        if (!isForIn && this.type === tt.semi && !this.#forDirectiveLoops.has(node)) {
+          this.raise(this.start, TS_ERRORS.TOKEN_EXPECTED(")"));
+        }
         if (!isForIn && this.type === tt.semi) {
           this.next();
           if (this.isContextual("index")) {
@@ -18129,7 +24281,7 @@ function TSRXPlugin(config) {
               /** @type {AST.ForOfStatement} */
               node.index.type !== "Identifier"
             ) {
-              this.raise(this.start, 'Expected identifier after "index" keyword');
+              this.raise(this.start, TSRX_ERRORS.FOR_INDEX_NAME_EXPECTED);
             }
             this.eat(tt.semi);
           }
@@ -18138,7 +24290,7 @@ function TSRXPlugin(config) {
             node.key = this.parseExpression();
           }
           if (this.isContextual("index")) {
-            this.raise(this.start, '"index" must come before "key" in for-of loop');
+            this.raise(this.start, TSRX_ERRORS.FOR_INDEX_AFTER_KEY);
           }
         } else if (!isForIn) {
           node.index = null;
@@ -18174,12 +24326,38 @@ function TSRXPlugin(config) {
        */
       parseFunctionBody(node, isArrowFunction, isMethod, forInit, ...args) {
         this.#functionBodyDepth++;
+        const arrow_parameter_list = this.#arrowParameterList;
+        this.#arrowParameterList = null;
         try {
           if (!isArrowFunction && this.match(tt.colon)) {
             node.returnType = this.tsParseTypeOrTypePredicateAnnotation(tt.colon);
           }
-          if (this.#isCodeBlockStart(this.start)) {
-            node.body = this.#parseCodeBlock({ allowReturnStatements: true });
+          const is_code_block = this.#isCodeBlockStart(this.start);
+          if (isArrowFunction) {
+            this.#reportRestParameterMistakes(
+              /** @type {AST.ArrowFunctionExpression} */
+              node
+            );
+            this.#reportOptionalPatternParameters(node);
+          } else if (is_code_block || !this.#isBodilessSignature(args[0])) {
+            this.#reportOptionalPatternParameters(node);
+          }
+          if (is_code_block) {
+            const body = this.#parseCodeBlock({ allowReturnStatements: true });
+            node.body = body;
+            this.adaptDirectivePrologue(body.body);
+            if (!this.isSimpleParamList(node.params) && body.body.some(
+              (statement) => (
+                /** @type {AST.Directive} */
+                statement.directive === "use strict"
+              )
+            )) {
+              this.raiseRecoverable(
+                /** @type {number} */
+                node.start,
+                TS_ERRORS.USE_STRICT_NON_SIMPLE_PARAMETERS
+              );
+            }
             this.checkParams(node, false);
             this.exitScope();
             return node;
@@ -18187,6 +24365,86 @@ function TSRXPlugin(config) {
           return super.parseFunctionBody(node, isArrowFunction, isMethod, forInit, ...args);
         } finally {
           this.#functionBodyDepth--;
+          this.#arrowParameterList = arrow_parameter_list;
+        }
+      }
+      /**
+       * Raise TS1047 for an optional rest parameter of an arrow function, at its
+       * `?`, outside an ambient context, and TS1048 for one with a default, at
+       * its name (see `#readRestParameterDefault`), as `parseBindingListItem`
+       * does for other functions. An arrow function's parameters are read as
+       * expressions, which acorn-typescript never checked.
+       * @param {AST.ArrowFunctionExpression} node
+       */
+      #reportRestParameterMistakes(node) {
+        for (const param of node.params) {
+          if (param.type !== "RestElement") continue;
+          const question = this.#restParameterQuestions.get(param);
+          if (!this.isAmbientContext && question !== void 0) {
+            this.raise(question, TS_ERRORS.OPTIONAL_REST_PARAMETER);
+          } else if (!this.isAmbientContext && /** @type {{ optional?: boolean }} */
+          param.optional) {
+            this.raise(
+              skip_space_and_comments_from(
+                this.input,
+                /** @type {number} */
+                param.argument.end
+              ),
+              TS_ERRORS.OPTIONAL_REST_PARAMETER
+            );
+          }
+          if (this.#isRestParameterWithDefault(param)) {
+            this.raise(
+              /** @type {number} */
+              param.argument.start,
+              TS_ERRORS.REST_PARAMETER_INITIALIZER
+            );
+          }
+        }
+      }
+      /**
+       * Whether acorn-typescript's `parseFunctionBody` finishes a function
+       * declaration or class method here as a signature without a body
+       * (`TSDeclareFunction`, `TSDeclareMethod`): its condition, without eating
+       * the `;`. Its `isLineTerminator` calls acorn's `canInsertSemicolon`, which
+       * `super` reaches too.
+       * @param {Parse.AcornTypeScriptFunctionBodyConfig | undefined} tsConfig
+       */
+      #isBodilessSignature(tsConfig) {
+        return !!(tsConfig?.isFunctionDeclaration || tsConfig?.isClassMethod) && this.type !== tt.braceL && (this.type === tt.semi || super.canInsertSemicolon());
+      }
+      /**
+       * Raise TS2463 for each optional binding pattern parameter of a function
+       * that has a body, outside an ambient context, with the message and
+       * position acorn-typescript gave it while reading the parameter (see
+       * `parseBindingListItem`). A signature without a body, such as an
+       * overload, may have one. An arrow function always has a body; its
+       * parameters are read as expressions, which acorn-typescript never
+       * checked.
+       * @param {AST.FunctionDeclaration | AST.FunctionExpression | AST.ArrowFunctionExpression} node
+       */
+      #reportOptionalPatternParameters(node) {
+        if (this.isAmbientContext) return;
+        for (const item of node.params) {
+          const item_node = (
+            /** @type {AST.Node} */
+            item
+          );
+          const param = (
+            /** @type {AST.Pattern} */
+            item_node.type === "TSParameterProperty" ? item_node.parameter : item
+          );
+          const pattern = (
+            /** @type {AST.Pattern & { optional?: boolean }} */
+            param.type === "AssignmentPattern" ? param.left : param
+          );
+          if (pattern.optional && (pattern.type === "ObjectPattern" || pattern.type === "ArrayPattern")) {
+            this.raise(
+              /** @type {number} */
+              pattern.start,
+              TS_ERRORS.OPTIONAL_BINDING_PATTERN_PARAMETER
+            );
+          }
         }
       }
       /**
@@ -18210,24 +24468,26 @@ function TSRXPlugin(config) {
           this.next();
           is_spread = this.eat(tt.ellipsis);
           this.#expressionContainerContextBaselines.push(this.context.length);
-          this.#expressionContainerPathBaselines.push(this.#path.length);
+          this.#expressionContainerPathBaselines.push({
+            path: this.#path,
+            length: this.#path.length
+          });
           pushed_context_baseline = true;
           node.expression = !is_spread && this.type === tt.braceR ? this.jsx_parseEmptyExpression() : this.parseExpression();
           if (this.#allowExpressionContainerTrailingSemicolon && this.type === tt.semi) {
             if (this.#collect) {
               this.#report_recoverable_error(
                 this.start,
-                "TSRX expression containers do not use semicolons. Remove this semicolon.",
-                DIAGNOSTIC_CODES.TEMPLATE_EXPRESSION_TRAILING_SEMICOLON
+                TSRX_ERRORS.TEMPLATE_EXPRESSION_TRAILING_SEMICOLON
               );
             }
             this.next();
           }
           if (!consumeBraceAfterScope) {
-            if (this.type === tt.braceR && this.context.length >= container_context_depth) {
-              this.context.length = container_context_depth - 1;
+            if (this.type === tt.braceR) {
+              this.#truncateContext(container_context_depth - 1);
             }
-            this.expect(tt.braceR);
+            this.#expectContainerClosingBrace();
           }
         } finally {
           this.#jsxExpressionContainerDepth--;
@@ -18237,7 +24497,7 @@ function TSRXPlugin(config) {
           }
         }
         if (consumeBraceAfterScope) {
-          this.expect(tt.braceR);
+          this.#expectContainerClosingBrace();
         }
         return this.finishNode(node, is_spread ? "JSXSpreadChild" : "JSXExpressionContainer");
       }
@@ -18272,81 +24532,19 @@ function TSRXPlugin(config) {
           this.startNode()
         );
         if (this.type === tt.braceL) {
-          let name_start = skip_whitespace_from(this.input, this.start + 1);
-          const first = this.input.charCodeAt(name_start);
-          if (this.#isIdentifierChar(first) && !(first >= CharCode.digit0 && first <= CharCode.digit9)) {
-            let name_end = name_start + 1;
-            while (this.#isIdentifierChar(this.input.charCodeAt(name_end))) {
-              name_end++;
-            }
-            const brace_start = skip_whitespace_from(this.input, name_end);
-            if (this.input.charCodeAt(brace_start) === CharCode.closeBrace) {
-              const name_start_loc = get_line_info(this, name_start);
-              const name_end_loc = get_line_info(this, name_end);
-              const name_value = this.input.slice(name_start, name_end);
-              const id2 = (
-                /** @type {ESTreeJSX.JSXIdentifier} */
-                this.startNodeAt(name_start, name_start_loc)
-              );
-              id2.name = name_value;
-              this.finishNodeAt(id2, "JSXIdentifier", name_end, name_end_loc);
-              const name = (
-                /** @type {AST.Identifier} */
-                this.startNodeAt(name_start, name_start_loc)
-              );
-              name.name = name_value;
-              this.finishNodeAt(name, "Identifier", name_end, name_end_loc);
-              const expression = (
-                /** @type {ESTreeJSX.JSXExpressionContainer} */
-                this.startNodeAt(this.start, this.startLoc)
-              );
-              expression.expression = name;
-              this.finishNodeAt(
-                expression,
-                "JSXExpressionContainer",
-                brace_start + 1,
-                get_line_info(this, brace_start + 1)
-              );
-              node.name = id2;
-              node.value = expression;
-              node.shorthand = true;
-              const end = brace_start + 1;
-              const endLoc = get_line_info(this, end);
-              this.pos = end;
-              this.curLine = endLoc.line;
-              this.lineStart = end - endLoc.column;
-              if (this.curContext()?.token === "{") {
-                this.context.pop();
-              }
-              this.exprAllowed = false;
-              this.next();
-              return this.finishNodeAt(node, "JSXAttribute", end, endLoc);
-            }
-          }
           this.#suppressTemplateRawTextToken = true;
-        }
-        if (this.eat(tt.braceL)) {
-          if (this.type === tt.ellipsis) {
+          this.next();
+          if (this.type === tt.ellipsis || this.lookahead().type === tt.ellipsis) {
+            const brace_context_depth = this.context.length;
             this.#suppressTemplateRawTextToken = true;
             this.expect(tt.ellipsis);
-            this.#templateScriptParsingDepth++;
-            try {
-              node.argument = this.parseMaybeAssign();
-            } finally {
-              this.#templateScriptParsingDepth--;
+            node.argument = this.#parseOpeningTagCode(
+              () => this.parseMaybeAssign()
+            );
+            if (this.type === tt.braceR) {
+              this.#truncateContext(brace_context_depth - 1);
             }
-            this.expect(tt.braceR);
-            return this.finishNode(node, "JSXSpreadAttribute");
-          } else if (this.lookahead().type === tt.ellipsis) {
-            this.#suppressTemplateRawTextToken = true;
-            this.expect(tt.ellipsis);
-            this.#templateScriptParsingDepth++;
-            try {
-              node.argument = this.parseMaybeAssign();
-            } finally {
-              this.#templateScriptParsingDepth--;
-            }
-            this.expect(tt.braceR);
+            this.#expectContainerClosingBrace();
             return this.finishNode(node, "JSXSpreadAttribute");
           } else {
             if (!(this.type === tt.name || this.type.keyword || this.type === tstt.jsxName)) {
@@ -18383,15 +24581,15 @@ function TSRXPlugin(config) {
             );
             expression.expression = name;
             node.name = id2;
+            node.shorthand = true;
+            this.next();
+            this.#expectContainerClosingBrace();
             node.value = this.finishNodeAt(
               expression,
               "JSXExpressionContainer",
-              this.end + 1,
-              this.endLoc
+              this.lastTokEnd,
+              this.lastTokEndLoc
             );
-            node.shorthand = true;
-            this.next();
-            this.expect(tt.braceR);
             return this.finishNode(node, "JSXAttribute");
           }
         }
@@ -18439,17 +24637,47 @@ function TSRXPlugin(config) {
         }
         return this.finishNode(node, "JSXIdentifier");
       }
+      /**
+       * A dynamic tag name, `{ AssignmentExpression }`. A spread or an empty
+       * container is no expression, so it can't be read as a tag at all. Which
+       * expressions make a valid tag is checked once per element, at the
+       * opening tag (see `#reportInvalidDynamicTag`).
+       */
       #parseJSXDynamicElementName() {
         const container = this.jsx_parseExpressionContainer();
-        if (container.type === "JSXSpreadChild" || !this.#isValidDynamicTagExpression(container.expression)) {
+        if (container.type === "JSXSpreadChild" || container.expression.type === "JSXEmptyExpression") {
           this.raise(
             /** @type {number} */
-            container.type === "JSXSpreadChild" ? container.start : container.expression?.start ?? container.start,
-            "Dynamic element names must be an identifier, member expression, static string, or runtime expression; calls, spreads, string concatenation, string interpolation, and static null, undefined, boolean, number, object, and array literals are not valid tag names."
+            container.type === "JSXSpreadChild" ? container.start : container.expression.start ?? container.start,
+            TSRX_ERRORS.DYNAMIC_TAG_EXPRESSION
           );
         }
         container.isDynamic = true;
         return container;
+      }
+      /**
+       * Report a dynamic tag expression that isn't an allowed form (see
+       * `find_invalid_dynamic_tag_part`) at its invalid part. The check doesn't
+       * change the parse: collecting records the error and goes on, and a
+       * strict parse throws it. The closing tag repeats the expression, so only
+       * the opening tag is checked.
+       * @param {ESTreeJSX.JSXExpressionContainer} name
+       */
+      #reportInvalidDynamicTag(name) {
+        const invalid = find_invalid_dynamic_tag_part(
+          /** @type {AST.Node} */
+          name.expression
+        );
+        if (!invalid) return;
+        const node = (
+          /** @type {AST.Node & AST.NodeWithLocation} */
+          invalid
+        );
+        this.#report_recoverable_error_range(
+          node.metadata?.paren_start ?? node.start,
+          end_after_parentheses(this.input, node),
+          TSRX_ERRORS.DYNAMIC_TAG_EXPRESSION
+        );
       }
       /**
        * @type {Parse.Parser['jsx_parseElementName']}
@@ -18511,7 +24739,7 @@ function TSRXPlugin(config) {
                 this.raise(
                   /** @type {number} */
                   value.start,
-                  "Attribute values cannot be spread. Use a spread attribute (`{...props}`) instead."
+                  TSRX_ERRORS.ATTRIBUTE_VALUE_SPREAD
                 );
               }
               return value;
@@ -18521,10 +24749,50 @@ function TSRXPlugin(config) {
             }
           }
           case tstt.jsxTagStart:
+            return this.#parseOpeningTagCode(() => {
+              this.#tagValueContextDepth = this.context.length - 2;
+              try {
+                return this.parseExprAtom();
+              } finally {
+                this.#tagValueContextDepth = -1;
+              }
+            });
           case tt.string:
             return this.parseExprAtom();
           default:
-            this.raise(this.start, "value should be either an expression or a quoted text");
+            this.raise(this.start, TS_ERRORS.JSX_ATTRIBUTE_VALUE);
+        }
+      }
+      /**
+       * Parses code in an opening tag outside a `{ … }` container: a spread
+       * attribute's argument, whose first token is read, or an element that is an
+       * attribute value without braces (`<div a=<b>…</b> />`). While the tag is
+       * read, the element it opens is `#openingNativeTemplateNode`, still in
+       * script mode, so `jsx_parseElement` would hand an element in that code to
+       * acorn-typescript's JSX parser. Hide it and read the code as a container's
+       * (see `jsx_parseExpressionContainer`), as a braced value is read: its
+       * elements are template markup, and the code around them is not template
+       * text. The token after the code is read in the tag again.
+       * @template T
+       * @param {() => T} parse
+       * @returns {T}
+       */
+      #parseOpeningTagCode(parse5) {
+        const opening_node = this.#openingNativeTemplateNode;
+        this.#openingNativeTemplateNode = null;
+        this.#jsxExpressionContainerDepth++;
+        this.#expressionContainerContextBaselines.push(this.context.length);
+        this.#expressionContainerPathBaselines.push({
+          path: this.#path,
+          length: this.#path.length
+        });
+        try {
+          return parse5();
+        } finally {
+          this.#jsxExpressionContainerDepth--;
+          this.#expressionContainerContextBaselines.pop();
+          this.#expressionContainerPathBaselines.pop();
+          this.#openingNativeTemplateNode = opening_node;
         }
       }
       /**
@@ -18554,7 +24822,7 @@ function TSRXPlugin(config) {
               node.pendingKeyword = this.#lastClauseKeywordSpan;
               node.pending = this.#parseTemplateControlFlowReturnBlock();
             } else if (this.#isUnprefixedDirectiveClauseContinuation("pending", ["{"])) {
-              this.raise(this.start, "Expected `@pending` after `@try` block.");
+              this.raise(this.start, TSRX_ERRORS.DIRECTIVE_BRANCH_EXPECTED("pending", "try"));
             } else {
               node.pending = null;
             }
@@ -18594,7 +24862,7 @@ function TSRXPlugin(config) {
                 if (this.eat(tt.parenL)) {
                   const param = this.parseBindingAtom();
                   const simple = param.type === "Identifier";
-                  this.enterScope(simple ? BINDING_TYPES.BIND_SIMPLE_CATCH : 0);
+                  this.enterScope(simple ? SCOPE_SIMPLE_CATCH2 : 0);
                   this.checkLValPattern(
                     param,
                     simple ? BINDING_TYPES.BIND_SIMPLE_CATCH : BINDING_TYPES.BIND_LEXICAL
@@ -18630,14 +24898,14 @@ function TSRXPlugin(config) {
               this.exitScope();
               node.handler = this.finishNode(clause, "CatchClause");
             } else if (this.#isUnprefixedDirectiveClauseContinuation("catch", ["{", "("])) {
-              this.raise(this.start, "Expected `@catch` after `@try` block.");
+              this.raise(this.start, TSRX_ERRORS.DIRECTIVE_BRANCH_EXPECTED("catch", "try"));
             }
             node.finalizer = null;
             if (!node.handler && !node.pending) {
               this.raise(
                 /** @type {AST.NodeWithLocation} */
                 node.start,
-                "Missing `@catch` or `@pending` after `@try` block."
+                TSRX_ERRORS.TRY_HANDLER_MISSING
               );
             }
             return this.finishNode(node, "TryStatement");
@@ -18663,11 +24931,12 @@ function TSRXPlugin(config) {
           if (this.eat(tt.parenL)) {
             const param = this.parseBindingAtom();
             const simple = param.type === "Identifier";
-            this.enterScope(simple ? BINDING_TYPES.BIND_SIMPLE_CATCH : 0);
+            this.enterScope(simple ? SCOPE_SIMPLE_CATCH2 : 0);
             this.checkLValPattern(
               param,
               simple ? BINDING_TYPES.BIND_SIMPLE_CATCH : BINDING_TYPES.BIND_LEXICAL
             );
+            catch_parameter_names.set(this.currentScope(), [...this.currentScope().lexical]);
             const type = this.tsTryParseTypeAnnotation();
             if (type) {
               param.typeAnnotation = type;
@@ -18701,7 +24970,7 @@ function TSRXPlugin(config) {
           this.raise(
             /** @type {AST.NodeWithLocation} */
             node.start,
-            "Missing catch or finally clause"
+            TS_ERRORS.MISSING_CATCH_OR_FINALLY
           );
         }
         return this.finishNode(node, "TryStatement");
@@ -18740,11 +25009,11 @@ function TSRXPlugin(config) {
             const inside_open_template = this.#path.findLast((n2) => this.#isNativeTemplateNode(n2));
             if (!inside_open_template) {
               while (this.curContext() === tstc.tc_expr) {
-                this.context.pop();
+                this.#popContext();
               }
               return this.finishToken(tt.eof);
             }
-            this.raise(this.start, "Unterminated JSX contents");
+            this.raise(this.start, TS_ERRORS.UNTERMINATED_JSX_CONTENTS);
           }
           let ch = this.input.charCodeAt(this.pos);
           switch (ch) {
@@ -18785,7 +25054,7 @@ function TSRXPlugin(config) {
               }
               return this.getTokenFromCode(ch);
             case CharCode.slash:
-              if (this.input.charCodeAt(this.pos + 1) === CharCode.slash) {
+              if (this.#isTemplateLineCommentStart(this.pos, this.start)) {
                 const commentStart = this.pos;
                 const startLoc = this.curPosition();
                 this.pos += 2;
@@ -18799,17 +25068,16 @@ function TSRXPlugin(config) {
                 const commentEnd = this.pos;
                 const endLoc = this.curPosition();
                 if (this.options.onComment) {
-                  const metadata = this.#createCommentMetadata();
                   this.options.onComment(
                     false,
                     commentText,
                     commentStart,
                     commentEnd,
                     startLoc,
-                    endLoc,
-                    metadata
+                    endLoc
                   );
                 }
+                out += this.input.slice(chunkStart, commentStart);
                 chunkStart = this.pos;
                 break;
               } else if (this.input.charCodeAt(this.pos + 1) === CharCode.asterisk) {
@@ -18828,17 +25096,16 @@ function TSRXPlugin(config) {
                 const commentEnd = this.pos;
                 const endLoc = this.curPosition();
                 if (this.options.onComment) {
-                  const metadata = this.#createCommentMetadata();
                   this.options.onComment(
                     true,
                     commentText,
                     commentStart,
                     commentEnd,
                     startLoc,
-                    endLoc,
-                    metadata
+                    endLoc
                   );
                 }
+                out += this.input.slice(chunkStart, commentStart);
                 chunkStart = this.pos;
                 break;
               }
@@ -18857,6 +25124,10 @@ function TSRXPlugin(config) {
               break;
             case CharCode.greaterThan:
             case CharCode.closeBrace: {
+              if (ch === CharCode.greaterThan && this.#shouldReadTemplateRawTextToken(true)) {
+                ++this.pos;
+                break;
+              }
               if (ch === CharCode.greaterThan && this.input.charCodeAt(this.pos - 1) === CharCode.equals && !this.#shouldReadTemplateRawTextToken()) {
                 const start = this.pos - 1;
                 const loc = get_line_info(this, start);
@@ -18871,7 +25142,7 @@ function TSRXPlugin(config) {
               }
               this.raise(
                 this.pos,
-                "Unexpected token `" + this.input[this.pos] + "`. Did you mean `" + (ch === CharCode.greaterThan ? "&gt;" : "&rbrace;") + '` or `{"' + this.input[this.pos] + '"}`?'
+                ch === CharCode.greaterThan ? TS_ERRORS.JSX_UNESCAPED_GREATER_THAN : TS_ERRORS.JSX_UNESCAPED_CLOSING_BRACE
               );
             }
             default:
@@ -18901,6 +25172,22 @@ function TSRXPlugin(config) {
         }
       }
       /**
+       * acorn-typescript's JSX parser reads an element's children until its
+       * closing tag and takes each text token as a child. A text token that
+       * reads nothing leaves the next token where it was, so the loop would read
+       * it again until memory runs out; report it instead, as `parseTemplateBody`
+       * does for template text.
+       * @type {Parse.Parser['jsx_parseText']}
+       */
+      jsx_parseText() {
+        const start = this.start;
+        const node = super.jsx_parseText();
+        if (node.end === start && this.start === start && this.type === tstt.jsxText) {
+          this.unexpected(start);
+        }
+        return node;
+      }
+      /**
        * Override jsx_parseElement to use TSRX template parsing only where the
        * fragment/element body can contain TSRX-only syntax.
        * @type {Parse.Parser['jsx_parseElement']}
@@ -18923,7 +25210,9 @@ function TSRXPlugin(config) {
           }
         }
         const enclosing_context_depth = this.context.length - 2;
+        const tag_start = this.start;
         this.next();
+        if (this.type === tt.slash) this.unexpected(tag_start);
         const parsed = (
           /** @type {import('estree-jsx').JSXElement} */
           /** @type {unknown} */
@@ -18950,6 +25239,7 @@ function TSRXPlugin(config) {
         if (nodeName) node.name = nodeName;
         if (this.#isDynamicJSXElementName(nodeName)) {
           node.isDynamic = true;
+          this.#reportInvalidDynamicTag(nodeName);
         }
         if (this.match(tt.relational) || this.match(tt.bitShift)) {
           const typeArguments = this.tsTryParseAndCatch(
@@ -19007,8 +25297,10 @@ function TSRXPlugin(config) {
        * @type {Parse.Parser['parseElement']}
        */
       parseElement() {
+        const tag_value_context_depth = this.#tagValueContextDepth;
+        this.#tagValueContextDepth = -1;
         let pre_element_context_depth = this.context.length - this.#currentTokenContextCount();
-        while (pre_element_context_depth > 0) {
+        while (pre_element_context_depth > Math.max(0, tag_value_context_depth)) {
           const ctx = this.context[pre_element_context_depth - 1];
           if (ctx === tstc.tc_expr || ctx === tstc.tc_oTag || ctx === tstc.tc_cTag) {
             pre_element_context_depth--;
@@ -19029,6 +25321,16 @@ function TSRXPlugin(config) {
           templateMode: "script"
         };
         node.children = [];
+        this.#elementStarts.set(node, {
+          labels: this.labels,
+          labelsLength: this.labels.length,
+          scriptDepth: this.#templateScriptParsingDepth,
+          switchCaseScriptDepth: this.#parsingJSXSwitchCaseScriptStatementDepth,
+          scriptJSXDepth: this.#scriptJSXElementDepth
+        });
+        if (tag_value_context_depth >= 0) {
+          this.#tagValueElements.add(node);
+        }
         const previous_opening_native_template_node = this.#openingNativeTemplateNode;
         this.#openingNativeTemplateNode = node;
         let open;
@@ -19053,10 +25355,7 @@ function TSRXPlugin(config) {
             open.name
           );
           const tagName = namespace_node.namespace.name + ":" + namespace_node.name.name;
-          this.raise(
-            open.start,
-            `Namespaced elements are not supported in TSRX templates: <${tagName}>.`
-          );
+          this.raise(open.start, TSRX_ERRORS.NAMESPACED_ELEMENT(tagName));
         }
         const slots = (
           /** @type {Parse.NativeTemplateNodeSlots} */
@@ -19079,9 +25378,6 @@ function TSRXPlugin(config) {
               slots.isDynamic = true;
             }
           }
-        }
-        if (node.metadata.commentContainerId === void 0) {
-          node.metadata.commentContainerId = ++this.#commentContextId;
         }
         this.#path.push(node);
         if (!is_fragment && open.selfClosing) {
@@ -19129,7 +25425,7 @@ function TSRXPlugin(config) {
             );
             this.#report_broken_markup_error(
               this.start,
-              `Unclosed tag '<${displayTag}>'. Expected '</${displayTag}>' before end of template.`
+              TSRX_ERRORS.UNCLOSED_TAG(String(displayTag))
             );
             slots.unclosed = true;
             node.loc.end = {
@@ -19155,10 +25451,9 @@ function TSRXPlugin(config) {
           const insideTemplate = this.#isNativeTemplateNode(parent);
           const token_context_depth = this.context.length - this.#currentTokenContextCount();
           if (!insideTemplate && token_context_depth > pre_element_context_depth) {
-            this.context.splice(
-              pre_element_context_depth,
-              token_context_depth - pre_element_context_depth
-            );
+            const token_contexts = this.context.slice(token_context_depth);
+            this.#truncateContext(pre_element_context_depth);
+            this.context.push(...token_contexts);
           }
         }
         if (is_style || is_script) {
@@ -19203,24 +25498,13 @@ function TSRXPlugin(config) {
         if (!current_template_node) return;
         current_template_node.metadata ??= { path: [] };
         current_template_node.metadata.templateMode = "template";
+        this.#readSkippedTemplateText(body);
         if (this.#atCodeBlockStart()) {
           const at_index = skip_whitespace_from(this.input, this.start);
           if (this.start !== at_index) {
-            const ws_start = this.start;
-            const ws_start_loc = this.startLoc;
-            const ws_value = this.input.slice(ws_start, at_index);
-            const text_node = (
-              /** @type {ESTreeJSX.JSXText} */
-              this.startNodeAt(ws_start, ws_start_loc)
-            );
-            text_node.value = ws_value;
-            text_node.raw = ws_value;
+            this.#addSkippedTemplateText(body, this.start, at_index);
             const loc = get_line_info(this, at_index);
             const at_position = new Position(loc.line, loc.column);
-            this.finishNodeAt(text_node, "JSXText", at_index, at_position);
-            if (this.#shouldKeepTemplateTextNode(text_node)) {
-              body.push(text_node);
-            }
             this.pos = at_index;
             this.start = at_index;
             this.startLoc = at_position;
@@ -19234,64 +25518,12 @@ function TSRXPlugin(config) {
         if (this.type === tt.braceL) {
           body.push(this.#parseNativeTemplateExpressionContainer());
         } else if (this.type === tstt.jsxText) {
-          if (this.input.charCodeAt(this.start) === CharCode.lessThan && can_start_tag_after_lt(this.input, this.start)) {
-            if (this.#jsxExpressionContainerDepth > 0) {
-              const path_baseline = this.#expressionContainerPathBaselines.at(-1) ?? 0;
-              let open_elements = 0;
-              for (let i2 = path_baseline; i2 < this.#path.length; i2++) {
-                if (this.#isNativeTemplateNode(this.#path[i2])) open_elements++;
-              }
-              let run = 0;
-              for (let i2 = this.context.length - 1; i2 >= 0 && this.context[i2] === tstc.tc_expr; i2--) {
-                run++;
-              }
-              while (run > open_elements && this.curContext() === tstc.tc_expr) {
-                this.context.pop();
-                run--;
-              }
-            } else if (this.input.charCodeAt(this.start + 1) === CharCode.slash) {
-              while (this.curContext() === tstc.tc_expr) {
-                this.context.pop();
-              }
-            } else {
-              let native_depth = 0;
-              for (const node of this.#path) {
-                if (this.#isNativeTemplateNode(node)) native_depth++;
-              }
-              let tc_expr_depth = 0;
-              for (const context of this.context) {
-                if (context === tstc.tc_expr) tc_expr_depth++;
-              }
-              while (tc_expr_depth > native_depth && this.curContext() === tstc.tc_expr) {
-                this.context.pop();
-                tc_expr_depth--;
-              }
-            }
-            this.pos = this.start;
-            this.exprAllowed = true;
-            this.next();
-            this.parseTemplateBody(body);
-            return;
-          }
-          const text = this.#parseTemplateRawText();
-          if (this.#shouldKeepTemplateTextNode(text)) {
-            body.push(text);
-          }
+          this.#parseTemplateRawText(body);
         } else if (this.#isJSXControlFlowDirectiveStart()) {
-          const directive = this.#parseJSXControlFlowExpression();
-          body.push(directive);
-          const blockEnd = directive.end;
-          const nextCh = this.input.charCodeAt(this.start);
-          const startsRawText = this.type !== tt.eof && nextCh !== CharCode.lessThan && nextCh !== CharCode.openBrace && nextCh !== CharCode.closeBrace && !this.#isJSXControlFlowDirectiveStart();
-          if (startsRawText && typeof blockEnd === "number" && this.start > blockEnd && /^\s*$/.test(this.input.slice(blockEnd, this.start))) {
-            const loc = get_line_info(this, blockEnd);
-            this.pos = blockEnd;
-            this.start = blockEnd;
-            this.startLoc = new Position(loc.line, loc.column);
-          }
+          body.push(this.#parseJSXControlFlowExpression());
         } else if (this.type === tt.braceR) {
           while (this.curContext() === tstc.tc_expr) {
-            this.context.pop();
+            this.#popContext();
           }
           return;
         } else if (this.type === tstt.jsxTagStart) {
@@ -19301,7 +25533,8 @@ function TSRXPlugin(config) {
           if (this.value === "/" || this.type === tt.slash) {
             this.next();
             const closingNode = this.startNodeAt(startPos, startLoc);
-            const inside_parent_template = this.#jsxExpressionContainerDepth === 0 && this.#templateScriptParsingDepth === 0 && this.#path.slice(0, -1).some((node2) => this.#isNativeTemplateNode(node2));
+            const parent_template_node = this.#path.slice(this.#containerPathBaseline(), -1).findLast((node2) => this.#isNativeTemplateNode(node2));
+            const inside_parent_template = !!parent_template_node && this.#templateScriptParsingDepth <= this.#elementStart(parent_template_node).scriptDepth;
             this.#closingNativeTemplateNode = true;
             let closingName;
             try {
@@ -19321,12 +25554,12 @@ function TSRXPlugin(config) {
             if (!(inside_parent_template && current_name === closing_name_str)) {
               this.#closingNativeTemplateNode = true;
             }
-            const closes_outside_template = this.#isNativeTemplateNode(current2) && current_name === closing_name_str && !this.#isNativeTemplateNode(this.#path.at(-2));
+            const closes_outside_template = this.#isNativeTemplateNode(current2) && current_name === closing_name_str && (!this.#isNativeTemplateNode(this.#path.at(-2)) || this.#tagValueElements.has(current2));
             if (closes_outside_template) {
               this.#path.pop();
               const context_depth = this.#elementContextDepths.get(current2);
               if (context_depth !== void 0 && this.context.length > context_depth) {
-                this.context.length = context_depth;
+                this.#truncateContext(context_depth);
                 this.exprAllowed = false;
               }
             }
@@ -19353,7 +25586,7 @@ function TSRXPlugin(config) {
               this.#path[this.#path.length - 1]
             );
             if (!this.#isNativeTemplateNode(currentElement)) {
-              this.raise(this.start, "Unexpected closing tag");
+              this.raise(this.start, TSRX_ERRORS.UNEXPECTED_CLOSING_TAG);
             }
             let openingTagName;
             let closingTagName;
@@ -19376,12 +25609,11 @@ function TSRXPlugin(config) {
                 return elemName === normalized_closing_name;
               });
               if (!matches_open_element && this.#collect) {
-                this.raise(closingElement.start, "Unexpected closing tag");
+                this.raise(closingElement.start, TSRX_ERRORS.UNEXPECTED_CLOSING_TAG);
               }
               this.#report_broken_markup_error(
                 closingElement.start,
-                `Expected closing tag to match opening tag. Expected '</${openingTagName}>' but found '</${closingTagName}>'`,
-                DIAGNOSTIC_CODES.MISMATCHED_CLOSING_TAG
+                TSRX_ERRORS.MISMATCHED_CLOSING_TAG(String(openingTagName), String(closingTagName))
               );
               while (this.#path.length > 0) {
                 const elem = (
@@ -19419,7 +25651,6 @@ function TSRXPlugin(config) {
               }
             }
             this.#path.pop();
-            this.#skipTrailingLayoutWhitespace();
             return;
           }
           const node = this.parseElement();
@@ -19429,40 +25660,32 @@ function TSRXPlugin(config) {
         } else if (this.type === tt.eof) {
           return;
         } else {
-          const text = this.#parseTemplateRawText();
-          if (this.#shouldKeepTemplateTextNode(text)) {
-            body.push(text);
+          const start = this.start;
+          const type = this.type;
+          const end = this.#parseTemplateRawText(body);
+          if (end === start && this.start === start && this.type === type) {
+            this.unexpected(start);
           }
         }
         this.parseTemplateBody(body);
       }
+      // UPSTREAM(sveltejs/acorn-typescript#110): remove once a release includes the fix
       /**
-       * Parse the argument list of a deferred dynamic import,
-       * `import.defer(specifier, options?)`, starting at the opening paren.
+       * Parse the arguments of `import(…)` and `import.defer(…)` with acorn's
+       * own grammar, starting at the `(`. acorn-typescript replaces it with an
+       * older one that rejected a trailing comma after either argument
+       * (`import("./a.js",)`), read `import(a, b, c)` as `import(a, (b, c))`,
+       * and put the options on `arguments`. acorn puts them on `options`, the
+       * name typescript-estree and import types here use, or `null` without
+       * them, and rejects a third argument.
        *
-       * This mirrors Acorn's ES2025 `import(...)` grammar (optional `options`
-       * argument, optional trailing comma), which the inherited parser does
-       * not produce here: acorn-typescript's `parseDynamicImport`, which
-       * emits legacy `arguments`, replaces Acorn's own.
-       *
-       * @param {AST.ImportExpression} node
-       * @returns {AST.ImportExpression}
+       * sveltejs/acorn-typescript#110 defers to acorn the same way, but also
+       * copies `options` onto `arguments`, and esrap prints both. If the
+       * release still does, drop `arguments` from the AST when removing this.
+       * @type {Parse.Parser['parseDynamicImport']}
        */
-      parseDeferredDynamicImport(node) {
-        this.next();
-        node.source = this.parseMaybeAssign();
-        node.options = null;
-        if (!this.eat(tt.parenR)) {
-          this.expect(tt.comma);
-          if (!this.afterTrailingComma(tt.parenR)) {
-            node.options = this.parseMaybeAssign();
-            if (!this.eat(tt.parenR)) {
-              this.expect(tt.comma);
-              if (!this.afterTrailingComma(tt.parenR)) this.unexpected();
-            }
-          }
-        }
-        return this.finishNode(node, "ImportExpression");
+      parseDynamicImport(node) {
+        return original.parseDynamicImport.call(this, node);
       }
       /**
        * Recognize the deferred dynamic-import form
@@ -19479,14 +25702,14 @@ function TSRXPlugin(config) {
             this.startNode()
           );
           if (this.containsEsc) {
-            this.raiseRecoverable(this.start, "Escape sequence in keyword import");
+            this.raise(this.start, TS_ERRORS.KEYWORD_ESCAPE_SEQUENCE("import"));
           }
           this.next();
           this.next();
           this.next();
           node.phase = "defer";
           if (this.type !== tt.parenL) this.unexpected();
-          return this.parseDeferredDynamicImport(node);
+          return this.parseDynamicImport(node);
         }
         return super.parseExprImport(forNew);
       }
@@ -19516,7 +25739,8 @@ function TSRXPlugin(config) {
             this.ts_eatContextualWithState("defer", 1, enterHead);
             enterHead = this.lookahead();
             ahead = this.lookahead(2);
-          } else if (head_modifies && this.ts_eatContextualWithState("type", 1, enterHead)) {
+          } else if (head_modifies && enterHead.type === tstt.type) {
+            this.next();
             this.importOrExportOuterKind = "type";
             node.importKind = "type";
             enterHead = this.lookahead();
@@ -19549,10 +25773,7 @@ function TSRXPlugin(config) {
           }
         }
         if (deferred && (node.specifiers.length !== 1 || node.specifiers[0].type !== "ImportNamespaceSpecifier" || node.source.type !== "Literal")) {
-          this.raise(
-            defer_start,
-            "`import defer` only supports a namespace import from a string literal."
-          );
+          this.raise(defer_start, TS_ERRORS.IMPORT_DEFER_NAMESPACE);
         }
         this.parseMaybeImportAttributes(node);
         this.semicolon();
@@ -19631,6 +25852,9 @@ function TSRXPlugin(config) {
        * @type {Parse.Parser['parseStatement']}
        */
       parseStatement(context, topLevel, exports) {
+        if (context == null && this.type === tt.eof) {
+          this.#raiseClosingBraceExpected();
+        }
         if (context !== "for" && context !== "if" && this.#functionBodyDepth === 0 && this.context.at(-1) === b_stat && this.type === tt.braceL && this.context.some((c) => c === tstc.tc_expr)) {
           return (
             /** @type {ESTreeJSX.JSXExpressionContainer} */
@@ -19645,24 +25869,26 @@ function TSRXPlugin(config) {
               super.parseStatement(context, topLevel, exports)
             );
           }
+          const tag_start = this.start;
           this.next();
-          if (this.value === "/") this.unexpected();
+          if (this.value === "/") this.unexpected(tag_start);
           const node = this.parseElement();
           if (!node) {
             this.unexpected();
           }
           if (this.#functionBodyDepth > 0 && node.type === "JSXFragment" && this.curContext() === b_stat) {
-            this.context.pop();
+            this.#popContext();
             if (this.curContext() === tstc.tc_expr) {
-              this.context.pop();
+              this.#popContext();
             }
             if (this.curContext() === b_stat) {
-              this.context.pop();
+              this.#popContext();
             }
           }
           if (this.#continuesElementExpression()) {
             return this.#parseElementExpressionStatement(node);
           }
+          if (context != null) this.eat(tt.semi);
           return node;
         }
         if (this.input.charCodeAt(this.start) === CharCode.at && (this.#isCodeBlockStart(this.start) || this.#isJSXControlFlowDirectiveStart())) {
@@ -19678,7 +25904,48 @@ function TSRXPlugin(config) {
             this.finishNode(node, "ExpressionStatement")
           );
         }
+        if (this.#collect && this.type === tstt.at) {
+          return this.#parseDecoratedStatement(
+            () => super.parseStatement(context, topLevel, exports)
+          );
+        }
+        if (context == null && this.start !== this.#declarationAfterAbstractStart) {
+          const read = this.#readModifiedDeclaration(false);
+          if (read) {
+            return this.#parseModifiedStatement(
+              read,
+              /** @type {Record<string, boolean> | undefined} */
+              /** @type {unknown} */
+              exports
+            );
+          }
+        }
+        this.#checkEscapedDeclarationKeyword();
+        if (this.type === tstt.type && this.#isTypeAliasNamedOperator()) {
+          const node = this.startNode();
+          this.next();
+          return (
+            /** @type {AST.Statement} */
+            /** @type {unknown} */
+            this.tsParseTypeAliasDeclaration(node)
+          );
+        }
         return super.parseStatement(context, topLevel, exports);
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#145): remove once a release includes the fix
+      /**
+       * Whether the current token, `type`, starts a type alias named `as` or
+       * `satisfies`. TypeScript reads `type` before a name on the same line as a
+       * type alias (`isDeclaration`), and these are names. acorn-typescript
+       * reads the start of a statement as an expression first and makes a type
+       * alias of `type` and the name after it, but it read `as` or `satisfies`
+       * after the expression `type` as an operator, so `type as = 1;` failed at
+       * `=`, and `type as number;` parsed as an expression, where TypeScript
+       * expects the alias's `=` (TS1005).
+       */
+      #isTypeAliasNamedOperator() {
+        const next = this.lookahead();
+        return next.type === tt.name && (next.value === "as" || next.value === "satisfies") && !this.#lineBreakAfter(this.end);
       }
       /**
        * @type {Parse.Parser['parseBlock']}
@@ -19703,11 +25970,224 @@ function TSRXPlugin(config) {
             return super.parseBlock(createNewLexicalScope, node, exitStrict);
           } finally {
             if (pushed_statement_context && this.curContext() === b_stat) {
-              this.context.pop();
+              this.#popContext();
             }
           }
         }
         return super.parseBlock(createNewLexicalScope, node, exitStrict);
+      }
+      /**
+       * Report a missing `}` at the current token as TypeScript does, with
+       * `'}' expected.` instead of acorn's `Unexpected token`.
+       * @returns {never}
+       */
+      #raiseClosingBraceExpected() {
+        return this.raise(this.start, TS_ERRORS.TOKEN_EXPECTED("}"));
+      }
+      /**
+       * Consume the `}` of an expression container (`{value}`, `{...spread}`, or
+       * a `{name}` attribute), which holds a single expression: whatever token
+       * is in its place, the `}` is missing, as TypeScript reports.
+       */
+      #expectContainerClosingBrace() {
+        if (!this.eat(tt.braceR)) {
+          this.#raiseClosingBraceExpected();
+        }
+      }
+      /**
+       * Parse an element of a `{ … }` list: a property, a named import or
+       * export, or an enum, interface, or type literal member. At the end of the
+       * input, the list's `}` is missing. Records where the element ends for
+       * `expect`.
+       * @template T
+       * @param {() => T} parse
+       * @returns {T}
+       */
+      #parseBraceListElement(parse5) {
+        if (this.type === tt.eof) {
+          this.#raiseClosingBraceExpected();
+        }
+        const element = parse5();
+        this.#braceListElementEnd = this.lastTokEnd;
+        return element;
+      }
+      /**
+       * Report a missing `}` like TypeScript wherever acorn expects one: at
+       * the end of the input, and at any token after the expression of a
+       * template literal's `${ … }`. Elsewhere a token in place of the `}` is
+       * one TypeScript reads differently (another member of a mapped type, or
+       * an import attribute without its comma) and keeps `Unexpected token`.
+       * At the end of the input, the comma expected after an element of a
+       * comma-separated `{ … }` list, and the first element of a list opened
+       * by an expected `{`, are the list's missing `}` too. A tag's `>`, expected
+       * after a closing tag's name or a self-closing tag's `/`, is missing
+       * whatever token is in its place, as TypeScript reports too.
+       * @param {Parse.TokenType} type
+       */
+      expect(type) {
+        if (this.type !== type) {
+          if (type === tstt.jsxTagEnd) {
+            this.raise(this.start, TS_ERRORS.TOKEN_EXPECTED(">"));
+          }
+          if (type === tt.braceR && (this.type === tt.eof || this.context.at(-1 - this.#currentTokenContextCount()) === b_tmpl)) {
+            this.#raiseClosingBraceExpected();
+          }
+          if (type === tt.comma && this.type === tt.eof && this.lastTokEnd === this.#braceListElementEnd) {
+            this.#raiseClosingBraceExpected();
+          }
+        }
+        super.expect(type);
+        if (type === tt.braceL && this.type === tt.eof) {
+          this.#raiseClosingBraceExpected();
+        }
+      }
+      /**
+       * @type {Parse.Parser['parseProperty']}
+       */
+      parseProperty(isPattern, refDestructuringErrors) {
+        if (this.type === tstt.at) this.unexpected();
+        return this.#parseBraceListElement(
+          () => isPattern && this.type === tt.ellipsis ? (
+            /** @type {AST.Property} */
+            /** @type {unknown} */
+            this.#parseObjectPatternRest()
+          ) : super.parseProperty(isPattern, refDestructuringErrors)
+        );
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#159): remove once a release includes the fix
+      /**
+       * An object binding pattern's rest element, as acorn's `parseProperty`
+       * reads it, and then what TypeScript's parser reads after it, which its
+       * checker reports:
+       * - A default (`const { ...a = 1 } = b`), TS1186 (see
+       *   `#readRestElementDefault`).
+       * - A comma, before another property (`const { ...a, b } = c`, TS2462)
+       *   or the `}`. acorn raises `Comma is not permitted after the rest
+       *   element` at it and goes on reading the properties. `raise` records
+       *   that only for a comma before the `}`, since elsewhere a rest element
+       *   ends its list. Record it at any comma here when collecting, as
+       *   `#parseBindingListPastRestElement` does for an array binding pattern
+       *   (#771), and leave the comma for `parseObj`. A strict parse throws it.
+       */
+      #parseObjectPatternRest() {
+        const rest2 = (
+          /** @type {AST.RestElement} */
+          this.startNode()
+        );
+        this.next();
+        rest2.argument = this.parseIdent(false);
+        this.finishNode(rest2, "RestElement");
+        if (this.type === tt.eq) this.#readRestElementDefault(rest2);
+        if (this.type === tt.comma) {
+          this.#raiseCheckerError(this.start, TS_ERRORS.REST_ELEMENT_TRAILING_COMMA);
+        }
+        return rest2;
+      }
+      /**
+       * A specifier that starts with `type` written with an escape is
+       * type-only, as without one (see `#readEscapedTypeModifier`).
+       * @type {Parse.Parser['parseImportSpecifier']}
+       */
+      parseImportSpecifier() {
+        this.#readEscapedTypeModifier();
+        return this.#parseBraceListElement(() => super.parseImportSpecifier());
+      }
+      /**
+       * A specifier that starts with `type` written with an escape is
+       * type-only, as without one (see `#readEscapedTypeModifier`).
+       * @type {Parse.Parser['parseExportSpecifier']}
+       */
+      parseExportSpecifier(exports) {
+        this.#readEscapedTypeModifier();
+        return this.#parseBraceListElement(() => super.parseExportSpecifier(exports));
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#154): remove once a release includes the fix
+      /**
+       * Read `type` written with an escape at the start of an import or export
+       * specifier as `type`: TypeScript reads the word as a name there and
+       * compares its text (`parseImportOrExportSpecifier`), without TS1260.
+       * acorn-typescript's `parseImportSpecifier` and `parseExportSpecifier`
+       * check for `type` with `ts_isContextual`, which declines a word with an
+       * escape, and read it as the imported or exported name, so the name after
+       * it was unexpected (`import { \u0074ype a } from "m";`).
+       */
+      #readEscapedTypeModifier() {
+        if (this.type === tstt.type && this.containsEsc) {
+          this.containsEsc = false;
+        }
+      }
+      // UPSTREAM(sveltejs/acorn-typescript#154): remove once a release includes the fix
+      /**
+       * `export import` with `type` written with an escape before the alias's
+       * name (`export import \u0074ype a = require("m");`) is a type-only
+       * import alias, as TypeScript reads it without TS1260. acorn-typescript's
+       * `parseExport` checks for `type` there with `ts_isContextual`, which
+       * declines a word with an escape, and the alias's name was unexpected.
+       * @type {Parse.Parser['tsParseImportEqualsDeclaration']}
+       */
+      tsParseImportEqualsDeclaration(node, isExport) {
+        if (isExport && this.type === tstt.type && this.containsEsc && this.lookaheadCharCode() !== CharCode.equals) {
+          node.importKind = "type";
+          this.importOrExportOuterKind = "type";
+          this.next();
+        }
+        return super.tsParseImportEqualsDeclaration(node, isExport);
+      }
+      /**
+       * @type {Parse.Parser['tsParseEnumMember']}
+       */
+      tsParseEnumMember() {
+        return this.#parseBraceListElement(() => super.tsParseEnumMember());
+      }
+      /**
+       * `get` or `set` before a property name, written with an escape, is
+       * TypeScript's TS1260 `Keywords cannot contain escape characters.`: its
+       * parser reads an accessor signature there, as acorn-typescript did,
+       * without an error (sveltejs/acorn-typescript#147).
+       * @type {Parse.Parser['tsParseTypeMember']}
+       */
+      tsParseTypeMember() {
+        if (this.containsEsc && this.type === tt.name && (this.value === "get" || this.value === "set")) {
+          const next = this.lookahead().type;
+          if (next === tt.bracketL || Parser4.acornTypeScript.tokenIsLiteralPropertyName(next)) {
+            this.raise(this.start, TS_ERRORS.KEYWORD_ESCAPE);
+          }
+        }
+        return this.#parseBraceListElement(() => super.tsParseTypeMember());
+      }
+      /**
+       * @type {Parse.Parser['parseDecorator']}
+       */
+      parseDecorator() {
+        const decorator = super.parseDecorator();
+        this.#decoratorEnd = this.lastTokEnd;
+        return decorator;
+      }
+      /**
+       * A class member at the end of the input: the class body's `}` is
+       * missing, unless a decorator came right before it, where TypeScript
+       * reports the member as missing instead.
+       *
+       * A constructor named with an escape (`\u0063onstructor() {}`) is
+       * TypeScript's TS1260 `Keywords cannot contain escape characters.`: its
+       * parser reads the `constructor` keyword there, and so a constructor
+       * even after `static`. acorn reads the constructor, or a static method,
+       * as ECMAScript does, without an error (sveltejs/acorn-typescript#147).
+       * @type {Parse.Parser['parseClassElement']}
+       */
+      parseClassElement(constructorAllowsSuper) {
+        if (this.type === tt.eof && this.lastTokEnd !== this.#decoratorEnd) {
+          this.#raiseClosingBraceExpected();
+        }
+        const element = super.parseClassElement(constructorAllowsSuper);
+        if (element?.type === "MethodDefinition" && !element.computed && element.kind !== "get" && element.kind !== "set" && !element.value.generator && element.key.type === "Identifier" && element.key.name === "constructor" && this.input.slice(element.key.start, element.key.end) !== "constructor") {
+          this.raise(
+            /** @type {number} */
+            element.key.start,
+            TS_ERRORS.KEYWORD_ESCAPE
+          );
+        }
+        return element;
       }
     }
     return (
@@ -19717,13 +26197,13 @@ function TSRXPlugin(config) {
   };
 }
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/parse/parse-module.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/parse/parse-module.js
 var parse4 = createParser(TSRXPlugin());
 function parse_module(source, filename, options) {
   return parse4(source, filename, options);
 }
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/utils/is-reference.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/utils/is-reference.js
 function is_reference(node, parent) {
   if (node.type === "MemberExpression") {
     return !node.computed && is_reference(node.object, node);
@@ -19760,7 +26240,7 @@ function is_reference(node, parent) {
   }
 }
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/utils/dom.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/utils/dom.js
 var RESERVED_WORDS = [
   "arguments",
   "await",
@@ -19863,12 +26343,12 @@ var DOM_PROPERTIES = [
   "disableRemotePlayback"
 ];
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/identifier-utils.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/identifier-utils.js
 var IDENTIFIER_OBFUSCATION_PREFIX = "_$_";
 var SERVER_IDENTIFIER = IDENTIFIER_OBFUSCATION_PREFIX + "server_$_";
 var CSS_HASH_IDENTIFIER = IDENTIFIER_OBFUSCATION_PREFIX + "hash";
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/scope.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/scope.js
 function create_scopes(ast, root, parent, error_options) {
   const scopes = /* @__PURE__ */ new Map();
   const scope = new Scope3(root, parent, false, error_options);
@@ -20147,7 +26627,7 @@ var Scope3 = class _Scope {
     }
     if (node.name.startsWith(IDENTIFIER_OBFUSCATION_PREFIX)) {
       error(
-        `Cannot declare a variable named "${node.name}" as identifiers starting with "${IDENTIFIER_OBFUSCATION_PREFIX}" are reserved`,
+        TSRX_ERRORS.RESERVED_IDENTIFIER_PREFIX(node.name, IDENTIFIER_OBFUSCATION_PREFIX),
         this.#error_options.filename,
         node,
         this.#error_options.collect ? this.#error_options.errors : void 0,
@@ -20156,7 +26636,7 @@ var Scope3 = class _Scope {
     }
     if (this.declarations.has(node.name)) {
       error(
-        `'${node.name}' has already been declared in the current scope`,
+        TS_ERRORS.DECLARED_IN_SCOPE(node.name),
         this.#error_options.filename,
         node,
         this.#error_options.collect ? this.#error_options.errors : void 0,
@@ -20265,7 +26745,7 @@ var ScopeRoot = class {
   }
 };
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/constants.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/constants.js
 var TEMPLATE_USE_IMPORT_NODE = 1 << 1;
 var IS_CONTROLLED = 1 << 2;
 var IS_INDEXED = 1 << 3;
@@ -20277,67 +26757,77 @@ var HYDRATION_END = "]";
 var BLOCK_OPEN = `<!--${HYDRATION_START}-->`;
 var BLOCK_CLOSE = `<!--${HYDRATION_END}-->`;
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/comment-utils.js
-function is_ts_pragma(comment) {
-  if (comment.type !== "Line") return false;
-  const pragmas = ["@ts-ignore", "@ts-expect-error", "@ts-nocheck", "@ts-check"];
-  return pragmas.some((pragma) => comment.value.trimStart().startsWith(pragma));
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/analyze/validation.js
+var TSRX_RETURN_STATEMENT_ERROR = TSRX_ERRORS.TEMPLATE_RETURN_STATEMENT.message;
+var TSRX_LOOP_RETURN_ERROR = TSRX_ERRORS.FOR_RETURN_STATEMENT.message;
+var TSRX_LOOP_BREAK_ERROR = TSRX_ERRORS.FOR_BREAK_STATEMENT.message;
+var TSRX_LOOP_CONTINUE_ERROR = TSRX_ERRORS.FOR_CONTINUE_STATEMENT.message;
+var TSRX_IF_RETURN_ERROR = TSRX_ERRORS.IF_RETURN_STATEMENT.message;
+var TSRX_IF_BREAK_ERROR = TSRX_ERRORS.IF_BREAK_STATEMENT.message;
+var TSRX_IF_CONTINUE_ERROR = TSRX_ERRORS.IF_CONTINUE_STATEMENT.message;
+var TSRX_FOR_STATEMENT_ERROR = TSRX_ERRORS.FOR_STATEMENT.message;
+var TSRX_FOR_IN_STATEMENT_ERROR = TSRX_ERRORS.FOR_IN_STATEMENT.message;
+var TSRX_WHILE_STATEMENT_ERROR = TSRX_ERRORS.WHILE_STATEMENT.message;
+var TSRX_DO_WHILE_STATEMENT_ERROR = TSRX_ERRORS.DO_WHILE_STATEMENT.message;
+var TSRX_FORGOTTEN_STATEMENT_CONTAINER_ERROR = TSRX_ERRORS.FORGOTTEN_STATEMENT_CONTAINER.message;
+var TSRX_JSX_SPREAD_CHILD_ERROR = TSRX_ERRORS.JSX_SPREAD_CHILD.message;
+var TSRX_DYNAMIC_TAG_EXPRESSION_ERROR = TSRX_ERRORS.DYNAMIC_TAG_EXPRESSION.message;
+var TSRX_STYLE_APPLY_VALUE_ERROR = TSRX_ERRORS.STYLE_APPLY_VALUE.message;
+var TSRX_STYLE_APPLY_DUPLICATE_ERROR = TSRX_ERRORS.STYLE_APPLY_DUPLICATE.message;
+var TSRX_STYLE_APPLY_UNSUPPORTED_HOST_ERROR = TSRX_ERRORS.STYLE_APPLY_UNSUPPORTED_HOST.message;
+var TSRX_STYLE_RESERVED_CLASS_KEY_ERROR = TSRX_ERRORS.STYLE_RESERVED_CLASS_KEY.message;
+var TSRX_STYLE_STANDALONE_AT_MODULE_SCOPE_ERROR = TSRX_ERRORS.STYLE_STANDALONE_AT_MODULE_SCOPE.message;
+var TSRX_STYLE_STANDALONE_NEEDS_FRAGMENT_ERROR = TSRX_ERRORS.STYLE_STANDALONE_NEEDS_FRAGMENT.message;
+var TSRX_STYLE_STANDALONE_OUTSIDE_TEMPLATE_ERROR = TSRX_ERRORS.STYLE_STANDALONE_OUTSIDE_TEMPLATE.message;
+var TSRX_CSS_GLOBAL_NESTED_IN_PSEUDOCLASS_ERROR = TSRX_ERRORS.CSS_GLOBAL_IN_PSEUDOCLASS.message;
+var TSRX_CSS_GLOBAL_MIDDLE_PLACEMENT_ERROR = TSRX_ERRORS.CSS_GLOBAL_IN_MIDDLE.message;
+var TSRX_CSS_IMPORT_ERROR = TSRX_ERRORS.CSS_IMPORT.message;
+function validate_forgotten_statement_container(node, filename, errors, comments) {
+  error(TSRX_ERRORS.FORGOTTEN_STATEMENT_CONTAINER, filename ?? null, node, errors, comments);
 }
-function is_triple_slash_directive(comment) {
-  if (comment.type !== "Line") return false;
-  const value = comment.value.trim();
-  return /^\/\s*<(reference|amd-module|amd-dependency)/.test(value);
+function validate_jsx_spread_child(node, filename, errors, comments) {
+  error(TSRX_ERRORS.JSX_SPREAD_CHILD, filename ?? null, node, errors, comments);
 }
-function is_jsdoc_comment(comment) {
-  return comment.type === "Block" && comment.value.startsWith("*");
-}
-function is_jsdoc_ts_annotation(comment) {
-  if (!is_jsdoc_comment(comment)) return false;
-  const tsAnnotations = [
-    "@type",
-    "@typedef",
-    "@param",
-    "@returns",
-    "@template",
-    "@extends",
-    "@implements",
-    "@satisfies",
-    "@overload",
-    "@import"
-  ];
-  return tsAnnotations.some((annotation) => comment.value.includes(annotation));
-}
-function is_jsx_pragma(comment) {
-  return /@jsx(ImportSource|Runtime|Frag)?\b/.test(comment.value);
-}
-function should_preserve_comment(comment) {
-  return is_ts_pragma(comment) || is_triple_slash_directive(comment) || is_jsdoc_ts_annotation(comment) || is_jsx_pragma(comment);
-}
-function should_preserve_jsx_tooling_comment(comment) {
-  return should_preserve_comment(comment) || is_jsdoc_comment(comment) || comment.type === "Line" && comment.value.trimStart().startsWith("@");
-}
-function is_file_level_pragma(comment) {
-  return is_jsx_pragma(comment) || is_triple_slash_directive(comment) || comment.type === "Line" && /^\s*@ts-(?:no)?check\b/.test(comment.value);
-}
-function get_hashbang(source) {
-  if (!source.startsWith("#!")) return null;
-  return /^#![^\n\r\u2028\u2029]*/.exec(source)?.[0] ?? null;
-}
-function format_comment(comment) {
-  if (comment.type === "Line") {
-    if (comment.value.trimStart().startsWith("/")) {
-      return `/// ${comment.value.trimStart().slice(1)}`;
-    }
-    return `// ${comment.value.trim()}`;
-  } else {
-    if (comment.value.startsWith("*")) {
-      return `/** ${comment.value.trim().slice(1)} */`;
-    }
-    return `/* ${comment.value.trim()} */`;
+function is_template_value_position(parent, child) {
+  switch (parent.type) {
+    case "VariableDeclarator":
+      return parent.init === child;
+    case "AssignmentExpression":
+      return parent.right === child;
+    case "Property":
+    case "PropertyDefinition":
+      return parent.value === child;
+    case "ArrayExpression":
+      return parent.elements.some((element) => element === child);
+    case "CallExpression":
+    case "NewExpression":
+      return parent.callee === child || parent.arguments.some((argument) => argument === child);
+    case "ConditionalExpression":
+      return parent.test === child || parent.consequent === child || parent.alternate === child;
+    case "LogicalExpression":
+    case "BinaryExpression":
+      return parent.left === child || parent.right === child;
+    case "UnaryExpression":
+    case "AwaitExpression":
+    case "SpreadElement":
+    case "YieldExpression":
+      return parent.argument === child;
+    case "TemplateLiteral":
+    case "SequenceExpression":
+      return parent.expressions.some((expression) => expression === child);
+    case "TSAsExpression":
+    case "TSNonNullExpression":
+    case "TSSatisfiesExpression":
+      return parent.expression === child;
+    default:
+      return false;
   }
 }
+function validate_style(diagnostic, node, filename, errors, comments) {
+  error(diagnostic, filename, node, errors, comments);
+}
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/transform/jsx/ast-builders.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/transform/jsx/ast-builders.js
 function set_loc(node, source_node) {
   node.metadata ??= { path: [] };
   if (has_location(source_node)) {
@@ -20475,13 +26965,13 @@ function is_bare_render_expression(node) {
 }
 function get_for_of_iteration_params(left, index) {
   const params = [];
-  if (left?.type === "VariableDeclaration" && left.declarations?.[0]) {
-    params.push(left.declarations[0].id);
-  } else {
+  if (left?.type !== "VariableDeclaration") {
     params.push(
       /** @type {AST.Pattern} */
       left
     );
+  } else if (left.declarations[0]) {
+    params.push(left.declarations[0].id);
   }
   if (index) {
     params.push(index);
@@ -20540,7 +27030,7 @@ function clone_ast_node(node, with_locations = true) {
   return clone;
 }
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/transform/style-ref.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/transform/style-ref.js
 function create_style_class_map(component, css, options = {}) {
   return build_style_class_map(
     component.metadata?.topScopedClasses ?? (css ? collect_style_class_map_entries(css) : /* @__PURE__ */ new Map()),
@@ -20752,7 +27242,7 @@ function get_standalone_class_selector(complex_selector) {
   return selector.type === "ClassSelector" ? selector : null;
 }
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/analyze/style-analyze.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/analyze/style-analyze.js
 function nearest_scope(path, scopes) {
   for (let i2 = path.length - 1; i2 >= 0; i2 -= 1) {
     const scope = scopes.get(path[i2]);
@@ -20822,18 +27312,14 @@ function analyze_styles(ast, scopes, state) {
   const errors = state.collect ? state.errors : void 0;
   const assigned = [];
   const standalone = [];
-  const report = (message, code, node) => {
-    validate_style(message, code, node, state.filename, errors, state.comments);
+  const report = (diagnostic, node) => {
+    validate_style(diagnostic, node, state.filename, errors, state.comments);
   };
   const resolve_apply_entry = (expression, scope, resolutions) => {
     if (expression.type === "ArrayExpression") {
       for (const element of expression.elements) {
         if (!element || element.type === "SpreadElement") {
-          report(
-            tsrx_style_apply_target_error("apply entry"),
-            DIAGNOSTIC_CODES.STYLE_APPLY_TARGET,
-            element ?? expression
-          );
+          report(TSRX_ERRORS.STYLE_APPLY_TARGET("apply entry"), element ?? expression);
           continue;
         }
         resolve_apply_entry(element, scope, resolutions);
@@ -20844,7 +27330,7 @@ function analyze_styles(ast, scopes, state) {
     const name = describe_target(expression);
     const binding = root && scope ? scope.get(root.name) : null;
     if (!root || !binding) {
-      report(tsrx_style_apply_target_error(name), DIAGNOSTIC_CODES.STYLE_APPLY_TARGET, expression);
+      report(TSRX_ERRORS.STYLE_APPLY_TARGET(name), expression);
       return;
     }
     if (binding.declaration_kind === "import") {
@@ -20858,7 +27344,7 @@ function analyze_styles(ast, scopes, state) {
       target = resolve_local_member(binding, expression);
     }
     if (!target) {
-      report(tsrx_style_apply_target_error(name), DIAGNOSTIC_CODES.STYLE_APPLY_TARGET, expression);
+      report(TSRX_ERRORS.STYLE_APPLY_TARGET(name), expression);
       return;
     }
     if (
@@ -20866,11 +27352,7 @@ function analyze_styles(ast, scopes, state) {
       binding.node.start > /** @type {number} */
       root.start
     ) {
-      report(
-        tsrx_style_apply_before_declaration_error(name),
-        DIAGNOSTIC_CODES.STYLE_APPLY_BEFORE_DECLARATION,
-        root
-      );
+      report(TSRX_ERRORS.STYLE_APPLY_BEFORE_DECLARATION(name), root);
       return;
     }
     target.metadata.styleApplied = true;
@@ -20914,11 +27396,7 @@ function analyze_styles(ast, scopes, state) {
           if (attr.type !== "JSXAttribute") continue;
           if (is_named_attribute(attr, "apply")) {
             if (apply_attr) {
-              report(
-                TSRX_STYLE_APPLY_DUPLICATE_ERROR,
-                DIAGNOSTIC_CODES.STYLE_APPLY_DUPLICATE,
-                attr
-              );
+              report(TSRX_ERRORS.STYLE_APPLY_DUPLICATE, attr);
               continue;
             }
             apply_attr = attr;
@@ -20926,23 +27404,15 @@ function analyze_styles(ast, scopes, state) {
           }
           if (is_named_attribute(attr, "ref") || inside_head || is_resource) continue;
           const attr_name = attr.name.type === "JSXIdentifier" ? attr.name.name : `${attr.name.namespace.name}:${attr.name.name.name}`;
-          report(
-            tsrx_style_unknown_attribute_error(attr_name),
-            DIAGNOSTIC_CODES.STYLE_UNKNOWN_ATTRIBUTE,
-            attr
-          );
+          report(TSRX_ERRORS.STYLE_UNKNOWN_ATTRIBUTE(attr_name), attr);
         }
         const resolutions = [];
         if (apply_attr) {
           const expression = attribute_expression(apply_attr);
           if (!expression) {
-            report(TSRX_STYLE_APPLY_VALUE_ERROR, DIAGNOSTIC_CODES.STYLE_APPLY_VALUE, apply_attr);
+            report(TSRX_ERRORS.STYLE_APPLY_VALUE, apply_attr);
           } else if (inside_head || is_resource) {
-            report(
-              TSRX_STYLE_APPLY_UNSUPPORTED_HOST_ERROR,
-              DIAGNOSTIC_CODES.STYLE_APPLY_UNSUPPORTED_HOST,
-              apply_attr
-            );
+            report(TSRX_ERRORS.STYLE_APPLY_UNSUPPORTED_HOST, apply_attr);
           } else {
             resolve_apply_entry(expression, nearest_scope(path, scopes), resolutions);
           }
@@ -20953,8 +27423,7 @@ function analyze_styles(ast, scopes, state) {
           for (const rule of stylesheet.children) {
             if (rule.type === "Atrule" && rule.name.toLowerCase() === "import") {
               report(
-                TSRX_CSS_IMPORT_ERROR,
-                DIAGNOSTIC_CODES.CSS_IMPORT,
+                TSRX_ERRORS.CSS_IMPORT,
                 /** @type {AST.Node} */
                 css_node_source_position(stylesheet, rule)
               );
@@ -20966,23 +27435,11 @@ function analyze_styles(ast, scopes, state) {
             const parent = path.at(-1);
             const in_children_list = parent?.type === "JSXElement" || parent?.type === "JSXFragment";
             if (walk_state.function_depth === 0 && walk_state.template_depth === 0) {
-              report(
-                TSRX_STYLE_STANDALONE_AT_MODULE_SCOPE_ERROR,
-                DIAGNOSTIC_CODES.STYLE_STANDALONE_AT_MODULE_SCOPE,
-                node
-              );
+              report(TSRX_ERRORS.STYLE_STANDALONE_AT_MODULE_SCOPE, node);
             } else if (!in_children_list) {
-              report(
-                TSRX_STYLE_STANDALONE_NEEDS_FRAGMENT_ERROR,
-                DIAGNOSTIC_CODES.STYLE_STANDALONE_NEEDS_FRAGMENT,
-                node
-              );
+              report(TSRX_ERRORS.STYLE_STANDALONE_NEEDS_FRAGMENT, node);
             } else if (walk_state.container_depth === 0 && !node.openingElement.selfClosing) {
-              report(
-                TSRX_STYLE_STANDALONE_OUTSIDE_TEMPLATE_ERROR,
-                DIAGNOSTIC_CODES.STYLE_STANDALONE_OUTSIDE_TEMPLATE,
-                node
-              );
+              report(TSRX_ERRORS.STYLE_STANDALONE_OUTSIDE_TEMPLATE, node);
             }
             standalone.push(node);
           }
@@ -20990,11 +27447,7 @@ function analyze_styles(ast, scopes, state) {
           assigned.push(node);
           node.metadata.styleKind = "theme";
           if (stylesheet && get_style_class_map_names(stylesheet).includes("$class")) {
-            report(
-              TSRX_STYLE_RESERVED_CLASS_KEY_ERROR,
-              DIAGNOSTIC_CODES.STYLE_RESERVED_CLASS_KEY,
-              node
-            );
+            report(TSRX_ERRORS.STYLE_RESERVED_CLASS_KEY, node);
           }
         }
         next();
@@ -21010,7 +27463,7 @@ function analyze_styles(ast, scopes, state) {
   return styles;
 }
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/analyze/index.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/analyze/index.js
 function is_free_floating_template(node, path) {
   let child = node;
   for (let i2 = path.length - 1; i2 >= 0; i2 -= 1) {
@@ -22273,14 +28726,14 @@ var MagicString = class _MagicString {
   }
 };
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/transform/platform.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/transform/platform.js
 var PLATFORMS = (
   /** @type {const} */
   ["web", "ios", "android"]
 );
 var platform_set = new Set(PLATFORMS);
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/transform/imports.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/transform/imports.js
 function with_deferred_imports(visitors3) {
   const print_import_declaration = visitors3.ImportDeclaration;
   const print_import_expression = visitors3.ImportExpression;
@@ -22339,10 +28792,9 @@ function with_deferred_imports(visitors3) {
         if (node.loc) context.location(node.loc.start.line, node.loc.start.column);
         context.write("import.defer(");
         context.visit(node.source);
-        const options = node.options ?? node.arguments?.[0];
-        if (options) {
+        if (node.options) {
           context.write(", ");
-          context.visit(options);
+          context.visit(node.options);
         }
         context.write(")");
         if (node.loc) context.location(node.loc.end.line, node.loc.end.column);
@@ -22589,7 +29041,7 @@ function print(node, visitors3, opts = {}) {
   };
 }
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/analyze/css-analyze.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/analyze/css-analyze.js
 function is_global_block_selector(simple_selector) {
   return simple_selector.type === "PseudoClassSelector" && simple_selector.name === "global" && simple_selector.args === null;
 }
@@ -22604,14 +29056,13 @@ function is_global(relative_selector) {
 function analyze_css(css, options = {}) {
   const sheet = css.type === "StyleSheet" ? css : null;
   const filename = options.filename ?? sheet?.filename ?? null;
-  function report(message, node) {
+  function report(diagnostic, node) {
     error(
-      message,
+      diagnostic,
       filename,
       css_node_source_position(sheet, node),
       options.errors,
-      options.comments,
-      DIAGNOSTIC_CODES.CSS_GLOBAL_PLACEMENT
+      options.comments
     );
   }
   walk(
@@ -22651,7 +29102,7 @@ function analyze_css(css, options = {}) {
             const is_nested = context.path.at(-2)?.type === "PseudoClassSelector";
             if (is_nested && !/** @type {AST.CSS.PseudoClassSelector} */
             global.selectors[0].args) {
-              report(TSRX_CSS_GLOBAL_NESTED_IN_PSEUDOCLASS_ERROR, global.selectors[0]);
+              report(TSRX_ERRORS.CSS_GLOBAL_IN_PSEUDOCLASS, global.selectors[0]);
             }
             const idx = node.children.indexOf(global);
             const first = (
@@ -22661,7 +29112,7 @@ function analyze_css(css, options = {}) {
             if (first.args !== null && idx !== 0 && idx !== node.children.length - 1) {
               for (let i2 = idx + 1; i2 < node.children.length; i2++) {
                 if (!is_global(node.children[i2])) {
-                  report(TSRX_CSS_GLOBAL_MIDDLE_PLACEMENT_ERROR, first);
+                  report(TSRX_ERRORS.CSS_GLOBAL_IN_MIDDLE, first);
                   break;
                 }
               }
@@ -24780,14 +31231,19 @@ var tsx_default = (options) => ({
   }
 });
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/transform/jsx/helpers.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/transform/jsx/helpers.js
 function in_jsx_child_context(path) {
   const parent = path[path.length - 1];
   return !!parent && (parent.type === "JSXElement" || parent.type === "JSXFragment");
 }
+var JSX_TEXT_ESCAPES = { "<": "&lt;", ">": "&gt;" };
+var regex_jsx_text_escaped = /[<>]/g;
+function escape_jsx_text(raw) {
+  return raw.replace(regex_jsx_text_escaped, (ch) => JSX_TEXT_ESCAPES[ch]);
+}
 function is_empty_jsx_fragment(node) {
   return node?.type === "JSXFragment" && !(node.children || []).some(
-    (child) => child && (child.type !== "JSXText" || child.value.trim() !== "")
+    (child) => child && (child.type !== "JSXText" || child.raw.trim() !== "")
   );
 }
 function set_node_path_metadata(node, path) {
@@ -24884,13 +31340,33 @@ function tsx_with_ts_locations(boundary_tokens = false, comments = void 0, hashb
       context.write(" ");
       context.visit(value.body);
     },
-    // TSRX text may contain a literal `<` — one that cannot start a tag
-    // (`<span><3</span>`) or a raw-text `<script>` body — but the printed TSX
-    // is re-parsed by a JSX toolchain (esbuild, Babel, SWC), and JSX forbids
-    // a bare `<` in text. Emit it as `&lt;`, which those parsers decode back
-    // to the same string.
+    // A comment between children is in an empty `{}` (see `#addTemplateText`
+    // in `plugin.js`). In the editor's TypeScript, a tooling comment there
+    // prints inside it in block form, `{/* @ts-expect-error */}`, which
+    // TypeScript applies to the next line, as in TSX.
+    JSXEmptyExpression: (node, context) => {
+      if (!emitted_comments || !preserve_owner_comments) return;
+      for (
+        const comment of
+        /** @type {AST.CommentWithLocation[]} */
+        node.innerComments ?? []
+      ) {
+        if (!is_jsx_child_tooling_comment(comment) || comment.value.includes("*/")) continue;
+        const key2 = `${comment.start}:${comment.end}:${comment.type}:${comment.value}`;
+        if (emitted_comments.has(key2)) continue;
+        emitted_comments.add(key2);
+        if (comment.loc) context.location(comment.loc.start.line, comment.loc.start.column);
+        context.write(
+          comment.type === "Line" ? `/* ${comment.value.trim()} */` : `/*${comment.value}*/`
+        );
+        if (comment.loc) context.location(comment.loc.end.line, comment.loc.end.column);
+      }
+    },
+    // Text prints from `raw`, as JSX printers do: `value` has its character
+    // references decoded, so `&#123;x&#125;` would print as the expression
+    // `{x}`.
     JSXText: (node, context) => {
-      context.write(node.value.replace(/</g, "&lt;"), node);
+      context.write(escape_jsx_text(node.raw), node);
     },
     // esrap's JSXOpeningElement printer doesn't emit `typeArguments`, so generic
     // component tags like `<RenderProp<User>>` lose the `<User>` in the output.
@@ -24917,6 +31393,28 @@ function tsx_with_ts_locations(boundary_tokens = false, comments = void 0, hashb
       context.visit(node.expression);
       if (node.typeParameters) {
         context.visit(node.typeParameters);
+      }
+    },
+    // esrap's TSImportType printer drops `options`, the import attributes in
+    // `import('./data.json', { with: { type: 'json' } })`, which TypeScript
+    // reads, for instance to pick the module's `resolution-mode`
+    // (sveltejs/esrap#231). Remove this once esrap prints them.
+    TSImportType: (node, context) => {
+      if (!node.options) {
+        base.TSImportType(node, context);
+        return;
+      }
+      context.write("import(");
+      context.visit(node.argument);
+      context.write(", ");
+      context.visit(node.options);
+      context.write(")");
+      if (node.qualifier) {
+        context.write(".");
+        context.visit(node.qualifier);
+      }
+      if (node.typeArguments) {
+        context.visit(node.typeArguments);
       }
     },
     // esrap's TSParameterProperty printer drops `override`, so
@@ -25070,7 +31568,7 @@ function is_template_try_node(node) {
   return node?.type === "JSXTryExpression" || node?.type === "TryStatement" && node?.statementType === "TryStatement";
 }
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/transform/stylesheet.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/transform/stylesheet.js
 var regex_css_browser_prefix = /^-((webkit)|(moz)|(o)|(ms))-/;
 var regex_css_name_boundary = /^[\s,;}]$/;
 var is_keyframes_node = (node) => remove_css_prefix(node.name) === "keyframes";
@@ -25425,7 +31923,7 @@ function render_css_result(stylesheets, minify = false) {
   };
 }
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/transform/await.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/transform/await.js
 function find_first_top_level_await_in_tsrx_function_body(body_nodes) {
   for (const node of body_nodes) {
     const found = find_first_top_level_await(node, false);
@@ -25460,7 +31958,7 @@ function find_first_top_level_await(node, inside_nested_function) {
   return null;
 }
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/transform/scoping.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/transform/scoping.js
 function prepare_stylesheet_for_render(stylesheet, mode = "scope") {
   walk(
     /** @type {AST.CSS.Node} */
@@ -25569,7 +32067,7 @@ function add_scope_classes(element, hashes, applied, class_attr_name = "class") 
   };
 }
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/analyze/prune.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/analyze/prune.js
 var FORWARD = 0;
 var BACKWARD = 1;
 var css_hash;
@@ -25839,7 +32337,7 @@ function get_possible_element_siblings(node, direction, adjacent_only) {
       if (adjacent_only && !isDynamic) {
         break;
       }
-    } else if (adjacent_only && sibling2.type === "JSXText" && sibling2.value.trim()) {
+    } else if (adjacent_only && sibling2.type === "JSXText" && sibling2.raw.trim()) {
       break;
     }
   }
@@ -26286,7 +32784,7 @@ function prune_css(css, element, styleClasses, topScopedClasses, regionHash = cs
   walk(css, null, visitors3);
 }
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/transform/jsx/style-scopes.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/transform/jsx/style-scopes.js
 function prepare_style_scopes(program, ctx) {
   const state = {
     ctx,
@@ -26751,7 +33249,7 @@ function type_only_style(block2) {
   };
 }
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/transform/jsx-interleave.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/transform/jsx-interleave.js
 function is_interleaved_body(body_nodes, is_jsx_child2) {
   let seen_jsx = false;
   for (const child of body_nodes) {
@@ -26778,7 +33276,7 @@ function capture_jsx_child(jsx, capture_index, anchor_id) {
   return { declaration: declaration2, reference };
 }
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/transform/jsx-hoist.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/transform/jsx-hoist.js
 function is_static_literal(node) {
   return node.value === null || typeof node.value === "string" || typeof node.value === "number" || typeof node.value === "boolean" || typeof node.value === "bigint";
 }
@@ -26844,7 +33342,7 @@ function is_hoist_safe_jsx_node(node) {
   return node.openingElement.attributes.every(is_hoist_safe_jsx_attribute) && node.children.every(is_hoist_safe_jsx_child);
 }
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/transform/jsx/server-module.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/transform/jsx/server-module.js
 var HOISTED_IMPORT_PREFIX = "__tsrx_server_import$";
 var WALK_SKIP_KEYS = /* @__PURE__ */ new Set([
   "loc",
@@ -27109,29 +33607,13 @@ function lower_server_module_for_types(ast, server_module) {
   ) };
 }
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/transform/jsx/index.js
-var TEMPLATE_FRAGMENT_ERROR = "JSX fragment syntax is not needed in TSRX templates. TSRX renders in immediate mode, so everything is already a fragment. Use `<>...</>` only in expression position.";
-var TSRX_FOR_RETURN_ERROR = "Return statements are not allowed inside TSRX template for...of loops. Filter the iterable before rendering or use an @empty fallback for empty lists.";
-var TSRX_FOR_BREAK_ERROR = "Break statements are not allowed inside TSRX template for...of loops.";
-var TSRX_FOR_CONTINUE_ERROR = "Continue statements are not allowed inside TSRX template for...of loops. Filter the iterable before rendering.";
-var TSRX_IF_RETURN_ERROR = "Return statements are not allowed inside TSRX template @if blocks. Move the return before the template output or render conditionally instead.";
-var TSRX_IF_BREAK_ERROR = "Break statements are not allowed inside TSRX template @if blocks.";
-var TSRX_IF_CONTINUE_ERROR = "Continue statements are not allowed inside TSRX template @if blocks. Filter before rendering or use conditional output instead.";
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/transform/jsx/index.js
 var DYNAMIC_IMPORT_LOCAL = "TsrxDynamic";
 var DYNAMIC_FACTORY_LOCAL = "_tsrx_dynamic";
 var LEADING_INLINE_WHITESPACE = /^[ \t]+/;
 var TRAILING_INLINE_WHITESPACE = /[ \t]+$/;
 function is_newline_char(ch) {
   return ch === "\n" || ch === "\r";
-}
-function report_jsx_fragment_in_tsrx_error(node, transform_context) {
-  error(
-    TEMPLATE_FRAGMENT_ERROR,
-    transform_context.filename,
-    node,
-    transform_context.errors,
-    transform_context.comments
-  );
 }
 function mark_nested_function_return_jsx(node, inside_function = false, seen = /* @__PURE__ */ new Set()) {
   if (seen.has(node)) return;
@@ -27419,9 +33901,7 @@ function createJsxTransform(platform) {
             next() ?? node
           );
           const immediate_parent = path[path.length - 1];
-          const is_empty_container_child = immediate_parent?.type === "JSXExpressionContainer" && in_jsx_child_context(path.slice(0, -1)) && !node_children(target).some(
-            (child) => child.type !== "EmptyStatement" && (child.type !== "JSXText" || child.value !== "")
-          );
+          const is_empty_container_child = immediate_parent?.type === "JSXExpressionContainer" && in_jsx_child_context(path.slice(0, -1)) && !render_children(target).some((child) => child.type !== "EmptyStatement");
           const in_jsx_child = in_jsx_child_context(path) || is_empty_container_child;
           let expression = tsrx_node_to_jsx_expression(target, state, in_jsx_child);
           if (!in_jsx_child && (is_authored_native_fragment(node) || is_combined_expression_position(path[path.length - 1], node))) {
@@ -27444,7 +33924,7 @@ function createJsxTransform(platform) {
               in_jsx_child_context(path)
             );
           }
-          const raw_children = node_children(node).map((child) => ({ ...child }));
+          const raw_children = render_children(node).map((child) => ({ ...child }));
           const inner = (
             /** @type {AST.TSRXJSXElement} */
             next() ?? node
@@ -28141,7 +34621,7 @@ function validate_native_await(node, transform_context) {
   }
   if (transform_context.platform.validation.requireUseServerForAwait) {
     error(
-      'Top-level `await` in TSRX functions requires a module-level `"use server"` directive.',
+      TSRX_ERRORS.TOP_LEVEL_AWAIT_USE_SERVER,
       transform_context.filename,
       await_node,
       transform_context.errors,
@@ -28522,9 +35002,7 @@ function mark_native_pretransformed_jsx(node, seen = /* @__PURE__ */ new Set()) 
   return node;
 }
 function get_tsrx_render_children(node) {
-  return node_children(node).filter(
-    (child) => child.type !== "EmptyStatement" && (child.type !== "JSXText" || child.value !== "")
-  );
+  return render_children(node).filter((child) => child.type !== "EmptyStatement");
 }
 function function_contains_hook_bearing_tsrx(node, transform_context) {
   return node_contains_hook_bearing_tsrx(node.body, transform_context);
@@ -28792,7 +35270,7 @@ function suspend_generated_closures(program, transform_context) {
           fn = { ...fn, async: true };
         } else {
           error(
-            `${transform_context.platform.name} TSRX does not support \`await\` here: this part of the template renders through a callback the target calls, so its result cannot be awaited. Await the value in the component body, or move it into an async child component.`,
+            TSRX_ERRORS.TARGET_AWAIT_UNSUPPORTED(transform_context.platform.name),
             transform_context.filename,
             /** @type {AST.Node} */
             first_await,
@@ -28806,7 +35284,7 @@ function suspend_generated_closures(program, transform_context) {
           fn = to_generator_function(fn);
         } else {
           error(
-            `${transform_context.platform.name} TSRX does not support \`yield\` here: this part of the template runs in a callback, which cannot yield from the enclosing generator. Yield the value in the function body first.`,
+            TSRX_ERRORS.TARGET_YIELD_UNSUPPORTED(transform_context.platform.name),
             transform_context.filename,
             /** @type {AST.Node} */
             first_yield,
@@ -28897,7 +35375,7 @@ function delegate_to_generated_generator(call2, transform_context) {
   }
   if (found.super) {
     error(
-      `${transform_context.platform.name} TSRX does not support \`super\` here: this part of the template also yields, so it is lowered into a generator function, where \`super\` is unavailable. Read the value into a variable in the method body first.`,
+      TSRX_ERRORS.TARGET_SUPER_UNSUPPORTED(transform_context.platform.name),
       transform_context.filename,
       found.super,
       transform_context.errors,
@@ -29234,13 +35712,26 @@ function create_helper_props_type_literal_with_typeof_flags(bindings, aliases, u
     })
   );
 }
-function to_jsx_element(node, transform_context, raw_children = node_children(node), in_jsx_child = false) {
+function is_raw_script_element(node) {
+  return node?.type === "JSXElement" && node.openingElement?.name?.type === "JSXIdentifier" && node.openingElement.name.name === "script" && typeof /** @type {AST.TSRXJSXElement} */
+  node.content === "string";
+}
+function create_script_body(node, form = "children") {
+  if (!is_raw_script_element(node) || node.content.trim() === "") return null;
+  const body = literal2(node.content);
+  if (form === "children") {
+    return { attributes: [], children: [jsx_expression_container(body)], selfClosing: false };
+  }
+  const value = form === "dangerouslySetInnerHTML" ? object([init("__html", body)]) : body;
+  return {
+    attributes: [jsx_attribute(jsx_id(form), jsx_expression_container(value))],
+    children: [],
+    selfClosing: true
+  };
+}
+function to_jsx_element(node, transform_context, raw_children = render_children(node), in_jsx_child = false) {
   if (node.type === "JSXElement" && !node.metadata?.native_tsrx) {
     return node;
-  }
-  if (node.type === "JSXFragment" || !node.openingElement?.name) {
-    report_jsx_fragment_in_tsrx_error(node, transform_context);
-    return set_loc(jsx_fragment(), node);
   }
   const source_opening = node.openingElement;
   const name = clone_jsx_name(source_opening.name);
@@ -29250,14 +35741,15 @@ function to_jsx_element(node, transform_context, raw_children = node_children(no
     /** @type {AST.TSRXJSXElement} */
     node
   );
-  let walked_children = node_children(node);
-  if (transform_context.typeOnly && typeof node.content === "string") {
-    walked_children = [];
-    raw_children = [];
-  }
+  const walked_children = render_children(node);
   let selfClosing = !!source_opening.selfClosing;
   let children;
-  const child_transform = transform_context.platform.hooks?.transformElementChildren?.(
+  const script_body = transform_context.typeOnly ? null : create_script_body(
+    /** @type {AST.TSRXJSXElement} */
+    node,
+    transform_context.platform.jsx?.scriptBody
+  );
+  const child_transform = script_body ? null : transform_context.platform.hooks?.transformElementChildren?.(
     /** @type {AST.TSRXJSXElement} */
     node,
     walked_children,
@@ -29265,7 +35757,11 @@ function to_jsx_element(node, transform_context, raw_children = node_children(no
     attributes,
     transform_context
   );
-  if (child_transform) {
+  if (script_body) {
+    attributes.push(...script_body.attributes);
+    children = script_body.children;
+    selfClosing = script_body.selfClosing;
+  } else if (child_transform) {
     children = child_transform.children;
     if (typeof child_transform.selfClosing === "boolean") {
       selfClosing = child_transform.selfClosing;
@@ -29660,23 +36156,26 @@ function wrap_edge_whitespace(nodes) {
       /** @type {string} */
       node.value
     );
+    let raw = node.raw;
     if (at_start) {
-      const lead = LEADING_INLINE_WHITESPACE.exec(value);
-      if (lead && !is_newline_char(value[lead[0].length])) {
+      const lead = LEADING_INLINE_WHITESPACE.exec(raw);
+      if (lead && !is_newline_char(raw[lead[0].length])) {
         out.push(to_jsx_expression_container(literal2(lead[0]), node));
         value = value.slice(lead[0].length);
+        raw = raw.slice(lead[0].length);
       }
     }
     let trailing = null;
     if (at_end) {
-      const trail = TRAILING_INLINE_WHITESPACE.exec(value);
-      if (trail && !is_newline_char(value[value.length - trail[0].length - 1])) {
+      const trail = TRAILING_INLINE_WHITESPACE.exec(raw);
+      if (trail && !is_newline_char(raw[raw.length - trail[0].length - 1])) {
         trailing = to_jsx_expression_container(literal2(trail[0]), node);
         value = value.slice(0, value.length - trail[0].length);
+        raw = raw.slice(0, raw.length - trail[0].length);
       }
     }
-    if (value !== "") {
-      out.push(jsx_text(value, value, has_location(node) ? node : void 0));
+    if (raw !== "") {
+      out.push(jsx_text(value, raw, has_location(node) ? node : void 0));
     }
     if (trailing) {
       out.push(trailing);
@@ -29709,7 +36208,7 @@ function to_jsx_child(node, transform_context) {
     case "JSXForExpression":
       if (node.statementType !== "ForOfStatement") {
         error(
-          "TSRX `@for` currently supports `for...of` loops in template output.",
+          TSRX_ERRORS.FOR_OF_ONLY,
           transform_context.filename,
           node,
           transform_context.errors,
@@ -29740,9 +36239,7 @@ function to_jsx_child(node, transform_context) {
   }
 }
 function tsrx_node_to_jsx_expression(node, transform_context, in_jsx_child = false) {
-  const children = (node.children || []).filter(
-    (child) => child && child.type !== "EmptyStatement" && (child.type !== "JSXText" || child.value !== "")
-  );
+  const children = render_children(node).filter((child) => child.type !== "EmptyStatement");
   let expression = null;
   if (children.length === 0) {
     expression = set_loc(jsx_fragment([]), has_location(node) ? node : void 0);
@@ -29989,7 +36486,7 @@ function validate_for_body_control_flow(node, transform_context, is_root = true)
   }
   if (node.type === "ReturnStatement") {
     error(
-      TSRX_FOR_RETURN_ERROR,
+      TSRX_ERRORS.FOR_RETURN_STATEMENT,
       transform_context.filename,
       node,
       transform_context.errors,
@@ -29999,7 +36496,7 @@ function validate_for_body_control_flow(node, transform_context, is_root = true)
   }
   if (node.type === "BreakStatement") {
     error(
-      TSRX_FOR_BREAK_ERROR,
+      TSRX_ERRORS.FOR_BREAK_STATEMENT,
       transform_context.filename,
       node,
       transform_context.errors,
@@ -30009,7 +36506,7 @@ function validate_for_body_control_flow(node, transform_context, is_root = true)
   }
   if (node.type === "ContinueStatement") {
     error(
-      TSRX_FOR_CONTINUE_ERROR,
+      TSRX_ERRORS.FOR_CONTINUE_STATEMENT,
       transform_context.filename,
       node,
       transform_context.errors,
@@ -30036,7 +36533,7 @@ function validate_if_body_control_flow(node, transform_context) {
   }
   if (node.type === "ReturnStatement") {
     error(
-      TSRX_IF_RETURN_ERROR,
+      TSRX_ERRORS.IF_RETURN_STATEMENT,
       transform_context.filename,
       node,
       transform_context.errors,
@@ -30046,7 +36543,7 @@ function validate_if_body_control_flow(node, transform_context) {
   }
   if (node.type === "BreakStatement") {
     error(
-      TSRX_IF_BREAK_ERROR,
+      TSRX_ERRORS.IF_BREAK_STATEMENT,
       transform_context.filename,
       node,
       transform_context.errors,
@@ -30056,7 +36553,7 @@ function validate_if_body_control_flow(node, transform_context) {
   }
   if (node.type === "ContinueStatement") {
     error(
-      TSRX_IF_CONTINUE_ERROR,
+      TSRX_ERRORS.IF_CONTINUE_STATEMENT,
       transform_context.filename,
       node,
       transform_context.errors,
@@ -30077,7 +36574,7 @@ function is_loop_statement(node) {
 function for_of_statement_to_jsx_child(node, transform_context) {
   if (node.await) {
     error(
-      `${transform_context.platform.name} TSRX does not support \`for await...of\` in TSRX templates.`,
+      TSRX_ERRORS.TARGET_FOR_AWAIT_UNSUPPORTED(transform_context.platform.name),
       transform_context.filename,
       node,
       transform_context.errors,
@@ -30399,7 +36896,7 @@ function try_statement_to_jsx_child(node, transform_context) {
   const finalizer = node.finalizer;
   if (finalizer) {
     error(
-      `${transform_context.platform.name} TSRX does not support JavaScript \`try/finally\` in TSRX templates. \`finally\` is not part of TSRX control flow; move the try/finally into a function if you need cleanup logic.`,
+      TSRX_ERRORS.TEMPLATE_TRY_FINALLY(transform_context.platform.name),
       transform_context.filename,
       finalizer,
       transform_context.errors,
@@ -30408,7 +36905,7 @@ function try_statement_to_jsx_child(node, transform_context) {
   }
   if (!pending && !handler) {
     error(
-      "TSRX try statements must have a `pending` or `catch` block.",
+      TSRX_ERRORS.TEMPLATE_TRY_HANDLER,
       transform_context.filename,
       node,
       transform_context.errors,
@@ -30422,7 +36919,8 @@ function try_statement_to_jsx_child(node, transform_context) {
       transform_context.filename,
       pending,
       transform_context.errors,
-      transform_context.comments
+      transform_context.comments,
+      DIAGNOSTIC_CODES.TARGET_PENDING_UNSUPPORTED
     );
   }
   const try_body_nodes = node.block.body || [];
@@ -30957,7 +37455,7 @@ function validate_at_most_one_ref_attribute(raw_attrs, transform_context) {
       continue;
     }
     error(
-      "Element has multiple `ref={...}` attributes; an element may have at most one. Use a single array-valued ref such as `ref={[a, b]}` where the target framework supports multiple refs.",
+      TSRX_ERRORS.MULTIPLE_REFS,
       transform_context?.filename ?? null,
       node,
       transform_context?.errors,
@@ -31059,7 +37557,7 @@ function build_return_expression(render_nodes, in_jsx_child = false, type_only =
       return only.expression;
     }
     if (only.type === "JSXText") {
-      if (!type_only && !in_jsx_child && (only.value ?? "").trim() === "") {
+      if (!type_only && !in_jsx_child && only.raw.trim() === "") {
         return null;
       }
       return set_loc(jsx_fragment([only]), has_location(only) ? only : void 0);
@@ -31084,7 +37582,7 @@ function build_return_expression(render_nodes, in_jsx_child = false, type_only =
   );
 }
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/source-map-utils.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/source-map-utils.js
 var mapping_data = {
   verification: true,
   completion: true,
@@ -31272,7 +37770,7 @@ function get_mapping_from_node(node, src_to_gen_map, gen_line_offsets, filtered_
   return mapping;
 }
 
-// ../../node_modules/.pnpm/@tsrx+core@0.4.0/node_modules/@tsrx/core/src/transform/segments.js
+// ../../node_modules/.pnpm/@tsrx+core@0.5.2/node_modules/@tsrx/core/src/transform/segments.js
 var RETURN_KEYWORD = "return";
 var EXPORT_KEYWORD = "export";
 var BLOCK_DECLARATION_TYPES = /* @__PURE__ */ new Set([
@@ -31900,10 +38398,13 @@ function convert_source_map_to_mappings(ast, ast_from_source, source, generated_
         }
         return;
       } else if (node.type === "JSXText") {
-        if (node.loc && typeof node.value === "string" && node.value.trimStart().startsWith("@")) {
+        const text = node.raw;
+        if (node.loc && typeof text === "string" && text.trimStart().startsWith("@")) {
+          const escaped_at = text.search(regex_jsx_text_escaped);
+          const verbatim = escaped_at === -1 ? text : text.slice(0, escaped_at);
           tokens.push({
-            source: node.value,
-            generated: node.value,
+            source: verbatim,
+            generated: verbatim,
             loc: node.loc,
             metadata: {},
             mappingData: mapping_data_completion_only
@@ -32757,11 +39258,7 @@ function convert_source_map_to_mappings(ast, ast_from_source, source, generated_
         }
         return;
       } else if (node.type === "TSTypeParameter") {
-        if (node.name && node.loc && typeof node.name === "string") {
-          tokens.push({ source: node.name, generated: node.name, loc: node.loc, metadata: {} });
-        } else if (node.name && typeof node.name === "object") {
-          visit(node.name);
-        }
+        visit(node.name);
         if (node.constraint) {
           visit(node.constraint);
         }
@@ -32987,6 +39484,9 @@ function convert_source_map_to_mappings(ast, ast_from_source, source, generated_
         if (node.argument) {
           visit(node.argument);
         }
+        if (node.options) {
+          visit(node.options);
+        }
         if (node.qualifier) {
           visit(node.qualifier);
         }
@@ -33040,10 +39540,8 @@ function convert_source_map_to_mappings(ast, ast_from_source, source, generated_
         if (node.id) {
           visit(node.id);
         }
-        if (node.members) {
-          for (const member2 of node.members) {
-            visit(member2);
-          }
+        for (const member2 of node.body.members) {
+          visit(member2);
         }
         return;
       } else if (node.type === "TSEnumMember") {
@@ -33451,6 +39949,7 @@ function publishOutput(options, selected) {
 }
 
 // src/compiler/parser.browser.js
+import { adoptTemplateShape } from "./parser-template-shape.js";
 var TypeScriptParser = acorn_exports.Parser.extend(
   tsPlugin({ jsx: true }),
   (Base) => class extends Base {
@@ -33541,7 +40040,10 @@ function parseTypeScript(source, options) {
   if (options?.comments) options.comments.push(...comments);
   return program;
 }
-function parseModule(source, filename, options) {
+function parseEditorModule(source, filename, options) {
+  return adoptTemplateShape(parseAuthoredModule(source, filename, options), true);
+}
+function parseAuthoredModule(source, filename, options) {
   const primary = isolateOutputOptions(options);
   let program;
   try {
@@ -33849,7 +40351,7 @@ function markNativeTemplateBodies(root) {
 function compileToVolarMappings(source, filename, options) {
   const errors = [];
   const comments = [];
-  const ast = parseModule(source, filename, {
+  const ast = parseEditorModule(source, filename, {
     collect: true,
     loose: !!options?.loose,
     preserveParens: true,
@@ -34052,7 +40554,7 @@ function collectDirectiveOrigins(ast, source) {
 function compileTypesInspection(source, filename, options) {
   const errors = [];
   const comments = [];
-  const ast = parseModule(source, filename, {
+  const ast = parseEditorModule(source, filename, {
     collect: true,
     loose: true,
     preserveParens: true,

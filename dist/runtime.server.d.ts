@@ -188,6 +188,15 @@ export declare function ssrBindingChild(value: unknown, scope: SSRScope, marker:
 export declare function ssrChildText(v: unknown, scope: SSRScope): string;
 /** @internal First-child renderable hole in a newline-eating HTML element. */
 export declare function ssrChildTextPre(v: unknown, scope: SSRScope): string;
+/**
+ * @internal A <textarea>'s authored children as its one markerless text, the
+ * server twin of the client's `textareaText`. Textarea content is RCDATA, so a
+ * `<!-- -->` separator or `<!--[-->` frame would parse as part of its default
+ * value. `textHoles` marks the `{x as string}` parts with a 't'; a part that is
+ * itself a signal handle is read, as the client binds it. A leading newline is
+ * doubled because the parser discards one directly after the opening tag.
+ */
+export declare function ssrTextareaText(parts: unknown[], textHoles?: string): string;
 /** @internal First renderable child when static output has no shielding markers. */
 export declare function ssrChildPre(v: unknown, scope: SSRScope): string;
 /**
@@ -300,7 +309,7 @@ export declare function ssrScriptInnerHtml(sources: readonly (readonly [boolean,
  * host. Prop-driven content is the host's sole child, so primitive text stays
  * markerless while descriptors/lists retain the normal child-slot framing.
  */
-export declare function ssrChildrenSources(sources: readonly (readonly [boolean, unknown])[], renderFallback: () => string, scope: SSRScope): string;
+export declare function ssrChildrenSources(sources: readonly (readonly [boolean, unknown])[], renderFallback: () => string, scope: SSRScope, textarea?: boolean): string;
 /**
  * Resolve the content of an otherwise empty ordinary host with one JSX spread.
  * The compiler has already snapshotted every enumerable own getter in authored
